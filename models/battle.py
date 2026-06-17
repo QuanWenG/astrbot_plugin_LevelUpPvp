@@ -21,6 +21,10 @@ class BattleResult:
     defender: User
     winner: User
     loser: User
+    attacker_strategy: str
+    defender_strategy: str
+    attacker_strategy_random: bool
+    defender_strategy_random: bool
     attacker_win_rate: float
     roll_value: float
     winner_exp_gain: int

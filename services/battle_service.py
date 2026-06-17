@@ -38,6 +38,8 @@ class BattleService:
         event=None,
     ) -> BattleResult:
         strategy = (strategy or "").strip()
+        attacker_strategy, attacker_strategy_random = self._resolve_strategy(strategy)
+        defender_strategy, defender_strategy_random = self._resolve_strategy("")
         async with await connect_db(self.db_path) as db:
             await db.execute("BEGIN")
             attacker, _ = await self.user_service.get_or_create_user_in_db(
@@ -52,7 +54,12 @@ class BattleService:
 
             await self._check_cooldown(db, attacker.id, defender.id)
 
-            local_analysis = self._local_analysis(attacker, defender, strategy)
+            local_analysis = self._local_analysis(
+                attacker,
+                defender,
+                attacker_strategy,
+                defender_strategy,
+            )
             final_analysis = local_analysis
             if context and event:
                 llm_analysis = await self.llm_service.analyze_battle(
@@ -60,7 +67,8 @@ class BattleService:
                     event,
                     attacker,
                     defender,
-                    strategy,
+                    attacker_strategy,
+                    defender_strategy,
                     local_analysis.attacker_win_rate,
                 )
                 if llm_analysis:
@@ -89,7 +97,8 @@ class BattleService:
                 defender,
                 winner,
                 loser,
-                strategy,
+                attacker_strategy,
+                defender_strategy,
             )
             winner_exp_gain = (
                 config.BATTLE_WIN_EXP_BASE
@@ -131,7 +140,15 @@ class BattleService:
                     loser.id,
                     final_analysis.attacker_win_rate,
                     roll_value,
-                    strategy,
+                    json.dumps(
+                        {
+                            "attacker": attacker_strategy,
+                            "defender": defender_strategy,
+                            "attacker_random": attacker_strategy_random,
+                            "defender_random": defender_strategy_random,
+                        },
+                        ensure_ascii=False,
+                    ),
                     winner_exp_gain,
                     loser_exp_loss,
                     final_analysis.analysis,
@@ -149,6 +166,10 @@ class BattleService:
                 defender=updated_defender,
                 winner=updated_winner,
                 loser=updated_loser,
+                attacker_strategy=attacker_strategy,
+                defender_strategy=defender_strategy,
+                attacker_strategy_random=attacker_strategy_random,
+                defender_strategy_random=defender_strategy_random,
                 attacker_win_rate=final_analysis.attacker_win_rate,
                 roll_value=roll_value,
                 winner_exp_gain=winner_exp_gain,
@@ -195,7 +216,13 @@ class BattleService:
             remain = config.BATTLE_PAIR_COOLDOWN_SECONDS - (now_ts - row["created_at_ts"])
             raise ValueError(f"双方刚打过，约 {remain // 60 + 1} 分钟后再挑战")
 
-    def _local_analysis(self, attacker: User, defender: User, strategy: str) -> BattleAnalysis:
+    def _local_analysis(
+        self,
+        attacker: User,
+        defender: User,
+        attacker_strategy: str,
+        defender_strategy: str,
+    ) -> BattleAnalysis:
         rate = 0.5
         rate += config.clamp(
             (attacker.level - defender.level) * config.BATTLE_LEVEL_RATE_STEP,
@@ -209,21 +236,47 @@ class BattleService:
         )
         rate += self._matchup_bonus(attacker, defender)
         rate -= self._matchup_bonus(defender, attacker)
-        rate += self._strategy_bonus(attacker, defender, strategy)
+        attacker_effect = self._strategy_attribute_effect(
+            attacker,
+            defender,
+            attacker_strategy,
+        )
+        defender_effect = self._strategy_attribute_effect(
+            defender,
+            attacker,
+            defender_strategy,
+        )
+        strategy_bonus = self._strategy_counter_bonus(
+            attacker_strategy,
+            defender_strategy,
+            attacker_effect,
+            defender_effect,
+        )
+        rate += strategy_bonus + attacker_effect["score"] - defender_effect["score"]
         rate = config.clamp(rate, config.BATTLE_MIN_WIN_RATE, config.BATTLE_MAX_WIN_RATE)
 
         attacker_type = self._build_type(attacker)
         defender_type = self._build_type(defender)
         attacker_name = self._display_name(attacker)
         defender_name = self._display_name(defender)
+        strategy_text = self._strategy_relation_text(
+            attacker_strategy,
+            defender_strategy,
+            strategy_bonus,
+            attacker_effect,
+            defender_effect,
+        )
+        fit_text = (
+            f"{self._strategy_effect_text(attacker_name, attacker_strategy, attacker_effect)}"
+            f"{self._strategy_effect_text(defender_name, defender_strategy, defender_effect)}"
+        )
         analysis = (
             f"{attacker_name} 偏{attacker_type}，{defender_name} 偏{defender_type}。"
-            f"策略{'契合' if self._strategy_bonus(attacker, defender, strategy) >= 0 else '略显别扭'}，"
-            "胜负仍由临场发挥决定。"
+            f"{strategy_text}{fit_text}胜负仍由临场发挥决定。"
         )
         battle_log = [
-            f"{attacker_name} 按照「{strategy or '稳扎稳打'}」展开试探。",
-            f"{defender_name} 依靠{defender_type}构筑稳住节奏。",
+            f"{attacker_name} 按照「{attacker_strategy}」展开试探。",
+            f"{defender_name} 选择「{defender_strategy}」，依靠{defender_type}构筑应对。",
             "战局在属性克制和随机变数之间摇摆，最后一击决定了结果。",
         ]
         return BattleAnalysis(
@@ -239,18 +292,22 @@ class BattleService:
         defender: User,
         winner: User,
         loser: User,
-        strategy: str,
+        attacker_strategy: str,
+        defender_strategy: str,
     ) -> list[str]:
         attacker_wins = winner.id == attacker.id
         attacker_type = self._build_type(attacker)
         defender_type = self._build_type(defender)
         attacker_name = self._display_name(attacker)
         defender_name = self._display_name(defender)
-        opening = f"{attacker_name} 采用「{strategy or '稳扎稳打'}」试探，{defender_name} 以{defender_type}构筑应对。"
+        opening = (
+            f"{attacker_name} 采用「{attacker_strategy}」试探，"
+            f"{defender_name} 以「{defender_strategy}」应对。"
+        )
         swing = (
-            f"{attacker_name} 利用{attacker_type}优势逐步抢到节奏。"
+            f"{attacker_name} 利用{attacker_type}优势和策略节奏逐步抢到主动。"
             if attacker_wins
-            else f"{defender_name} 扛住开局压力，抓住随机变数完成反制。"
+            else f"{defender_name} 用{defender_type}属性稳住局面，抓住随机变数完成反制。"
         )
         finish = (
             f"最终回合：{attacker_name} 打穿防线，攻击方获胜。"
@@ -289,20 +346,108 @@ class BattleService:
             bonus += 0.04
         return bonus
 
-    def _strategy_bonus(self, user: User, opponent: User, strategy: str) -> float:
-        text = (strategy or "").lower()
+    def _resolve_strategy(self, raw_strategy: str) -> tuple[str, bool]:
+        text = (raw_strategy or "").strip()
         if not text:
-            return 0.0
-        user_type = self._build_type(user)
+            return random.choice(config.BATTLE_STRATEGY_NAMES), True
+        for strategy in config.BATTLE_STRATEGY_NAMES:
+            if text == strategy or strategy in text:
+                return strategy, False
+        for alias, strategy in config.BATTLE_STRATEGY_ALIASES.items():
+            if alias in text:
+                return strategy, False
+        return random.choice(config.BATTLE_STRATEGY_NAMES), True
+
+    def _strategy_counter_bonus(
+        self,
+        attacker_strategy: str,
+        defender_strategy: str,
+        attacker_effect: dict,
+        defender_effect: dict,
+    ) -> float:
         bonus = 0.0
-        if user_type == "速度" and any(k in text for k in ["游走", "闪避", "拉扯", "先手", "消耗"]):
-            bonus += 0.06
-        if user_type == "攻击" and any(k in text for k in ["爆发", "强攻", "速攻", "进攻"]):
-            bonus += 0.06
-        if user_type in {"防御", "生命"} and any(k in text for k in ["防守", "拖", "反击", "消耗", "持久"]):
-            bonus += 0.06
-        if user_type == "幸运" and any(k in text for k in ["奇袭", "冒险", "扰乱", "赌"]):
-            bonus += 0.04
-        if user.hp < opponent.atk * 2 and any(k in text for k in ["硬扛", "硬抗", "正面硬拼"]):
-            bonus -= 0.05
+        if defender_strategy in config.BATTLE_STRATEGY_COUNTERS.get(attacker_strategy, ()):
+            bonus += 0.08 if attacker_effect["ready"] else -0.06
+        if attacker_strategy in config.BATTLE_STRATEGY_COUNTERS.get(defender_strategy, ()):
+            bonus -= 0.08 if defender_effect["ready"] else -0.06
         return bonus
+
+    def _strategy_attribute_effect(
+        self,
+        user: User,
+        opponent: User,
+        strategy: str,
+    ) -> dict:
+        rules = config.BATTLE_STRATEGY_ATTRIBUTE_RULES.get(strategy, ())
+        score = 0.0
+        passed = []
+        failed = []
+        critical_failed = False
+        for rule in rules:
+            (
+                own_stat,
+                opponent_stat,
+                own_factor,
+                opponent_factor,
+                margin,
+                success_bonus,
+                fail_penalty,
+                critical,
+            ) = rule
+            own_value = getattr(user, own_stat) * own_factor
+            required_value = getattr(opponent, opponent_stat) * opponent_factor + margin
+            label = config.STAT_LABELS.get(own_stat, own_stat)
+            if own_value >= required_value:
+                score += success_bonus
+                passed.append(label)
+            else:
+                score += fail_penalty
+                failed.append(label)
+                if critical:
+                    critical_failed = True
+        required_pass_count = max(1, (len(rules) + 1) // 2)
+        ready = not critical_failed and len(passed) >= required_pass_count
+        return {
+            "score": score,
+            "ready": ready,
+            "passed": passed,
+            "failed": failed,
+            "critical_failed": critical_failed,
+        }
+
+    def _strategy_relation_text(
+        self,
+        attacker_strategy: str,
+        defender_strategy: str,
+        bonus: float,
+        attacker_effect: dict,
+        defender_effect: dict,
+    ) -> str:
+        attacker_names_counter = defender_strategy in config.BATTLE_STRATEGY_COUNTERS.get(
+            attacker_strategy,
+            (),
+        )
+        defender_names_counter = attacker_strategy in config.BATTLE_STRATEGY_COUNTERS.get(
+            defender_strategy,
+            (),
+        )
+        if bonus > 0:
+            if attacker_names_counter and attacker_effect["ready"]:
+                return f"「{attacker_strategy}」条件达标，对「{defender_strategy}」形成克制。"
+            if defender_names_counter and not defender_effect["ready"]:
+                return f"「{defender_strategy}」尝试应对但条件不足，反给攻击方机会。"
+            return "攻击方策略执行质量略好。"
+        if bonus < 0:
+            if defender_names_counter and defender_effect["ready"]:
+                return f"「{defender_strategy}」条件达标，对「{attacker_strategy}」形成克制。"
+            if attacker_names_counter and not attacker_effect["ready"]:
+                return f"「{attacker_strategy}」条件不足，强行执行受到反噬。"
+            return "防守方策略执行质量略好。"
+        return f"「{attacker_strategy}」与「{defender_strategy}」没有明显克制。"
+
+    def _strategy_effect_text(self, name: str, strategy: str, effect: dict) -> str:
+        passed = "、".join(effect["passed"][:2]) or "无明显属性"
+        failed = "、".join(effect["failed"][:2])
+        if failed:
+            return f"{name}执行「{strategy}」时{passed}达标，{failed}不足。"
+        return f"{name}执行「{strategy}」时{passed}达标。"

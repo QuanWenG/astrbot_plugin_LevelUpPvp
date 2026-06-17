@@ -173,7 +173,7 @@ class LevelUpPvpCommandHandler:
                 text = text.replace(token, " ")
         text = re.sub(r"<@!?[^>\s]+>", " ", text)
         text = " ".join(text.split())
-        return text or "稳扎稳打"
+        return text
 
     def _format_profile(self, user: User) -> str:
         return "\n".join(
@@ -219,6 +219,11 @@ class LevelUpPvpCommandHandler:
         loser_name = self._display_name(result.loser)
         lines = [
             f"{attacker_name} VS {defender_name}",
+            "策略："
+            f"攻击方「{result.attacker_strategy}」"
+            f"{'（随机）' if result.attacker_strategy_random else ''} / "
+            f"防守方「{result.defender_strategy}」"
+            f"{'（随机）' if result.defender_strategy_random else ''}",
             f"攻击方胜率：{rate:.1f}% / 随机值：{roll:.1f}%",
             f"结算：{winner_name} +{result.winner_exp_gain} 经验，"
             f"{loser_name} -{result.loser_exp_loss} 经验",
