@@ -1,24 +1,79 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+import os
+
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+
+try:
+    from .handles.command_handler import LevelUpPvpCommandHandler
+    from .services.battle_service import BattleService
+    from .services.checkin_service import CheckinService
+    from .services.db import init_db
+    from .services.llm_service import LLMService
+    from .services.stat_service import StatService
+    from .services.user_service import UserService
+except ImportError:
+    from handles.command_handler import LevelUpPvpCommandHandler
+    from services.battle_service import BattleService
+    from services.checkin_service import CheckinService
+    from services.db import init_db
+    from services.llm_service import LLMService
+    from services.stat_service import StatService
+    from services.user_service import UserService
+
+
+PLUGIN_DIR = os.path.dirname(__file__)
+DB_PATH = os.path.join(PLUGIN_DIR, "data", "db_level_up_pvp.db")
+
 
 @register("astrbot_plugin_LevelUpPvp", "QuanWenG", "升级就开打", "1.0.0")
 class MyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
+        user_service = UserService(DB_PATH)
+        checkin_service = CheckinService(DB_PATH, user_service)
+        stat_service = StatService(DB_PATH, user_service)
+        llm_service = LLMService()
+        battle_service = BattleService(DB_PATH, user_service, llm_service)
+        self.command_handler = LevelUpPvpCommandHandler(
+            context=context,
+            user_service=user_service,
+            checkin_service=checkin_service,
+            stat_service=stat_service,
+            battle_service=battle_service,
+        )
 
     async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        """初始化插件数据库。"""
+        await init_db(DB_PATH)
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+    @filter.command("签到")
+    async def sign(self, event: AstrMessageEvent):
+        """每日签到获取随机经验。"""
+        async for result in self.command_handler.sign(event):
+            yield result
+
+    @filter.command("面板")
+    async def profile(self, event: AstrMessageEvent):
+        """查看自己的等级、经验和属性。"""
+        async for result in self.command_handler.profile(event):
+            yield result
+
+    @filter.command("加点")
+    async def add_point(
+        self,
+        event: AstrMessageEvent,
+        stat_name: str = "",
+        amount: int = 1,
+    ):
+        """消耗自定义属性点，按属性随机范围提升属性。"""
+        async for result in self.command_handler.add_point(event, stat_name, amount):
+            yield result
+
+    @filter.command("挑战")
+    async def challenge(self, event: AstrMessageEvent):
+        """At 一名用户发起概率战斗。"""
+        async for result in self.command_handler.challenge(event):
+            yield result
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        """插件卸载时无需额外清理。"""
