@@ -131,7 +131,7 @@ class UserService:
                 """
                 SELECT * FROM users
                 WHERE platform = ? AND group_id = ?
-                ORDER BY level DESC, total_exp DESC, exp DESC, id ASC
+                ORDER BY level DESC, exp DESC, total_exp DESC, id ASC
                 LIMIT ?
                 """,
                 (platform, group_id, limit),
@@ -150,7 +150,7 @@ class UserService:
                 """
                 SELECT * FROM users
                 WHERE platform = ? AND group_id = ?
-                ORDER BY level DESC, total_exp DESC, exp DESC, id ASC
+                ORDER BY level DESC, exp DESC, total_exp DESC, id ASC
                 """,
                 (identity.platform, group_id),
             )

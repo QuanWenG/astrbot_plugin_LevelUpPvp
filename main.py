@@ -82,8 +82,38 @@ class MyPlugin(Star):
             yield result
 
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def alias_challenge(self, event: AstrMessageEvent):
-        """包含 At 和“艾斯比”的普通消息视为挑战。"""
+    async def mentioned_command(self, event: AstrMessageEvent):
+        """普通消息里的 @机器人指令 或挑战唤起词。"""
+        mentioned_command = self.command_handler.parse_mentioned_command(event)
+        if mentioned_command:
+            command, args = mentioned_command
+            if command == "签到":
+                async for result in self.command_handler.sign(event):
+                    yield result
+            elif command == "面板":
+                async for result in self.command_handler.profile(event):
+                    yield result
+            elif command == "加点":
+                parsed_args = self.command_handler.parse_add_point_args(args)
+                if not parsed_args:
+                    yield event.plain_result("用法：/加点 攻击 2")
+                else:
+                    stat_name, amount = parsed_args
+                    async for result in self.command_handler.add_point(
+                        event,
+                        stat_name,
+                        amount,
+                    ):
+                        yield result
+            elif command == "排行":
+                async for result in self.command_handler.ranking(event):
+                    yield result
+            elif command == "挑战":
+                async for result in self.command_handler.challenge(event):
+                    yield result
+            event.stop_event()
+            return
+
         if not self.command_handler.is_alias_challenge_event(event):
             return
         async for result in self.command_handler.challenge(event):

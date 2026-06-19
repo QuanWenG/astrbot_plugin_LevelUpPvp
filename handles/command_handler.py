@@ -18,7 +18,12 @@ CHALLENGE_WAKE_WORDS = [
     "艾斯比",
     "啥比"
 ]
+MENTION_COMMAND_NAMES = ("签到", "面板", "加点", "排行", "挑战")
+MENTION_COMMAND_PATTERN = re.compile(
+    rf"^/?({'|'.join(MENTION_COMMAND_NAMES)})(?:\s|$)"
+)
 CHALLENGE_COMMAND_PATTERN = re.compile(r"^/?挑战(?:\s|$)")
+SLASH_CHALLENGE_COMMAND_PATTERN = re.compile(r"^/挑战(?:\s|$)")
 
 
 class LevelUpPvpCommandHandler:
@@ -163,11 +168,45 @@ class LevelUpPvpCommandHandler:
 
     def is_alias_challenge_event(self, event: AstrMessageEvent) -> bool:
         message = (event.get_message_str() or "").strip()
-        if not any(word and word in message for word in CHALLENGE_WAKE_WORDS):
+        if (
+            MENTION_COMMAND_PATTERN.match(message)
+            or SLASH_CHALLENGE_COMMAND_PATTERN.match(message)
+        ):
             return False
-        if CHALLENGE_COMMAND_PATTERN.match(message):
+        has_wake_word = any(word and word in message for word in CHALLENGE_WAKE_WORDS)
+        has_mention_command = "挑战" in message and (
+            self._is_self_mentioned(event) or CHALLENGE_COMMAND_PATTERN.match(message)
+        )
+        if not has_wake_word and not has_mention_command:
             return False
         return self._target_identity_from_event(event) is not None
+
+    def parse_mentioned_command(self, event: AstrMessageEvent) -> tuple[str, str] | None:
+        if not self._is_self_mentioned(event):
+            return None
+        message = (event.get_message_str() or "").strip()
+        if MENTION_COMMAND_PATTERN.match(message):
+            return None
+        text = self._text_without_mentions(event)
+        match = MENTION_COMMAND_PATTERN.match(text)
+        if not match:
+            return None
+        command = match.group(1)
+        args = text[match.end():].strip()
+        return command, args
+
+    def parse_add_point_args(self, args: str) -> tuple[str, int] | None:
+        parts = args.split()
+        if not parts:
+            return None
+        stat_name = parts[0]
+        amount = 1
+        if len(parts) >= 2:
+            try:
+                amount = int(parts[1])
+            except ValueError:
+                return None
+        return stat_name, amount
 
     def _identity_from_event(self, event: AstrMessageEvent) -> UserIdentity:
         return UserIdentity(
@@ -193,9 +232,10 @@ class LevelUpPvpCommandHandler:
                 nickname=comp.name or target_id,
             )
         message = event.get_message_str() or ""
+        ignored_ids = self._ignored_target_ids(event)
         for match in re.finditer(r"<@!?([^>\s]+)>", message):
             target_id = match.group(1).strip()
-            if target_id and target_id not in {"all", sender_id, self_id, "qq_official"}:
+            if target_id and target_id not in ignored_ids:
                 return UserIdentity(
                     platform=event.get_platform_id() or event.get_platform_name() or "unknown",
                     group_id=event.get_group_id() or "",
@@ -203,6 +243,52 @@ class LevelUpPvpCommandHandler:
                     nickname=target_id,
                 )
         return None
+
+    def _is_self_mentioned(self, event: AstrMessageEvent) -> bool:
+        ignored_ids = self._ignored_target_ids(event)
+        for comp in event.get_messages():
+            if isinstance(comp, At) and str(comp.qq) in ignored_ids:
+                return True
+        message = event.get_message_str() or ""
+        return any(
+            match.group(1).strip() in ignored_ids
+            for match in re.finditer(r"<@!?([^>\s]+)>", message)
+        )
+
+    def _ignored_target_ids(self, event: AstrMessageEvent) -> set[str]:
+        sender_id = event.get_sender_id()
+        self_id = event.get_self_id()
+        ignored_ids = {"all", "qq_official"}
+        if sender_id:
+            ignored_ids.add(sender_id)
+        if self_id:
+            ignored_ids.add(self_id)
+
+        has_self_component = any(
+            isinstance(comp, At) and str(comp.qq) in ignored_ids
+            for comp in event.get_messages()
+        )
+        if has_self_component:
+            message = event.get_message_str() or ""
+            match = re.search(r"<@!?([^>\s]+)>", message)
+            command_index = self._first_command_index(message)
+            if match and command_index != -1 and match.start() < command_index:
+                ignored_ids.add(match.group(1).strip())
+        return ignored_ids
+
+    def _first_command_index(self, message: str) -> int:
+        indexes = [
+            message.find(command)
+            for command in MENTION_COMMAND_NAMES
+            if message.find(command) != -1
+        ]
+        return min(indexes) if indexes else -1
+
+    def _text_without_mentions(self, event: AstrMessageEvent) -> str:
+        text = event.get_message_str() or ""
+        text = re.sub(r"<@!?[^>\s]+>", " ", text)
+        text = re.sub(r"@\S+", " ", text)
+        return " ".join(text.split())
 
     def _extract_strategy(
         self,
@@ -216,16 +302,18 @@ class LevelUpPvpCommandHandler:
             text = CHALLENGE_COMMAND_PATTERN.sub("", message).strip()
         for token in [
             *CHALLENGE_WAKE_WORDS,
-            target_identity.user_id,
-            target_identity.nickname,
-            f"@{target_identity.user_id}",
-            f"@{target_identity.nickname}",
             f"<@{target_identity.user_id}>",
             f"<@!{target_identity.user_id}>",
+            f"@{target_identity.user_id}",
+            f"@{target_identity.nickname}",
+            target_identity.user_id,
+            target_identity.nickname,
         ]:
             if token:
                 text = text.replace(token, " ")
         text = re.sub(r"<@!?[^>\s]+>", " ", text)
+        text = " ".join(text.split())
+        text = CHALLENGE_COMMAND_PATTERN.sub("", text).strip()
         text = " ".join(text.split())
         return text
 
