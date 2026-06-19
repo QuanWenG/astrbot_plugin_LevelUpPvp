@@ -100,14 +100,8 @@ class BattleService:
                 attacker_strategy,
                 defender_strategy,
             )
-            winner_exp_gain = (
-                config.BATTLE_WIN_EXP_BASE
-                + loser.level * config.BATTLE_WIN_EXP_PER_LOSER_LEVEL
-            )
-            loser_exp_loss = (
-                config.BATTLE_LOSE_EXP_BASE
-                + loser.level * config.BATTLE_LOSE_EXP_PER_LOSER_LEVEL
-            )
+            winner_exp_gain = self._roll_winner_exp_gain(winner, loser)
+            loser_exp_loss = self._roll_loser_exp_loss(winner, loser)
 
             winner_exp = await self.user_service.add_exp_in_db(db, winner, winner_exp_gain)
             await self.user_service.deduct_exp_in_db(db, loser, loser_exp_loss)
@@ -315,6 +309,32 @@ class BattleService:
             else f"最终回合：{defender_name} 反击得手，防守方获胜。"
         )
         return [opening, swing, finish]
+
+    def _roll_winner_exp_gain(self, winner: User, loser: User) -> int:
+        base = (
+            config.BATTLE_WIN_EXP_BASE
+            + loser.level * config.BATTLE_WIN_EXP_PER_LOSER_LEVEL
+        )
+        level_diff = winner.level - loser.level
+        level_multiplier = config.clamp(
+            1 - level_diff * config.BATTLE_WIN_EXP_LEVEL_DIFF_STEP,
+            *config.BATTLE_WIN_EXP_LEVEL_MULTIPLIER_RANGE,
+        )
+        random_multiplier = random.uniform(*config.BATTLE_WIN_EXP_RANDOM_MULTIPLIER_RANGE)
+        return max(1, round(base * level_multiplier * random_multiplier))
+
+    def _roll_loser_exp_loss(self, winner: User, loser: User) -> int:
+        base = (
+            config.BATTLE_LOSE_EXP_BASE
+            + loser.level * config.BATTLE_LOSE_EXP_PER_LOSER_LEVEL
+        )
+        level_diff = loser.level - winner.level
+        level_multiplier = config.clamp(
+            1 + level_diff * config.BATTLE_LOSE_EXP_LEVEL_DIFF_STEP,
+            *config.BATTLE_LOSE_EXP_LEVEL_MULTIPLIER_RANGE,
+        )
+        random_multiplier = random.uniform(*config.BATTLE_LOSE_EXP_RANDOM_MULTIPLIER_RANGE)
+        return max(1, round(base * level_multiplier * random_multiplier))
 
     def _display_name(self, user: User) -> str:
         name = user.nickname or user.user_id

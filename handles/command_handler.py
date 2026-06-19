@@ -13,7 +13,11 @@ except ImportError:
     from services import config
 
 
-CHALLENGE_WAKE_WORD = "艾斯比"
+"""很不文明哦，好孩子别学"""
+CHALLENGE_WAKE_WORDS = [
+    "艾斯比",
+    "啥比"
+]
 CHALLENGE_COMMAND_PATTERN = re.compile(r"^/?挑战(?:\s|$)")
 
 
@@ -97,6 +101,43 @@ class LevelUpPvpCommandHandler:
         except Exception as exc:
             yield event.plain_result(str(exc))
 
+    async def ranking(self, event: AstrMessageEvent) -> AsyncGenerator:
+        try:
+            target_identity = self._target_identity_from_event(event)
+            if target_identity:
+                result = await self.user_service.get_user_rank(target_identity)
+                if not result:
+                    yield event.plain_result("该用户暂无排行数据。")
+                    return
+                rank, user = result
+                yield event.plain_result(
+                    "\n".join(
+                        [
+                            "排名 用户名 等级 当前经验/升级所需经验",
+                            self._format_ranking_line(rank, user),
+                        ]
+                    )
+                )
+                return
+
+            identity = self._identity_from_event(event)
+            ranked_users = await self.user_service.get_top_users(
+                identity.platform,
+                identity.group_id,
+                10,
+            )
+            if not ranked_users:
+                yield event.plain_result("当前群暂无排行数据。")
+                return
+            lines = ["等级排行 TOP10", "排名 用户名 等级 当前经验/升级所需经验"]
+            lines.extend(
+                self._format_ranking_line(rank, user) for rank, user in ranked_users
+            )
+            yield event.plain_result("\n".join(lines))
+        except Exception as exc:
+            logger.exception("LevelUpPvp ranking failed")
+            yield event.plain_result(f"查看排行失败：{exc}")
+
     async def challenge(self, event: AstrMessageEvent) -> AsyncGenerator:
         try:
             target_identity = self._target_identity_from_event(event)
@@ -122,7 +163,7 @@ class LevelUpPvpCommandHandler:
 
     def is_alias_challenge_event(self, event: AstrMessageEvent) -> bool:
         message = (event.get_message_str() or "").strip()
-        if CHALLENGE_WAKE_WORD not in message:
+        if not any(word and word in message for word in CHALLENGE_WAKE_WORDS):
             return False
         if CHALLENGE_COMMAND_PATTERN.match(message):
             return False
@@ -174,7 +215,7 @@ class LevelUpPvpCommandHandler:
             message = event.get_message_str().strip()
             text = CHALLENGE_COMMAND_PATTERN.sub("", message).strip()
         for token in [
-            CHALLENGE_WAKE_WORD,
+            *CHALLENGE_WAKE_WORDS,
             target_identity.user_id,
             target_identity.nickname,
             f"@{target_identity.user_id}",
@@ -208,6 +249,10 @@ class LevelUpPvpCommandHandler:
             f"属性：生命 {user.hp} / 攻击 {user.atk} / 防御 {user.defense} / "
             f"速度 {user.speed} / 幸运 {user.luck}"
         )
+
+    def _format_ranking_line(self, rank: int, user: User) -> str:
+        required = config.exp_required_for_next_level(user.level)
+        return f"{rank} {self._display_name(user)} Lv.{user.level} {user.exp}/{required}"
 
     def _format_level_ups(self, level_ups: list[LevelUpEvent]) -> str:
         lines = ["升级成长："]

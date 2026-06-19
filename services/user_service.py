@@ -119,6 +119,49 @@ class UserService:
             raise ValueError("用户不存在")
         return row_to_user(row)
 
+    async def get_top_users(
+        self,
+        platform: str,
+        group_id: str,
+        limit: int = 10,
+    ) -> list[tuple[int, User]]:
+        group_id = group_id or ""
+        async with await connect_db(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT * FROM users
+                WHERE platform = ? AND group_id = ?
+                ORDER BY level DESC, total_exp DESC, exp DESC, id ASC
+                LIMIT ?
+                """,
+                (platform, group_id, limit),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [(index, row_to_user(row)) for index, row in enumerate(rows, start=1)]
+
+    async def get_user_rank(
+        self,
+        identity: UserIdentity,
+    ) -> tuple[int, User] | None:
+        group_id = identity.group_id or ""
+        async with await connect_db(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT * FROM users
+                WHERE platform = ? AND group_id = ?
+                ORDER BY level DESC, total_exp DESC, exp DESC, id ASC
+                """,
+                (identity.platform, group_id),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        for index, row in enumerate(rows, start=1):
+            user = row_to_user(row)
+            if user.user_id == identity.user_id:
+                return index, user
+        return None
+
     async def add_exp_in_db(self, db, user: User, amount: int) -> ExpChangeResult:
         if amount <= 0:
             return ExpChangeResult(user=user, exp_delta=0, level_ups=[])

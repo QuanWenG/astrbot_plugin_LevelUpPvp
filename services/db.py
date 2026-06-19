@@ -14,6 +14,9 @@ class _AsyncSQLiteCursor:
     async def fetchone(self):
         return self._cursor.fetchone()
 
+    async def fetchall(self):
+        return self._cursor.fetchall()
+
     async def close(self) -> None:
         self._cursor.close()
 

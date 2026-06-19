@@ -69,6 +69,12 @@ class MyPlugin(Star):
         async for result in self.command_handler.add_point(event, stat_name, amount):
             yield result
 
+    @filter.command("排行")
+    async def ranking(self, event: AstrMessageEvent):
+        """查看当前群等级排行榜，At 用户时查看该用户排名。"""
+        async for result in self.command_handler.ranking(event):
+            yield result
+
     @filter.command("挑战")
     async def challenge(self, event: AstrMessageEvent):
         """At 一名用户发起概率战斗。"""
