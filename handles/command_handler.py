@@ -13,6 +13,10 @@ except ImportError:
     from services import config
 
 
+CHALLENGE_WAKE_WORD = "艾斯比"
+CHALLENGE_COMMAND_PATTERN = re.compile(r"^/?挑战(?:\s|$)")
+
+
 class LevelUpPvpCommandHandler:
     def __init__(
         self,
@@ -116,6 +120,14 @@ class LevelUpPvpCommandHandler:
             logger.exception("LevelUpPvp battle failed")
             yield event.plain_result(f"挑战失败：{exc}")
 
+    def is_alias_challenge_event(self, event: AstrMessageEvent) -> bool:
+        message = (event.get_message_str() or "").strip()
+        if CHALLENGE_WAKE_WORD not in message:
+            return False
+        if CHALLENGE_COMMAND_PATTERN.match(message):
+            return False
+        return self._target_identity_from_event(event) is not None
+
     def _identity_from_event(self, event: AstrMessageEvent) -> UserIdentity:
         return UserIdentity(
             platform=event.get_platform_id() or event.get_platform_name() or "unknown",
@@ -160,8 +172,9 @@ class LevelUpPvpCommandHandler:
         text = parsed_strategy.strip()
         if not text:
             message = event.get_message_str().strip()
-            text = re.sub(r"^/?挑战\b", "", message).strip()
+            text = CHALLENGE_COMMAND_PATTERN.sub("", message).strip()
         for token in [
+            CHALLENGE_WAKE_WORD,
             target_identity.user_id,
             target_identity.nickname,
             f"@{target_identity.user_id}",

@@ -75,5 +75,14 @@ class MyPlugin(Star):
         async for result in self.command_handler.challenge(event):
             yield result
 
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def alias_challenge(self, event: AstrMessageEvent):
+        """包含 At 和“艾斯比”的普通消息视为挑战。"""
+        if not self.command_handler.is_alias_challenge_event(event):
+            return
+        async for result in self.command_handler.challenge(event):
+            yield result
+        event.stop_event()
+
     async def terminate(self):
         """插件卸载时无需额外清理。"""
