@@ -64,7 +64,25 @@ class UserService:
         now = utc_now_text()
         if row:
             user = row_to_user(row)
-            if identity.nickname and identity.nickname != user.nickname:
+            registered_nickname = await self.get_registered_nickname_in_db(
+                db,
+                identity.platform,
+                group_id,
+                identity.user_id,
+            )
+            if registered_nickname and registered_nickname != user.nickname:
+                await db.execute(
+                    "UPDATE users SET nickname = ?, updated_at = ? WHERE id = ?",
+                    (registered_nickname, now, user.id),
+                )
+                user.nickname = registered_nickname
+                user.updated_at = now
+            elif (
+                not registered_nickname
+                and identity.platform != "qq_official"
+                and identity.nickname
+                and identity.nickname != user.nickname
+            ):
                 await db.execute(
                     "UPDATE users SET nickname = ?, updated_at = ? WHERE id = ?",
                     (identity.nickname, now, user.id),
@@ -73,6 +91,13 @@ class UserService:
                 user.updated_at = now
             return user, False
 
+        registered_nickname = await self.get_registered_nickname_in_db(
+            db,
+            identity.platform,
+            group_id,
+            identity.user_id,
+        )
+        nickname = registered_nickname or self._default_nickname(identity)
         await db.execute(
             """
             INSERT INTO users (
@@ -85,7 +110,7 @@ class UserService:
                 identity.platform,
                 group_id,
                 identity.user_id,
-                identity.nickname or identity.user_id,
+                nickname,
                 config.INITIAL_LEVEL,
                 config.INITIAL_EXP,
                 config.INITIAL_TOTAL_EXP,
@@ -111,13 +136,120 @@ class UserService:
         await cursor.close()
         return row_to_user(row), True
 
+    async def register_nickname(self, identity: UserIdentity, nickname: str) -> User:
+        nickname = " ".join((nickname or "").split())
+        if not nickname:
+            raise ValueError("用法：/登记 昵称")
+        if len(nickname) > 32:
+            raise ValueError("昵称最多 32 个字符")
+
+        group_id = identity.group_id or ""
+        async with await connect_db(self.db_path) as db:
+            await db.execute("BEGIN")
+            user, _ = await self.get_or_create_user_in_db(db, identity)
+            now = utc_now_text()
+            mapped_group_ids = {group_id, ""}
+            for mapped_group_id in mapped_group_ids:
+                await self.set_registered_nickname_in_db(
+                    db,
+                    identity.platform,
+                    mapped_group_id,
+                    identity.user_id,
+                    nickname,
+                    now,
+                )
+            await db.execute(
+                "UPDATE users SET nickname = ?, updated_at = ? WHERE id = ?",
+                (nickname, now, user.id),
+            )
+            await db.commit()
+            return await self.get_user_by_pk_in_db(db, user.id)
+
+    async def has_registered_nickname(self, identity: UserIdentity) -> bool:
+        async with await connect_db(self.db_path) as db:
+            nickname = await self.get_registered_nickname_in_db(
+                db,
+                identity.platform,
+                identity.group_id,
+                identity.user_id,
+            )
+            return bool(nickname)
+
     async def get_user_by_pk_in_db(self, db, user_pk: int) -> User:
         cursor = await db.execute("SELECT * FROM users WHERE id = ?", (user_pk,))
         row = await cursor.fetchone()
         await cursor.close()
         if not row:
             raise ValueError("用户不存在")
-        return row_to_user(row)
+        user = row_to_user(row)
+        registered_nickname = await self.get_registered_nickname_in_db(
+            db,
+            user.platform,
+            user.group_id,
+            user.user_id,
+        )
+        if registered_nickname:
+            user.nickname = registered_nickname
+        return user
+
+    async def get_registered_nickname_in_db(
+        self,
+        db,
+        platform: str,
+        group_id: str,
+        user_id: str,
+    ) -> str:
+        cursor = await db.execute(
+            """
+            SELECT nickname FROM nickname_mappings
+            WHERE platform = ?
+              AND user_id = ?
+              AND group_id IN (?, '')
+            ORDER BY CASE WHEN group_id = ? THEN 0 ELSE 1 END
+            LIMIT 1
+            """,
+            (platform, user_id, group_id or "", group_id or ""),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row["nickname"] if row else ""
+
+    async def set_registered_nickname_in_db(
+        self,
+        db,
+        platform: str,
+        group_id: str,
+        user_id: str,
+        nickname: str,
+        now: str,
+    ) -> None:
+        cursor = await db.execute(
+            """
+            SELECT id FROM nickname_mappings
+            WHERE platform = ? AND group_id = ? AND user_id = ?
+            """,
+            (platform, group_id or "", user_id),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row:
+            await db.execute(
+                """
+                UPDATE nickname_mappings
+                SET nickname = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (nickname, now, row["id"]),
+            )
+            return
+        await db.execute(
+            """
+            INSERT INTO nickname_mappings (
+                platform, group_id, user_id, nickname, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (platform, group_id or "", user_id, nickname, now, now),
+        )
 
     async def get_top_users(
         self,
@@ -138,7 +270,19 @@ class UserService:
             )
             rows = await cursor.fetchall()
             await cursor.close()
-        return [(index, row_to_user(row)) for index, row in enumerate(rows, start=1)]
+            ranked_users = []
+            for index, row in enumerate(rows, start=1):
+                user = row_to_user(row)
+                registered_nickname = await self.get_registered_nickname_in_db(
+                    db,
+                    user.platform,
+                    user.group_id,
+                    user.user_id,
+                )
+                if registered_nickname:
+                    user.nickname = registered_nickname
+                ranked_users.append((index, user))
+        return ranked_users
 
     async def get_user_rank(
         self,
@@ -156,10 +300,18 @@ class UserService:
             )
             rows = await cursor.fetchall()
             await cursor.close()
-        for index, row in enumerate(rows, start=1):
-            user = row_to_user(row)
-            if user.user_id == identity.user_id:
-                return index, user
+            for index, row in enumerate(rows, start=1):
+                user = row_to_user(row)
+                registered_nickname = await self.get_registered_nickname_in_db(
+                    db,
+                    user.platform,
+                    user.group_id,
+                    user.user_id,
+                )
+                if registered_nickname:
+                    user.nickname = registered_nickname
+                if user.user_id == identity.user_id:
+                    return index, user
         return None
 
     async def add_exp_in_db(self, db, user: User, amount: int) -> ExpChangeResult:
@@ -269,3 +421,8 @@ class UserService:
             stat_name: random.randint(*config.AUTO_GROWTH_RANGES[stat_name])
             for stat_name in selected
         }
+
+    def _default_nickname(self, identity: UserIdentity) -> str:
+        if identity.platform == "qq_official":
+            return identity.user_id
+        return identity.nickname or identity.user_id

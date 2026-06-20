@@ -128,12 +128,15 @@ async def init_db(db_path: str) -> None:
                 battle_log TEXT NOT NULL DEFAULT '[]',
                 llm_raw_result TEXT NOT NULL DEFAULT '',
                 source TEXT NOT NULL DEFAULT 'local',
+                is_counterattack INTEGER NOT NULL DEFAULT 0,
+                countered_battle_id INTEGER,
                 created_at TEXT NOT NULL,
                 created_at_ts INTEGER NOT NULL,
                 FOREIGN KEY(attacker_pk) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(defender_pk) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(winner_pk) REFERENCES users(id) ON DELETE CASCADE,
-                FOREIGN KEY(loser_pk) REFERENCES users(id) ON DELETE CASCADE
+                FOREIGN KEY(loser_pk) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(countered_battle_id) REFERENCES battles(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS level_up_logs (
@@ -158,6 +161,17 @@ async def init_db(db_path: str) -> None:
                 FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS nickname_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL,
+                group_id TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL,
+                nickname TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(platform, group_id, user_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_checkins_user_date
                 ON checkins(user_pk, checkin_date);
             CREATE INDEX IF NOT EXISTS idx_battles_attacker
@@ -170,6 +184,30 @@ async def init_db(db_path: str) -> None:
                 ON level_up_logs(user_pk);
             CREATE INDEX IF NOT EXISTS idx_stat_point_logs_user
                 ON stat_point_logs(user_pk);
+            CREATE INDEX IF NOT EXISTS idx_nickname_mappings_lookup
+                ON nickname_mappings(platform, group_id, user_id);
+            """
+        )
+        await _ensure_column(
+            db,
+            "battles",
+            "is_counterattack",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        await _ensure_column(db, "battles", "countered_battle_id", "INTEGER")
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_battles_countered
+                ON battles(countered_battle_id)
             """
         )
         await db.commit()
+
+
+async def _ensure_column(db, table_name: str, column_name: str, definition: str) -> None:
+    cursor = await db.execute(f"PRAGMA table_info({table_name})")
+    rows = await cursor.fetchall()
+    await cursor.close()
+    if any(row["name"] == column_name for row in rows):
+        return
+    await db.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")

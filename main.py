@@ -75,6 +75,12 @@ class MyPlugin(Star):
         async for result in self.command_handler.ranking(event):
             yield result
 
+    @filter.command("登记")
+    async def register_nickname(self, event: AstrMessageEvent, nickname: str = ""):
+        """登记 QQ official openid 对应的展示昵称。"""
+        async for result in self.command_handler.register_nickname(event, nickname):
+            yield result
+
     @filter.command("挑战")
     async def challenge(self, event: AstrMessageEvent):
         """At 一名用户发起概率战斗。"""
@@ -107,6 +113,9 @@ class MyPlugin(Star):
                         yield result
             elif command == "排行":
                 async for result in self.command_handler.ranking(event):
+                    yield result
+            elif command == "登记":
+                async for result in self.command_handler.register_nickname(event, args):
                     yield result
             elif command == "挑战":
                 async for result in self.command_handler.challenge(event):

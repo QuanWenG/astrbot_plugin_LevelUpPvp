@@ -34,3 +34,4 @@ class BattleResult:
     level_ups: list = field(default_factory=list)
     source: str = "local"
     target_created: bool = False
+    is_counterattack: bool = False

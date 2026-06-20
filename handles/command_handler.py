@@ -18,12 +18,13 @@ CHALLENGE_WAKE_WORDS = [
     "艾斯比",
     "啥比"
 ]
-MENTION_COMMAND_NAMES = ("签到", "面板", "加点", "排行", "挑战")
+MENTION_COMMAND_NAMES = ("签到", "面板", "加点", "排行", "登记", "挑战")
 MENTION_COMMAND_PATTERN = re.compile(
     rf"^/?({'|'.join(MENTION_COMMAND_NAMES)})(?:\s|$)"
 )
 CHALLENGE_COMMAND_PATTERN = re.compile(r"^/?挑战(?:\s|$)")
 SLASH_CHALLENGE_COMMAND_PATTERN = re.compile(r"^/挑战(?:\s|$)")
+REGISTRATION_REQUIRED_MESSAGE = "请先使用 /登记 昵称 完成昵称登记后再使用本插件指令。"
 
 
 class LevelUpPvpCommandHandler:
@@ -43,6 +44,10 @@ class LevelUpPvpCommandHandler:
         self.battle_service = battle_service
 
     async def sign(self, event: AstrMessageEvent) -> AsyncGenerator:
+        registration_error = await self._registration_error(event)
+        if registration_error:
+            yield event.plain_result(registration_error)
+            return
         try:
             result = await self.checkin_service.checkin(self._identity_from_event(event))
             if result.already_checked:
@@ -65,6 +70,10 @@ class LevelUpPvpCommandHandler:
             yield event.plain_result(f"签到失败：{exc}")
 
     async def profile(self, event: AstrMessageEvent) -> AsyncGenerator:
+        registration_error = await self._registration_error(event)
+        if registration_error:
+            yield event.plain_result(registration_error)
+            return
         try:
             identity = self._target_identity_from_event(event) or self._identity_from_event(
                 event
@@ -81,6 +90,10 @@ class LevelUpPvpCommandHandler:
         stat_name: str = "",
         amount: int = 1,
     ) -> AsyncGenerator:
+        registration_error = await self._registration_error(event)
+        if registration_error:
+            yield event.plain_result(registration_error)
+            return
         if not stat_name:
             yield event.plain_result("用法：/加点 攻击 2")
             return
@@ -107,6 +120,10 @@ class LevelUpPvpCommandHandler:
             yield event.plain_result(str(exc))
 
     async def ranking(self, event: AstrMessageEvent) -> AsyncGenerator:
+        registration_error = await self._registration_error(event)
+        if registration_error:
+            yield event.plain_result(registration_error)
+            return
         try:
             target_identity = self._target_identity_from_event(event)
             if target_identity:
@@ -143,7 +160,29 @@ class LevelUpPvpCommandHandler:
             logger.exception("LevelUpPvp ranking failed")
             yield event.plain_result(f"查看排行失败：{exc}")
 
+    async def register_nickname(
+        self,
+        event: AstrMessageEvent,
+        nickname: str = "",
+    ) -> AsyncGenerator:
+        if not nickname:
+            yield event.plain_result("用法：/登记 昵称")
+            return
+        try:
+            user = await self.user_service.register_nickname(
+                self._identity_from_event(event),
+                nickname,
+            )
+            yield event.plain_result(f"登记成功：{self._display_name(user)}")
+        except Exception as exc:
+            logger.exception("LevelUpPvp nickname registration failed")
+            yield event.plain_result(f"登记失败：{exc}")
+
     async def challenge(self, event: AstrMessageEvent) -> AsyncGenerator:
+        registration_error = await self._registration_error(event)
+        if registration_error:
+            yield event.plain_result(registration_error)
+            return
         try:
             target_identity = self._target_identity_from_event(event)
             if not target_identity:
@@ -207,6 +246,12 @@ class LevelUpPvpCommandHandler:
             except ValueError:
                 return None
         return stat_name, amount
+
+    async def _registration_error(self, event: AstrMessageEvent) -> str:
+        identity = self._identity_from_event(event)
+        if await self.user_service.has_registered_nickname(identity):
+            return ""
+        return REGISTRATION_REQUIRED_MESSAGE
 
     def _identity_from_event(self, event: AstrMessageEvent) -> UserIdentity:
         return UserIdentity(
@@ -374,11 +419,15 @@ class LevelUpPvpCommandHandler:
             f"结算：{winner_name} +{result.winner_exp_gain} 经验，"
             f"{loser_name} -{result.loser_exp_loss} 经验",
         ]
+        if result.is_counterattack:
+            lines.insert(1, "反击：本次不消耗主动挑战次数")
         if result.analysis:
             lines.append(f"分析：{result.analysis}")
         if result.battle_log:
             lines.append("战报：")
-            lines.extend(f"- {item}" for item in result.battle_log[:5])
+            lines.extend(
+                f"- {item}" for item in result.battle_log[: config.BATTLE_LOG_MAX_LINES]
+            )
         if result.level_ups:
             lines.append(self._format_level_ups(result.level_ups))
         lines.append("结果：" + ("攻击方获胜" if winner_is_attacker else "防守方获胜"))
