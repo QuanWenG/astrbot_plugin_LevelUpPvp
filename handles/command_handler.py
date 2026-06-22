@@ -1,3 +1,4 @@
+import inspect
 import re
 from collections.abc import AsyncGenerator
 
@@ -18,13 +19,15 @@ CHALLENGE_WAKE_WORDS = [
     "艾斯比",
     "啥比"
 ]
-MENTION_COMMAND_NAMES = ("签到", "面板", "加点", "排行", "登记", "挑战")
+MENTION_COMMAND_NAMES = ("修改登记", "签到", "面板", "加点", "排行", "登记", "挑战")
 MENTION_COMMAND_PATTERN = re.compile(
     rf"^/?({'|'.join(MENTION_COMMAND_NAMES)})(?:\s|$)"
 )
 CHALLENGE_COMMAND_PATTERN = re.compile(r"^/?挑战(?:\s|$)")
 SLASH_CHALLENGE_COMMAND_PATTERN = re.compile(r"^/挑战(?:\s|$)")
+MODIFY_REGISTER_COMMAND_PATTERN = re.compile(r"^/?修改登记(?:\s|$)")
 REGISTRATION_REQUIRED_MESSAGE = "请先使用 /登记 昵称 完成昵称登记后再使用本插件指令。"
+ADMIN_REQUIRED_MESSAGE = "只有 AstrBot 管理员可以使用该指令。"
 
 
 class LevelUpPvpCommandHandler:
@@ -178,6 +181,33 @@ class LevelUpPvpCommandHandler:
             logger.exception("LevelUpPvp nickname registration failed")
             yield event.plain_result(f"登记失败：{exc}")
 
+    async def modify_registered_nickname(
+        self,
+        event: AstrMessageEvent,
+        nickname: str = "",
+    ) -> AsyncGenerator:
+        if not await self._is_astrbot_admin(event):
+            yield event.plain_result(ADMIN_REQUIRED_MESSAGE)
+            return
+        registration_error = await self._registration_error(event)
+        if registration_error:
+            yield event.plain_result(registration_error)
+            return
+
+        target_identity = self._target_identity_from_event(
+            event
+        ) or self._target_identity_from_text(event, nickname)
+        nickname = self._extract_modified_nickname(event, target_identity, nickname)
+        if not target_identity or not nickname:
+            yield event.plain_result("用法：/修改登记 @用户 昵称")
+            return
+        try:
+            user = await self.user_service.register_nickname(target_identity, nickname)
+            yield event.plain_result(f"修改登记成功：{self._display_name(user)}")
+        except Exception as exc:
+            logger.exception("LevelUpPvp admin nickname registration failed")
+            yield event.plain_result(f"修改登记失败：{exc}")
+
     async def challenge(self, event: AstrMessageEvent) -> AsyncGenerator:
         registration_error = await self._registration_error(event)
         if registration_error:
@@ -253,6 +283,19 @@ class LevelUpPvpCommandHandler:
             return ""
         return REGISTRATION_REQUIRED_MESSAGE
 
+    async def _is_astrbot_admin(self, event: AstrMessageEvent) -> bool:
+        check = getattr(event, "is_admin", None)
+        if check is None:
+            return False
+        try:
+            result = check() if callable(check) else check
+            if inspect.isawaitable(result):
+                result = await result
+            return bool(result)
+        except Exception:
+            logger.exception("LevelUpPvp admin permission check failed")
+            return False
+
     def _identity_from_event(self, event: AstrMessageEvent) -> UserIdentity:
         return UserIdentity(
             platform=event.get_platform_id() or event.get_platform_name() or "unknown",
@@ -279,6 +322,23 @@ class LevelUpPvpCommandHandler:
         message = event.get_message_str() or ""
         ignored_ids = self._ignored_target_ids(event)
         for match in re.finditer(r"<@!?([^>\s]+)>", message):
+            target_id = match.group(1).strip()
+            if target_id and target_id not in ignored_ids:
+                return UserIdentity(
+                    platform=event.get_platform_id() or event.get_platform_name() or "unknown",
+                    group_id=event.get_group_id() or "",
+                    user_id=target_id,
+                    nickname=target_id,
+                )
+        return None
+
+    def _target_identity_from_text(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+    ) -> UserIdentity | None:
+        ignored_ids = self._ignored_target_ids(event)
+        for match in re.finditer(r"<@!?([^>\s]+)>", text or ""):
             target_id = match.group(1).strip()
             if target_id and target_id not in ignored_ids:
                 return UserIdentity(
@@ -361,6 +421,29 @@ class LevelUpPvpCommandHandler:
         text = CHALLENGE_COMMAND_PATTERN.sub("", text).strip()
         text = " ".join(text.split())
         return text
+
+    def _extract_modified_nickname(
+        self,
+        event: AstrMessageEvent,
+        target_identity: UserIdentity | None,
+        parsed_nickname: str,
+    ) -> str:
+        text = parsed_nickname.strip()
+        if not text:
+            text = self._text_without_mentions(event)
+            text = MODIFY_REGISTER_COMMAND_PATTERN.sub("", text).strip()
+        if target_identity:
+            for token in [
+                f"<@{target_identity.user_id}>",
+                f"<@!{target_identity.user_id}>",
+                f"@{target_identity.user_id}",
+            ]:
+                if token:
+                    text = text.replace(token, " ")
+        text = re.sub(r"<@!?[^>\s]+>", " ", text)
+        text = re.sub(r"@\S+", " ", text)
+        text = MODIFY_REGISTER_COMMAND_PATTERN.sub("", text).strip()
+        return " ".join(text.split())
 
     def _format_profile(self, user: User) -> str:
         return "\n".join(

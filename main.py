@@ -2,6 +2,7 @@ import os
 
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.star.filter.command import GreedyStr
 
 try:
     from .handles.command_handler import LevelUpPvpCommandHandler
@@ -81,6 +82,20 @@ class MyPlugin(Star):
         async for result in self.command_handler.register_nickname(event, nickname):
             yield result
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("修改登记")
+    async def modify_registered_nickname(
+        self,
+        event: AstrMessageEvent,
+        nickname: GreedyStr,
+    ):
+        """管理员修改指定用户的展示昵称。"""
+        async for result in self.command_handler.modify_registered_nickname(
+            event,
+            nickname,
+        ):
+            yield result
+
     @filter.command("挑战")
     async def challenge(self, event: AstrMessageEvent):
         """At 一名用户发起概率战斗。"""
@@ -116,6 +131,12 @@ class MyPlugin(Star):
                     yield result
             elif command == "登记":
                 async for result in self.command_handler.register_nickname(event, args):
+                    yield result
+            elif command == "修改登记":
+                async for result in self.command_handler.modify_registered_nickname(
+                    event,
+                    args,
+                ):
                     yield result
             elif command == "挑战":
                 async for result in self.command_handler.challenge(event):
