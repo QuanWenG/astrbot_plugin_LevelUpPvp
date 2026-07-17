@@ -30,6 +30,9 @@ class User:
     losses: int
     created_at: str
     updated_at: str
+    frozen_stats: dict[str, int] = field(default_factory=dict)
+    frozen_stat_points: int = 0
+    frozen_levels: list[int] = field(default_factory=list)
 
     def stats(self) -> dict[str, int]:
         return {
@@ -47,6 +50,15 @@ class LevelUpEvent:
     to_level: int
     auto_growth: dict[str, int]
     stat_points_gain: int
+    restored_from_freeze: bool = False
+
+
+@dataclass
+class LevelDownEvent:
+    from_level: int
+    to_level: int
+    frozen_stats: dict[str, int]
+    frozen_stat_points: int
 
 
 @dataclass
@@ -54,6 +66,7 @@ class ExpChangeResult:
     user: User
     exp_delta: int
     level_ups: list[LevelUpEvent] = field(default_factory=list)
+    level_downs: list[LevelDownEvent] = field(default_factory=list)
 
 
 @dataclass

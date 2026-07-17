@@ -3,13 +3,28 @@ import random
 from datetime import datetime
 
 try:
-    from ..models.user import ExpChangeResult, LevelUpEvent, User, UserIdentity
+    from ..models.user import (
+        ExpChangeResult,
+        LevelDownEvent,
+        LevelUpEvent,
+        User,
+        UserIdentity,
+    )
     from . import config
     from .db import connect_db
 except ImportError:
-    from models.user import ExpChangeResult, LevelUpEvent, User, UserIdentity
+    from models.user import (
+        ExpChangeResult,
+        LevelDownEvent,
+        LevelUpEvent,
+        User,
+        UserIdentity,
+    )
     from services import config
     from services.db import connect_db
+
+
+STAT_NAMES = tuple(config.INITIAL_STATS.keys())
 
 
 def utc_now_text() -> str:
@@ -89,7 +104,7 @@ class UserService:
                 )
                 user.nickname = identity.nickname
                 user.updated_at = now
-            return user, False
+            return await self._attach_freeze_summary_in_db(db, user), False
 
         registered_nickname = await self.get_registered_nickname_in_db(
             db,
@@ -134,7 +149,7 @@ class UserService:
         )
         row = await cursor.fetchone()
         await cursor.close()
-        return row_to_user(row), True
+        return await self._attach_freeze_summary_in_db(db, row_to_user(row)), True
 
     async def register_nickname(self, identity: UserIdentity, nickname: str) -> User:
         nickname = " ".join((nickname or "").split())
@@ -190,7 +205,7 @@ class UserService:
         )
         if registered_nickname:
             user.nickname = registered_nickname
-        return user
+        return await self._attach_freeze_summary_in_db(db, user)
 
     async def get_registered_nickname_in_db(
         self,
@@ -281,6 +296,7 @@ class UserService:
                 )
                 if registered_nickname:
                     user.nickname = registered_nickname
+                user = await self._attach_freeze_summary_in_db(db, user)
                 ranked_users.append((index, user))
         return ranked_users
 
@@ -310,6 +326,7 @@ class UserService:
                 )
                 if registered_nickname:
                     user.nickname = registered_nickname
+                user = await self._attach_freeze_summary_in_db(db, user)
                 if user.user_id == identity.user_id:
                     return index, user
         return None
@@ -331,20 +348,42 @@ class UserService:
             required = config.exp_required_for_next_level(level)
             exp -= required
             from_level = level
-            level += 1
+            to_level = level + 1
+            released = await self._release_freeze_for_level_in_db(
+                db,
+                user.id,
+                to_level,
+                stats,
+                now,
+            )
+            level = to_level
+            if released:
+                stat_points += released["frozen_stat_points"]
+                level_ups.append(
+                    LevelUpEvent(
+                        from_level=from_level,
+                        to_level=level,
+                        auto_growth=released["frozen_stats"],
+                        stat_points_gain=released["frozen_stat_points"],
+                        restored_from_freeze=True,
+                    )
+                )
+                continue
+
             level_up_count += 1
             stat_points += config.STAT_POINTS_PER_LEVEL
             auto_growth = self._roll_auto_growth()
             for stat_name, gain in auto_growth.items():
                 stats[stat_name] += gain
 
-            level_up = LevelUpEvent(
-                from_level=from_level,
-                to_level=level,
-                auto_growth=auto_growth,
-                stat_points_gain=config.STAT_POINTS_PER_LEVEL,
+            level_ups.append(
+                LevelUpEvent(
+                    from_level=from_level,
+                    to_level=level,
+                    auto_growth=auto_growth,
+                    stat_points_gain=config.STAT_POINTS_PER_LEVEL,
+                )
             )
-            level_ups.append(level_up)
             await db.execute(
                 """
                 INSERT INTO level_up_logs (
@@ -362,6 +401,142 @@ class UserService:
                 ),
             )
 
+        await self._update_user_progress_in_db(
+            db,
+            user.id,
+            level,
+            exp,
+            total_exp,
+            stat_points,
+            level_up_count,
+            stats,
+            now,
+        )
+        updated = await self.get_user_by_pk_in_db(db, user.id)
+        return ExpChangeResult(user=updated, exp_delta=amount, level_ups=level_ups)
+
+    async def deduct_exp_in_db(self, db, user: User, amount: int) -> ExpChangeResult:
+        if amount <= 0:
+            return ExpChangeResult(user=user, exp_delta=0, level_downs=[])
+
+        remaining = amount
+        actual_loss = 0
+        level = user.level
+        exp = user.exp
+        total_exp = user.total_exp
+        stat_points = user.stat_points
+        level_up_count = user.level_up_count
+        stats = user.stats()
+        level_downs: list[LevelDownEvent] = []
+        now = utc_now_text()
+
+        while remaining > 0:
+            if remaining <= exp:
+                exp -= remaining
+                actual_loss += remaining
+                remaining = 0
+                break
+
+            remaining -= exp
+            actual_loss += exp
+            exp = 0
+            if level <= config.INITIAL_LEVEL:
+                break
+
+            from_level = level
+            to_level = level - 1
+            level_down = await self._freeze_level_in_db(
+                db,
+                user.id,
+                from_level,
+                to_level,
+                stats,
+                stat_points,
+                now,
+            )
+            stat_points = max(0, stat_points - level_down.frozen_stat_points)
+            level_downs.append(level_down)
+            level = to_level
+            exp = config.exp_required_for_next_level(level)
+
+        await self._update_user_progress_in_db(
+            db,
+            user.id,
+            level,
+            exp,
+            total_exp,
+            stat_points,
+            level_up_count,
+            stats,
+            now,
+        )
+        updated = await self.get_user_by_pk_in_db(db, user.id)
+        return ExpChangeResult(
+            user=updated,
+            exp_delta=-actual_loss,
+            level_downs=level_downs,
+        )
+
+    async def increment_battle_stats_in_db(
+        self,
+        db,
+        winner_id: int,
+        loser_id: int,
+    ) -> None:
+        now = utc_now_text()
+        await db.execute(
+            "UPDATE users SET wins = wins + 1, updated_at = ? WHERE id = ?",
+            (now, winner_id),
+        )
+        await db.execute(
+            "UPDATE users SET losses = losses + 1, updated_at = ? WHERE id = ?",
+            (now, loser_id),
+        )
+
+    async def _attach_freeze_summary_in_db(self, db, user: User) -> User:
+        cursor = await db.execute(
+            """
+            SELECT frozen_level, frozen_stats_json, frozen_stat_points
+            FROM level_freezes
+            WHERE user_pk = ? AND status = 'frozen'
+            ORDER BY frozen_level DESC, id DESC
+            """,
+            (user.id,),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        frozen_stats = {stat_name: 0 for stat_name in STAT_NAMES}
+        frozen_levels = []
+        frozen_stat_points = 0
+        for row in rows:
+            frozen_levels.append(int(row["frozen_level"]))
+            frozen_stat_points += int(row["frozen_stat_points"])
+            for stat_name, amount in self._load_stats_json(
+                row["frozen_stats_json"]
+            ).items():
+                if stat_name in frozen_stats:
+                    frozen_stats[stat_name] += amount
+        user.frozen_stats = {
+            stat_name: amount
+            for stat_name, amount in frozen_stats.items()
+            if amount > 0
+        }
+        user.frozen_stat_points = frozen_stat_points
+        user.frozen_levels = sorted(set(frozen_levels), reverse=True)
+        return user
+
+    async def _update_user_progress_in_db(
+        self,
+        db,
+        user_id: int,
+        level: int,
+        exp: int,
+        total_exp: int,
+        stat_points: int,
+        level_up_count: int,
+        stats: dict[str, int],
+        now: str,
+    ) -> None:
         await db.execute(
             """
             UPDATE users
@@ -382,36 +557,167 @@ class UserService:
                 stats["speed"],
                 stats["luck"],
                 now,
-                user.id,
+                user_id,
             ),
         )
-        updated = await self.get_user_by_pk_in_db(db, user.id)
-        return ExpChangeResult(user=updated, exp_delta=amount, level_ups=level_ups)
 
-    async def deduct_exp_in_db(self, db, user: User, amount: int) -> User:
-        loss = max(0, amount)
-        exp = max(0, user.exp - loss)
-        await db.execute(
-            "UPDATE users SET exp = ?, updated_at = ? WHERE id = ?",
-            (exp, utc_now_text(), user.id),
-        )
-        return await self.get_user_by_pk_in_db(db, user.id)
-
-    async def increment_battle_stats_in_db(
+    async def _release_freeze_for_level_in_db(
         self,
         db,
-        winner_id: int,
-        loser_id: int,
-    ) -> None:
-        now = utc_now_text()
-        await db.execute(
-            "UPDATE users SET wins = wins + 1, updated_at = ? WHERE id = ?",
-            (now, winner_id),
+        user_id: int,
+        restored_level: int,
+        stats: dict[str, int],
+        now: str,
+    ) -> dict | None:
+        cursor = await db.execute(
+            """
+            SELECT id, frozen_stats_json, frozen_stat_points
+            FROM level_freezes
+            WHERE user_pk = ?
+              AND frozen_level = ?
+              AND status = 'frozen'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (user_id, restored_level),
         )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if not row:
+            return None
+
+        frozen_stats = self._load_stats_json(row["frozen_stats_json"])
+        for stat_name, amount in frozen_stats.items():
+            stats[stat_name] += amount
         await db.execute(
-            "UPDATE users SET losses = losses + 1, updated_at = ? WHERE id = ?",
-            (now, loser_id),
+            """
+            UPDATE level_freezes
+            SET status = 'released', released_at = ?
+            WHERE id = ?
+            """,
+            (now, row["id"]),
         )
+        return {
+            "frozen_stats": frozen_stats,
+            "frozen_stat_points": int(row["frozen_stat_points"]),
+        }
+
+    async def _freeze_level_in_db(
+        self,
+        db,
+        user_id: int,
+        from_level: int,
+        to_level: int,
+        stats: dict[str, int],
+        stat_points: int,
+        now: str,
+    ) -> LevelDownEvent:
+        frozen_stats = await self._level_auto_growth_in_db(db, user_id, from_level)
+        for stat_name, amount in frozen_stats.items():
+            stats[stat_name] = max(
+                config.INITIAL_STATS[stat_name],
+                stats[stat_name] - amount,
+            )
+
+        frozen_stat_points = min(stat_points, config.STAT_POINTS_PER_LEVEL)
+        spent_points = config.STAT_POINTS_PER_LEVEL - frozen_stat_points
+        spent_freeze = self._roll_spent_stat_freeze(stats, spent_points)
+        for stat_name, amount in spent_freeze.items():
+            frozen_stats[stat_name] = frozen_stats.get(stat_name, 0) + amount
+
+        frozen_stats = {
+            stat_name: amount
+            for stat_name, amount in frozen_stats.items()
+            if amount > 0
+        }
+        await db.execute(
+            """
+            INSERT INTO level_freezes (
+                user_pk, frozen_level, from_level, to_level, frozen_stats_json,
+                frozen_stat_points, status, created_at, released_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'frozen', ?, NULL)
+            """,
+            (
+                user_id,
+                from_level,
+                from_level,
+                to_level,
+                json.dumps(frozen_stats, ensure_ascii=False),
+                frozen_stat_points,
+                now,
+            ),
+        )
+        return LevelDownEvent(
+            from_level=from_level,
+            to_level=to_level,
+            frozen_stats=frozen_stats,
+            frozen_stat_points=frozen_stat_points,
+        )
+
+    async def _level_auto_growth_in_db(
+        self,
+        db,
+        user_id: int,
+        level: int,
+    ) -> dict[str, int]:
+        cursor = await db.execute(
+            """
+            SELECT auto_growth_json
+            FROM level_up_logs
+            WHERE user_pk = ? AND to_level = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (user_id, level),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if not row:
+            return {}
+        return self._load_stats_json(row["auto_growth_json"])
+
+    def _roll_spent_stat_freeze(
+        self,
+        stats: dict[str, int],
+        spent_points: int,
+    ) -> dict[str, int]:
+        frozen_stats: dict[str, int] = {}
+        for _ in range(spent_points):
+            eligible_stats = [
+                stat_name
+                for stat_name in STAT_NAMES
+                if stats[stat_name] > config.INITIAL_STATS[stat_name]
+            ]
+            if not eligible_stats:
+                break
+            stat_name = random.choice(eligible_stats)
+            rolled = random.randint(*config.STAT_POINT_RANGES[stat_name])
+            available = stats[stat_name] - config.INITIAL_STATS[stat_name]
+            amount = min(rolled, available)
+            if amount <= 0:
+                continue
+            stats[stat_name] -= amount
+            frozen_stats[stat_name] = frozen_stats.get(stat_name, 0) + amount
+        return frozen_stats
+
+    def _load_stats_json(self, raw_json: str) -> dict[str, int]:
+        try:
+            raw_stats = json.loads(raw_json or "{}")
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(raw_stats, dict):
+            return {}
+        stats: dict[str, int] = {}
+        for stat_name, amount in raw_stats.items():
+            if stat_name not in STAT_NAMES:
+                continue
+            try:
+                normalized_amount = int(amount)
+            except (TypeError, ValueError):
+                continue
+            if normalized_amount > 0:
+                stats[stat_name] = normalized_amount
+        return stats
 
     def _roll_auto_growth(self) -> dict[str, int]:
         min_count, max_count = config.AUTO_GROWTH_STAT_COUNT_RANGE

@@ -1,16 +1,21 @@
+import asyncio
 import inspect
 import re
 from collections.abc import AsyncGenerator
 
+from PIL import Image, ImageDraw
+
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
-from astrbot.api.message_components import At
+from astrbot.api.message_components import At, Node, Plain
+from astrbot.core.utils.io import save_temp_img
+from astrbot.core.utils.t2i.local_strategy import FontManager
 
 try:
-    from ..models.user import LevelUpEvent, User, UserIdentity
+    from ..models.user import LevelDownEvent, LevelUpEvent, User, UserIdentity
     from ..services import config
 except ImportError:
-    from models.user import LevelUpEvent, User, UserIdentity
+    from models.user import LevelDownEvent, LevelUpEvent, User, UserIdentity
     from services import config
 
 
@@ -26,8 +31,19 @@ MENTION_COMMAND_PATTERN = re.compile(
 CHALLENGE_COMMAND_PATTERN = re.compile(r"^/?挑战(?:\s|$)")
 SLASH_CHALLENGE_COMMAND_PATTERN = re.compile(r"^/挑战(?:\s|$)")
 MODIFY_REGISTER_COMMAND_PATTERN = re.compile(r"^/?修改登记(?:\s|$)")
+SLASH_CHECKIN_COMMAND_PATTERN = re.compile(r"^/签到(?:\s|$)")
+CHECKIN_COMMAND_PATTERN = re.compile(r"^/?签到(?:\s|$)")
 REGISTRATION_REQUIRED_MESSAGE = "请先使用 /登记 昵称 完成昵称登记后再使用本插件指令。"
 ADMIN_REQUIRED_MESSAGE = "只有 AstrBot 管理员可以使用该指令。"
+BATTLE_REPORT_WIDTH = 1280
+BATTLE_REPORT_MIN_HEIGHT = 720
+BATTLE_REPORT_HEADER_HEIGHT = 112
+BATTLE_REPORT_HORIZONTAL_PADDING = 96
+BATTLE_REPORT_CONTENT_TOP = 82
+BATTLE_REPORT_CONTENT_BOTTOM = 56
+BATTLE_REPORT_TITLE_FONT_SIZE = 56
+BATTLE_REPORT_CONTENT_FONT_SIZE = 30
+BATTLE_REPORT_LINE_HEIGHT = 54
 
 
 class LevelUpPvpCommandHandler:
@@ -47,30 +63,48 @@ class LevelUpPvpCommandHandler:
         self.battle_service = battle_service
 
     async def sign(self, event: AstrMessageEvent) -> AsyncGenerator:
-        registration_error = await self._registration_error(event)
-        if registration_error:
-            yield event.plain_result(registration_error)
+        try:
+            result = await self.checkin_service.checkin(self._identity_from_event(event))
+            if result.already_checked:
+                yield event.plain_result(self._format_existing_checkin(result))
+                return
+
+            yield event.plain_result(self._format_checkin_success(result))
+        except Exception as exc:
+            logger.exception("LevelUpPvp sign failed")
+            yield event.plain_result(f"签到失败：{exc}")
+
+    async def auto_checkin(self, event: AstrMessageEvent) -> AsyncGenerator:
+        """群内当天首条消息自动签到；失败时不影响原消息传播。"""
+        if not self.is_auto_checkin_event(event):
             return
         try:
             result = await self.checkin_service.checkin(self._identity_from_event(event))
             if result.already_checked:
-                yield event.plain_result(
-                    f"今天已经签到过了。\n当前连续签到：{result.streak_days} 天"
-                )
                 return
+            yield event.plain_result(self._format_checkin_success(result))
+        except Exception:
+            logger.exception("LevelUpPvp automatic check-in failed")
 
-            lines = [
-                f"{self._display_name(result.user)} 签到成功！",
-                f"获得经验：{result.exp_gain}",
-                f"连续签到：{result.streak_days} 天",
-                self._format_level_progress(result.user),
-            ]
-            if result.level_ups:
-                lines.append(self._format_level_ups(result.level_ups))
-            yield event.plain_result("\n".join(lines))
-        except Exception as exc:
-            logger.exception("LevelUpPvp sign failed")
-            yield event.plain_result(f"签到失败：{exc}")
+    def is_auto_checkin_event(self, event: AstrMessageEvent) -> bool:
+        group_id = event.get_group_id()
+        sender_id = event.get_sender_id()
+        if (
+            not group_id
+            or not sender_id
+            or str(sender_id) == str(event.get_self_id())
+        ):
+            return False
+        return not self.is_explicit_checkin_event(event)
+
+    def is_explicit_checkin_event(self, event: AstrMessageEvent) -> bool:
+        message = (event.get_message_str() or "").strip()
+        if SLASH_CHECKIN_COMMAND_PATTERN.match(message):
+            return True
+        if not self._is_self_mentioned(event):
+            return False
+        text = self._text_without_mentions(event)
+        return CHECKIN_COMMAND_PATTERN.match(text) is not None
 
     async def profile(self, event: AstrMessageEvent) -> AsyncGenerator:
         registration_error = await self._registration_error(event)
@@ -230,7 +264,7 @@ class LevelUpPvpCommandHandler:
                 context=self.context,
                 event=event,
             )
-            yield event.plain_result(self._format_battle_result(result))
+            yield await self._battle_result(event, self._format_battle_result(result))
         except Exception as exc:
             logger.exception("LevelUpPvp battle failed")
             yield event.plain_result(f"挑战失败：{exc}")
@@ -446,13 +480,36 @@ class LevelUpPvpCommandHandler:
         return " ".join(text.split())
 
     def _format_profile(self, user: User) -> str:
+        lines = [
+            f"{self._display_name(user)} 的面板",
+            self._format_level_progress(user),
+            f"自定义属性点：{user.stat_points}",
+            self._format_stats(user),
+        ]
+        freeze_summary = self._format_freeze_summary(user)
+        if freeze_summary:
+            lines.append(freeze_summary)
+        lines.append(f"战绩：{user.wins} 胜 / {user.losses} 负")
+        return "\n".join(lines)
+
+    def _format_checkin_success(self, result) -> str:
+        lines = [
+            f"{self._display_name(result.user)} 签到成功！",
+            f"获得经验：{result.exp_gain}",
+            f"连续签到：{result.streak_days} 天",
+            self._format_level_progress(result.user),
+        ]
+        if result.level_ups:
+            lines.append(self._format_level_ups(result.level_ups))
+        return "\n".join(lines)
+
+    def _format_existing_checkin(self, result) -> str:
         return "\n".join(
             [
-                f"{self._display_name(user)} 的面板",
-                self._format_level_progress(user),
-                f"自定义属性点：{user.stat_points}",
-                self._format_stats(user),
-                f"战绩：{user.wins} 胜 / {user.losses} 负",
+                "今天已经签到过了。",
+                f"今日签到经验：{result.exp_gain}",
+                f"连续签到：{result.streak_days} 天",
+                self._format_level_progress(result.user),
             ]
         )
 
@@ -471,17 +528,51 @@ class LevelUpPvpCommandHandler:
         return f"{rank} {self._display_name(user)} Lv.{user.level} {user.exp}/{required}"
 
     def _format_level_ups(self, level_ups: list[LevelUpEvent]) -> str:
-        lines = ["升级成长："]
+        lines = ["等级变化："]
         for item in level_ups:
-            growth = "，".join(
-                f"{config.STAT_LABELS[name]} +{gain}"
-                for name, gain in item.auto_growth.items()
-            )
+            label = "解冻恢复" if item.restored_from_freeze else "升级成长"
+            growth = self._format_stat_changes(item.auto_growth, "+") or "无属性变化"
+            parts = [growth]
+            if item.stat_points_gain:
+                parts.append(f"自定义属性点 +{item.stat_points_gain}")
             lines.append(
-                f"Lv.{item.from_level} -> Lv.{item.to_level}：{growth}，"
-                f"自定义属性点 +{item.stat_points_gain}"
+                f"{label} Lv.{item.from_level} -> Lv.{item.to_level}："
+                + "，".join(parts)
             )
         return "\n".join(lines)
+
+    def _format_level_downs(self, level_downs: list[LevelDownEvent]) -> str:
+        lines = ["降级冻结："]
+        for item in level_downs:
+            parts = []
+            frozen_stats = self._format_stat_changes(item.frozen_stats, "-")
+            if frozen_stats:
+                parts.append(frozen_stats)
+            if item.frozen_stat_points:
+                parts.append(f"自定义属性点 -{item.frozen_stat_points}")
+            detail = "，".join(parts) or "无属性冻结"
+            lines.append(f"Lv.{item.from_level} -> Lv.{item.to_level}：{detail}")
+        return "\n".join(lines)
+
+    def _format_freeze_summary(self, user: User) -> str:
+        frozen_stats = self._format_stat_changes(user.frozen_stats, "-")
+        parts = []
+        if frozen_stats:
+            parts.append(frozen_stats)
+        if user.frozen_stat_points:
+            parts.append(f"自定义属性点 -{user.frozen_stat_points}")
+        if not parts:
+            return ""
+        levels = "、".join(f"Lv.{level}" for level in user.frozen_levels) or "等级"
+        return f"冻结：{levels} 待解冻，" + "，".join(parts)
+
+    def _format_stat_changes(self, stats: dict[str, int], sign: str) -> str:
+        changes = []
+        for stat_name, label in config.STAT_LABELS.items():
+            amount = int(stats.get(stat_name, 0) or 0)
+            if amount > 0:
+                changes.append(f"{label} {sign}{amount}")
+        return " / ".join(changes)
 
     def _format_battle_result(self, result) -> str:
         winner_is_attacker = result.winner.id == result.attacker.id
@@ -513,8 +604,106 @@ class LevelUpPvpCommandHandler:
             )
         if result.level_ups:
             lines.append(self._format_level_ups(result.level_ups))
+        if result.level_downs:
+            lines.append(self._format_level_downs(result.level_downs))
         lines.append("结果：" + ("攻击方获胜" if winner_is_attacker else "防守方获胜"))
         return "\n".join(lines)
+
+    async def _battle_result(self, event: AstrMessageEvent, text: str):
+        """按平台选择战报载体，避免长战报刷屏。"""
+        platform_name = event.get_platform_name() or ""
+        if platform_name in {"qq_official", "qq_official_webhook"}:
+            try:
+                image = await asyncio.to_thread(self._render_battle_report_image, text)
+                return event.image_result(image)
+            except BaseException:
+                logger.exception("LevelUpPvp battle report image rendering failed")
+                return event.plain_result(text)
+        if platform_name == "aiocqhttp":
+            node = Node(
+                uin=event.get_self_id() or "0",
+                name="LevelUpPvp 战报",
+                content=[Plain(text)],
+            )
+            return event.chain_result([node])
+        return event.plain_result(text)
+
+    def _render_battle_report_image(self, text: str) -> str:
+        title_font = FontManager.get_font(BATTLE_REPORT_TITLE_FONT_SIZE)
+        content_font = FontManager.get_font(BATTLE_REPORT_CONTENT_FONT_SIZE)
+        measure_image = Image.new("RGB", (1, 1))
+        measure_draw = ImageDraw.Draw(measure_image)
+        max_text_width = (
+            BATTLE_REPORT_WIDTH - BATTLE_REPORT_HORIZONTAL_PADDING * 2
+        )
+        wrapped_lines = self._wrap_battle_report_text(
+            text,
+            measure_draw,
+            content_font,
+            max_text_width,
+        )
+        content_height = (
+            BATTLE_REPORT_CONTENT_TOP
+            + len(wrapped_lines) * BATTLE_REPORT_LINE_HEIGHT
+            + BATTLE_REPORT_CONTENT_BOTTOM
+        )
+        image_height = max(
+            BATTLE_REPORT_MIN_HEIGHT,
+            BATTLE_REPORT_HEADER_HEIGHT + content_height,
+        )
+        image = Image.new(
+            "RGB",
+            (BATTLE_REPORT_WIDTH, image_height),
+            color="#ffffff",
+        )
+        draw = ImageDraw.Draw(image)
+        draw.rectangle(
+            (0, 0, BATTLE_REPORT_WIDTH, BATTLE_REPORT_HEADER_HEIGHT),
+            fill="#3276dc",
+        )
+        title = "# LevelUpPvp 战报"
+        title_box = draw.textbbox((0, 0), title, font=title_font)
+        title_height = title_box[3] - title_box[1]
+        title_y = (BATTLE_REPORT_HEADER_HEIGHT - title_height) // 2 - title_box[1]
+        draw.text((18, title_y), title, fill="#ffffff", font=title_font)
+
+        content_y = BATTLE_REPORT_HEADER_HEIGHT + BATTLE_REPORT_CONTENT_TOP
+        for line in wrapped_lines:
+            draw.text(
+                (BATTLE_REPORT_HORIZONTAL_PADDING, content_y),
+                line,
+                fill="#1f2937",
+                font=content_font,
+            )
+            content_y += BATTLE_REPORT_LINE_HEIGHT
+        return save_temp_img(image)
+
+    def _wrap_battle_report_text(
+        self,
+        text: str,
+        draw: ImageDraw.ImageDraw,
+        font,
+        max_width: int,
+    ) -> list[str]:
+        wrapped: list[str] = []
+        for source_line in text.splitlines():
+            if not source_line:
+                wrapped.append("")
+                continue
+            remaining = source_line
+            while remaining:
+                low, high = 1, len(remaining)
+                while low <= high:
+                    middle = (low + high) // 2
+                    width = draw.textlength(remaining[:middle], font=font)
+                    if width <= max_width:
+                        low = middle + 1
+                    else:
+                        high = middle - 1
+                split_at = max(1, high)
+                wrapped.append(remaining[:split_at])
+                remaining = remaining[split_at:]
+        return wrapped or [""]
 
     def _display_name(self, user: User) -> str:
         name = user.nickname or user.user_id

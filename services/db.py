@@ -150,6 +150,20 @@ async def init_db(db_path: str) -> None:
                 FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS level_freezes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_pk INTEGER NOT NULL,
+                frozen_level INTEGER NOT NULL,
+                from_level INTEGER NOT NULL,
+                to_level INTEGER NOT NULL,
+                frozen_stats_json TEXT NOT NULL,
+                frozen_stat_points INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'frozen',
+                created_at TEXT NOT NULL,
+                released_at TEXT,
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS stat_point_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_pk INTEGER NOT NULL,
@@ -182,6 +196,8 @@ async def init_db(db_path: str) -> None:
                 ON battles(created_at_ts);
             CREATE INDEX IF NOT EXISTS idx_level_up_logs_user
                 ON level_up_logs(user_pk);
+            CREATE INDEX IF NOT EXISTS idx_level_freezes_user_status
+                ON level_freezes(user_pk, status, frozen_level);
             CREATE INDEX IF NOT EXISTS idx_stat_point_logs_user
                 ON stat_point_logs(user_pk);
             CREATE INDEX IF NOT EXISTS idx_nickname_mappings_lookup

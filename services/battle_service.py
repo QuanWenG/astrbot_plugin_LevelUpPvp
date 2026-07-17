@@ -141,10 +141,15 @@ class BattleService:
             winner = attacker if attacker_wins else defender
             loser = defender if attacker_wins else attacker
             winner_exp_gain = self._roll_winner_exp_gain(winner, loser)
-            loser_exp_loss = self._roll_loser_exp_loss(winner, loser)
+            requested_loser_exp_loss = self._roll_loser_exp_loss(winner, loser)
 
             winner_exp = await self.user_service.add_exp_in_db(db, winner, winner_exp_gain)
-            await self.user_service.deduct_exp_in_db(db, loser, loser_exp_loss)
+            loser_exp = await self.user_service.deduct_exp_in_db(
+                db,
+                loser,
+                requested_loser_exp_loss,
+            )
+            loser_exp_loss = abs(loser_exp.exp_delta)
             await self.user_service.increment_battle_stats_in_db(db, winner.id, loser.id)
 
             updated_attacker = await self.user_service.get_user_by_pk_in_db(db, attacker.id)
@@ -240,6 +245,7 @@ class BattleService:
                 analysis=final_analysis.analysis,
                 battle_log=battle_log,
                 level_ups=winner_exp.level_ups,
+                level_downs=loser_exp.level_downs,
                 source=final_analysis.source,
                 target_created=defender_created,
                 is_counterattack=challenge_limit["is_counterattack"],
@@ -450,30 +456,26 @@ class BattleService:
         return [opening, swing, finish]
 
     def _roll_winner_exp_gain(self, winner: User, loser: User) -> int:
-        base = (
-            config.BATTLE_WIN_EXP_BASE
-            + loser.level * config.BATTLE_WIN_EXP_PER_LOSER_LEVEL
+        rate = config.clamp(
+            config.BATTLE_WIN_EXP_BASE_RATE
+            + (loser.level - winner.level)
+            * config.BATTLE_WIN_EXP_LEVEL_DIFF_RATE_STEP
+            + random.uniform(*config.BATTLE_WIN_EXP_RANDOM_RATE_RANGE),
+            *config.BATTLE_WIN_EXP_RATE_RANGE,
         )
-        level_diff = winner.level - loser.level
-        level_multiplier = config.clamp(
-            1 - level_diff * config.BATTLE_WIN_EXP_LEVEL_DIFF_STEP,
-            *config.BATTLE_WIN_EXP_LEVEL_MULTIPLIER_RANGE,
-        )
-        random_multiplier = random.uniform(*config.BATTLE_WIN_EXP_RANDOM_MULTIPLIER_RANGE)
-        return max(1, round(base * level_multiplier * random_multiplier))
+        required = config.exp_required_for_next_level(winner.level)
+        return max(1, round(required * rate))
 
     def _roll_loser_exp_loss(self, winner: User, loser: User) -> int:
-        base = (
-            config.BATTLE_LOSE_EXP_BASE
-            + loser.level * config.BATTLE_LOSE_EXP_PER_LOSER_LEVEL
+        rate = config.clamp(
+            config.BATTLE_LOSE_EXP_BASE_RATE
+            + (loser.level - winner.level)
+            * config.BATTLE_LOSE_EXP_LEVEL_DIFF_RATE_STEP
+            + random.uniform(*config.BATTLE_LOSE_EXP_RANDOM_RATE_RANGE),
+            *config.BATTLE_LOSE_EXP_RATE_RANGE,
         )
-        level_diff = loser.level - winner.level
-        level_multiplier = config.clamp(
-            1 + level_diff * config.BATTLE_LOSE_EXP_LEVEL_DIFF_STEP,
-            *config.BATTLE_LOSE_EXP_LEVEL_MULTIPLIER_RANGE,
-        )
-        random_multiplier = random.uniform(*config.BATTLE_LOSE_EXP_RANDOM_MULTIPLIER_RANGE)
-        return max(1, round(base * level_multiplier * random_multiplier))
+        required = config.exp_required_for_next_level(loser.level)
+        return max(1, round(required * rate))
 
     def _display_name(self, user: User) -> str:
         name = user.nickname or user.user_id

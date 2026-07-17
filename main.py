@@ -26,7 +26,7 @@ PLUGIN_DIR = os.path.dirname(__file__)
 DB_PATH = os.path.join(PLUGIN_DIR, "data", "db_level_up_pvp.db")
 
 
-@register("astrbot_plugin_LevelUpPvp", "QuanWenG", "升级就开打", "1.0.0")
+@register("astrbot_plugin_LevelUpPvp", "QuanWenG", "群聊自动签到，升级就开打", "1.1.0")
 class MyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -46,6 +46,21 @@ class MyPlugin(Star):
     async def initialize(self):
         """初始化插件数据库。"""
         await init_db(DB_PATH)
+
+    @filter.event_message_type(
+        filter.EventMessageType.GROUP_MESSAGE,
+        priority=100,
+    )
+    async def auto_checkin(self, event: AstrMessageEvent):
+        """优先处理显式签到，其余群消息尝试自动签到。"""
+        if self.command_handler.is_explicit_checkin_event(event):
+            async for result in self.command_handler.sign(event):
+                yield result
+            event.stop_event()
+            return
+
+        async for result in self.command_handler.auto_checkin(event):
+            yield result
 
     @filter.command("签到")
     async def sign(self, event: AstrMessageEvent):
