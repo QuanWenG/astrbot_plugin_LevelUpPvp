@@ -8,6 +8,7 @@ try:
     from .handles.command_handler import LevelUpPvpCommandHandler
     from .services.battle_service import BattleService
     from .services.checkin_service import CheckinService
+    from .services.challenge_queue import ChallengeQueueService
     from .services.db import init_db
     from .services.llm_service import LLMService
     from .services.stat_service import StatService
@@ -16,6 +17,7 @@ except ImportError:
     from handles.command_handler import LevelUpPvpCommandHandler
     from services.battle_service import BattleService
     from services.checkin_service import CheckinService
+    from services.challenge_queue import ChallengeQueueService
     from services.db import init_db
     from services.llm_service import LLMService
     from services.stat_service import StatService
@@ -35,17 +37,20 @@ class MyPlugin(Star):
         stat_service = StatService(DB_PATH, user_service)
         llm_service = LLMService()
         battle_service = BattleService(DB_PATH, user_service, llm_service)
+        self.challenge_queue = ChallengeQueueService(battle_service)
         self.command_handler = LevelUpPvpCommandHandler(
             context=context,
             user_service=user_service,
             checkin_service=checkin_service,
             stat_service=stat_service,
             battle_service=battle_service,
+            challenge_queue=self.challenge_queue,
         )
 
     async def initialize(self):
         """初始化插件数据库。"""
         await init_db(DB_PATH)
+        self.challenge_queue.start()
 
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE,
@@ -167,3 +172,4 @@ class MyPlugin(Star):
 
     async def terminate(self):
         """插件卸载时无需额外清理。"""
+        await self.challenge_queue.shutdown()

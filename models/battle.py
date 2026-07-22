@@ -1,8 +1,10 @@
 from dataclasses import dataclass, field
 
 try:
+    from .combat import SimulationResult
     from .user import User
 except ImportError:
+    from models.combat import SimulationResult
     from models.user import User
 
 
@@ -36,3 +38,4 @@ class BattleResult:
     source: str = "local"
     target_created: bool = False
     is_counterattack: bool = False
+    simulation: SimulationResult | None = None

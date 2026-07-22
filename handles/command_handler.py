@@ -35,17 +35,6 @@ SLASH_CHECKIN_COMMAND_PATTERN = re.compile(r"^/签到(?:\s|$)")
 CHECKIN_COMMAND_PATTERN = re.compile(r"^/?签到(?:\s|$)")
 REGISTRATION_REQUIRED_MESSAGE = "请先使用 /登记 昵称 完成昵称登记后再使用本插件指令。"
 ADMIN_REQUIRED_MESSAGE = "只有 AstrBot 管理员可以使用该指令。"
-BATTLE_REPORT_WIDTH = 1280
-BATTLE_REPORT_MIN_HEIGHT = 720
-BATTLE_REPORT_HEADER_HEIGHT = 112
-BATTLE_REPORT_HORIZONTAL_PADDING = 96
-BATTLE_REPORT_CONTENT_TOP = 82
-BATTLE_REPORT_CONTENT_BOTTOM = 56
-BATTLE_REPORT_TITLE_FONT_SIZE = 56
-BATTLE_REPORT_CONTENT_FONT_SIZE = 30
-BATTLE_REPORT_LINE_HEIGHT = 54
-
-
 class LevelUpPvpCommandHandler:
     def __init__(
         self,
@@ -55,12 +44,14 @@ class LevelUpPvpCommandHandler:
         checkin_service,
         stat_service,
         battle_service,
+        challenge_queue=None,
     ):
         self.context = context
         self.user_service = user_service
         self.checkin_service = checkin_service
         self.stat_service = stat_service
         self.battle_service = battle_service
+        self.challenge_queue = challenge_queue
 
     async def sign(self, event: AstrMessageEvent) -> AsyncGenerator:
         try:
@@ -257,13 +248,30 @@ class LevelUpPvpCommandHandler:
                 return
 
             parsed_strategy = self._extract_strategy(event, target_identity, "")
-            result = await self.battle_service.battle(
+            battle_args = (
                 self._identity_from_event(event),
                 target_identity,
                 parsed_strategy,
-                context=self.context,
-                event=event,
             )
+            if self.challenge_queue is None:
+                result = await self.battle_service.battle(
+                    *battle_args,
+                    context=self.context,
+                    event=event,
+                )
+            else:
+                ticket = await self.challenge_queue.enqueue(
+                    *battle_args,
+                    context=self.context,
+                    event=event,
+                )
+                if ticket.position == 1:
+                    yield event.plain_result("\u6311\u6218\u5df2\u8fdb\u5165\u5904\u7406\u961f\u5217\uff0c\u6b63\u5728\u751f\u6210\u6218\u62a5\u2026\u2026")
+                else:
+                    yield event.plain_result(
+                        f"\u6311\u6218\u5df2\u8fdb\u5165\u5904\u7406\u961f\u5217\uff0c\u5f53\u524d\u6392\u4f4d {ticket.position}\uff0c\u8bf7\u7a0d\u5019\u2026\u2026"
+                    )
+                result = await ticket.result()
             yield await self._battle_result(event, self._format_battle_result(result))
         except Exception as exc:
             logger.exception("LevelUpPvp battle failed")
@@ -576,8 +584,6 @@ class LevelUpPvpCommandHandler:
 
     def _format_battle_result(self, result) -> str:
         winner_is_attacker = result.winner.id == result.attacker.id
-        rate = result.attacker_win_rate * 100
-        roll = result.roll_value * 100
         attacker_name = self._display_name(result.attacker)
         defender_name = self._display_name(result.defender)
         winner_name = self._display_name(result.winner)
@@ -589,13 +595,12 @@ class LevelUpPvpCommandHandler:
             f"{'（随机）' if result.attacker_strategy_random else ''} / "
             f"防守方「{result.defender_strategy}」"
             f"{'（随机）' if result.defender_strategy_random else ''}",
-            f"攻击方胜率：{rate:.1f}% / 随机值：{roll:.1f}%",
             f"结算：{winner_name} +{result.winner_exp_gain} 经验，"
             f"{loser_name} -{result.loser_exp_loss} 经验",
         ]
         if result.is_counterattack:
             lines.insert(1, "反击：本次不消耗主动挑战次数")
-        if result.analysis:
+        if result.analysis and result.simulation is None:
             lines.append(f"分析：{result.analysis}")
         if result.battle_log:
             lines.append("战报：")
@@ -610,15 +615,9 @@ class LevelUpPvpCommandHandler:
         return "\n".join(lines)
 
     async def _battle_result(self, event: AstrMessageEvent, text: str):
-        """按平台选择战报载体，避免长战报刷屏。"""
+        """发送纯文字战报；OneBot 使用折叠消息避免刷屏。"""
         platform_name = event.get_platform_name() or ""
-        if platform_name in {"qq_official", "qq_official_webhook"}:
-            try:
-                image = await asyncio.to_thread(self._render_battle_report_image, text)
-                return event.image_result(image)
-            except BaseException:
-                logger.exception("LevelUpPvp battle report image rendering failed")
-                return event.plain_result(text)
+
         if platform_name == "aiocqhttp":
             node = Node(
                 uin=event.get_self_id() or "0",
@@ -627,83 +626,6 @@ class LevelUpPvpCommandHandler:
             )
             return event.chain_result([node])
         return event.plain_result(text)
-
-    def _render_battle_report_image(self, text: str) -> str:
-        title_font = FontManager.get_font(BATTLE_REPORT_TITLE_FONT_SIZE)
-        content_font = FontManager.get_font(BATTLE_REPORT_CONTENT_FONT_SIZE)
-        measure_image = Image.new("RGB", (1, 1))
-        measure_draw = ImageDraw.Draw(measure_image)
-        max_text_width = (
-            BATTLE_REPORT_WIDTH - BATTLE_REPORT_HORIZONTAL_PADDING * 2
-        )
-        wrapped_lines = self._wrap_battle_report_text(
-            text,
-            measure_draw,
-            content_font,
-            max_text_width,
-        )
-        content_height = (
-            BATTLE_REPORT_CONTENT_TOP
-            + len(wrapped_lines) * BATTLE_REPORT_LINE_HEIGHT
-            + BATTLE_REPORT_CONTENT_BOTTOM
-        )
-        image_height = max(
-            BATTLE_REPORT_MIN_HEIGHT,
-            BATTLE_REPORT_HEADER_HEIGHT + content_height,
-        )
-        image = Image.new(
-            "RGB",
-            (BATTLE_REPORT_WIDTH, image_height),
-            color="#ffffff",
-        )
-        draw = ImageDraw.Draw(image)
-        draw.rectangle(
-            (0, 0, BATTLE_REPORT_WIDTH, BATTLE_REPORT_HEADER_HEIGHT),
-            fill="#3276dc",
-        )
-        title = "# LevelUpPvp 战报"
-        title_box = draw.textbbox((0, 0), title, font=title_font)
-        title_height = title_box[3] - title_box[1]
-        title_y = (BATTLE_REPORT_HEADER_HEIGHT - title_height) // 2 - title_box[1]
-        draw.text((18, title_y), title, fill="#ffffff", font=title_font)
-
-        content_y = BATTLE_REPORT_HEADER_HEIGHT + BATTLE_REPORT_CONTENT_TOP
-        for line in wrapped_lines:
-            draw.text(
-                (BATTLE_REPORT_HORIZONTAL_PADDING, content_y),
-                line,
-                fill="#1f2937",
-                font=content_font,
-            )
-            content_y += BATTLE_REPORT_LINE_HEIGHT
-        return save_temp_img(image)
-
-    def _wrap_battle_report_text(
-        self,
-        text: str,
-        draw: ImageDraw.ImageDraw,
-        font,
-        max_width: int,
-    ) -> list[str]:
-        wrapped: list[str] = []
-        for source_line in text.splitlines():
-            if not source_line:
-                wrapped.append("")
-                continue
-            remaining = source_line
-            while remaining:
-                low, high = 1, len(remaining)
-                while low <= high:
-                    middle = (low + high) // 2
-                    width = draw.textlength(remaining[:middle], font=font)
-                    if width <= max_width:
-                        low = middle + 1
-                    else:
-                        high = middle - 1
-                split_at = max(1, high)
-                wrapped.append(remaining[:split_at])
-                remaining = remaining[split_at:]
-        return wrapped or [""]
 
     def _display_name(self, user: User) -> str:
         name = user.nickname or user.user_id

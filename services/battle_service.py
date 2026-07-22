@@ -4,15 +4,23 @@ import time
 
 try:
     from ..models.battle import BattleAnalysis, BattleResult
+    from ..models.combat import FighterSnapshot
     from ..models.user import User, UserIdentity
     from . import config
+    from .battle_report import BattleReportBuilder
+    from .combat_ai import profile_for_strategy
+    from .combat_engine import SideviewCombatEngine
     from .db import connect_db
     from .llm_service import LLMService
     from .user_service import UserService, utc_now_text
 except ImportError:
     from models.battle import BattleAnalysis, BattleResult
+    from models.combat import FighterSnapshot
     from models.user import User, UserIdentity
     from services import config
+    from services.battle_report import BattleReportBuilder
+    from services.combat_ai import profile_for_strategy
+    from services.combat_engine import SideviewCombatEngine
     from services.db import connect_db
     from services.llm_service import LLMService
     from services.user_service import UserService, utc_now_text
@@ -45,6 +53,8 @@ class BattleService:
         self.db_path = db_path
         self.user_service = user_service
         self.llm_service = llm_service
+        self.combat_engine = SideviewCombatEngine()
+        self.report_builder = BattleReportBuilder()
 
     async def battle(
         self,
@@ -65,7 +75,9 @@ class BattleService:
             defender_strategy_random,
             defender_strategy_custom,
         ) = self._resolve_strategy("")
-        custom_strategy_profiles = {}
+
+        # Keep persistence locks short. The first transaction creates/loads a
+        # stable fighter snapshot and rejects invalid challenges before any LLM work.
         async with await connect_db(self.db_path) as db:
             await db.execute("BEGIN")
             attacker, _ = await self.user_service.get_or_create_user_in_db(
@@ -77,69 +89,70 @@ class BattleService:
             if attacker.id == defender.id:
                 await db.rollback()
                 raise ValueError("不能挑战自己")
+            await self._check_challenge_limit(db, attacker.id, defender.id)
+            await db.commit()
 
+        custom_strategy_profiles = {}
+        if attacker_strategy_custom:
+            custom_strategy_profiles[attacker_strategy] = (
+                await self._build_custom_strategy_profile(
+                    attacker_strategy,
+                    context,
+                    event,
+                )
+            )
+        if defender_strategy_custom:
+            custom_strategy_profiles[defender_strategy] = (
+                await self._build_custom_strategy_profile(
+                    defender_strategy,
+                    context,
+                    event,
+                )
+            )
+
+        local_analysis = self._local_analysis(
+            attacker,
+            defender,
+            attacker_strategy,
+            defender_strategy,
+            custom_strategy_profiles,
+        )
+        attacker_snapshot = self._fighter_snapshot(attacker, attacker_strategy)
+        defender_snapshot = self._fighter_snapshot(defender, defender_strategy)
+        random_seed = random.SystemRandom().randrange(0, 2**63)
+        simulation = self.combat_engine.simulate(
+            attacker_snapshot,
+            defender_snapshot,
+            profile_for_strategy(
+                attacker_strategy,
+                custom_strategy_profiles.get(attacker_strategy),
+            ),
+            profile_for_strategy(
+                defender_strategy,
+                custom_strategy_profiles.get(defender_strategy),
+            ),
+            random_seed,
+        )
+        local_battle_log = self.report_builder.build(simulation)
+        legacy_roll_value = random.Random(random_seed ^ 0x5DEECE66D).random()
+        analysis = (
+            f"一维横板模拟持续 {simulation.duration_ticks} Tick，"
+            f"结束原因：{simulation.finish_reason}。"
+        )
+
+        # Re-check the limit at settlement so direct callers cannot race around
+        # challenge restrictions. The queue makes the common path strictly FIFO.
+        async with await connect_db(self.db_path) as db:
+            await db.execute("BEGIN")
             challenge_limit = await self._check_challenge_limit(
                 db,
                 attacker.id,
                 defender.id,
             )
-
-            if attacker_strategy_custom:
-                custom_strategy_profiles[attacker_strategy] = (
-                    await self._build_custom_strategy_profile(
-                        attacker_strategy,
-                        context,
-                        event,
-                    )
-                )
-            if defender_strategy_custom:
-                custom_strategy_profiles[defender_strategy] = (
-                    await self._build_custom_strategy_profile(
-                        defender_strategy,
-                        context,
-                        event,
-                    )
-                )
-
-            local_analysis = self._local_analysis(
-                attacker,
-                defender,
-                attacker_strategy,
-                defender_strategy,
-                custom_strategy_profiles,
-            )
-            final_analysis = local_analysis
-            if context and event:
-                llm_analysis = await self.llm_service.analyze_battle(
-                    context,
-                    event,
-                    attacker,
-                    defender,
-                    attacker_strategy,
-                    defender_strategy,
-                    local_analysis.attacker_win_rate,
-                )
-                if llm_analysis:
-                    mixed_rate = (
-                        local_analysis.attacker_win_rate * (1 - config.LLM_RATE_WEIGHT)
-                        + llm_analysis.attacker_win_rate * config.LLM_RATE_WEIGHT
-                    )
-                    final_analysis = BattleAnalysis(
-                        attacker_win_rate=config.clamp(
-                            mixed_rate,
-                            config.BATTLE_MIN_WIN_RATE,
-                            config.BATTLE_MAX_WIN_RATE,
-                        ),
-                        analysis=llm_analysis.analysis,
-                        battle_log=llm_analysis.battle_log or local_analysis.battle_log,
-                        raw_result=llm_analysis.raw_result,
-                        source="llm",
-                    )
-
-            roll_value = random.random()
-            attacker_wins = roll_value < final_analysis.attacker_win_rate
-            winner = attacker if attacker_wins else defender
-            loser = defender if attacker_wins else attacker
+            attacker = await self.user_service.get_user_by_pk_in_db(db, attacker.id)
+            defender = await self.user_service.get_user_by_pk_in_db(db, defender.id)
+            winner = attacker if simulation.winner_pk == attacker.id else defender
+            loser = defender if winner.id == attacker.id else attacker
             requested_loser_exp_loss = self._roll_loser_exp_loss(winner, loser)
             loser_exp = await self.user_service.deduct_exp_in_db(
                 db,
@@ -159,29 +172,6 @@ class BattleService:
             updated_loser = (
                 updated_attacker if loser.id == updated_attacker.id else updated_defender
             )
-            battle_log = self._result_battle_log(
-                updated_attacker,
-                updated_defender,
-                updated_winner,
-                updated_loser,
-                attacker_strategy,
-                defender_strategy,
-            )
-            if context and event:
-                llm_battle_log = await self.llm_service.describe_battle_result(
-                    context,
-                    event,
-                    updated_attacker,
-                    updated_defender,
-                    updated_winner,
-                    updated_loser,
-                    attacker_strategy,
-                    defender_strategy,
-                    winner_exp_gain,
-                    loser_exp_loss,
-                )
-                if llm_battle_log:
-                    battle_log = llm_battle_log
 
             now_ts = int(time.time())
             await db.execute(
@@ -191,8 +181,9 @@ class BattleService:
                     attacker_win_rate, roll_value, strategy, winner_exp_gain,
                     loser_exp_loss, analysis, battle_log, llm_raw_result,
                     source, is_counterattack, countered_battle_id,
-                    created_at, created_at_ts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    battle_mode, engine_version, random_seed, duration_ticks,
+                    finish_reason, simulation_json, created_at, created_at_ts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     attacker.group_id,
@@ -200,8 +191,8 @@ class BattleService:
                     defender.id,
                     winner.id,
                     loser.id,
-                    final_analysis.attacker_win_rate,
-                    roll_value,
+                    local_analysis.attacker_win_rate,
+                    legacy_roll_value,
                     json.dumps(
                         {
                             "attacker": attacker_strategy,
@@ -216,39 +207,87 @@ class BattleService:
                     ),
                     winner_exp_gain,
                     loser_exp_loss,
-                    final_analysis.analysis,
-                    json.dumps(battle_log, ensure_ascii=False),
-                    final_analysis.raw_result,
-                    final_analysis.source,
+                    analysis,
+                    json.dumps(local_battle_log, ensure_ascii=False),
+                    "",
+                    "local",
                     1 if challenge_limit["is_counterattack"] else 0,
                     challenge_limit["countered_battle_id"],
+                    "sideview",
+                    simulation.engine_version,
+                    simulation.random_seed,
+                    simulation.duration_ticks,
+                    simulation.finish_reason,
+                    json.dumps(simulation.to_dict(), ensure_ascii=False),
                     utc_now_text(),
                     now_ts,
                 ),
             )
+            cursor = await db.execute("SELECT last_insert_rowid() AS id")
+            battle_row = await cursor.fetchone()
+            await cursor.close()
+            battle_id = battle_row["id"]
             await db.commit()
 
-            return BattleResult(
-                attacker=updated_attacker,
-                defender=updated_defender,
-                winner=updated_winner,
-                loser=updated_loser,
-                attacker_strategy=attacker_strategy,
-                defender_strategy=defender_strategy,
-                attacker_strategy_random=attacker_strategy_random,
-                defender_strategy_random=defender_strategy_random,
-                attacker_win_rate=final_analysis.attacker_win_rate,
-                roll_value=roll_value,
-                winner_exp_gain=winner_exp_gain,
-                loser_exp_loss=loser_exp_loss,
-                analysis=final_analysis.analysis,
-                battle_log=battle_log,
-                level_ups=winner_exp.level_ups,
-                level_downs=loser_exp.level_downs,
-                source=final_analysis.source,
-                target_created=defender_created,
-                is_counterattack=challenge_limit["is_counterattack"],
+        battle_log = local_battle_log
+        source = "local"
+        if context and event:
+            llm_battle_log = await self.llm_service.describe_simulation_result(
+                context,
+                event,
+                simulation,
+                local_battle_log,
             )
+            if llm_battle_log:
+                try:
+                    async with await connect_db(self.db_path) as db:
+                        await db.execute(
+                            "UPDATE battles SET battle_log = ?, source = ? WHERE id = ?",
+                            (json.dumps(llm_battle_log, ensure_ascii=False), "llm", battle_id),
+                        )
+                        await db.commit()
+                    battle_log = llm_battle_log
+                    source = "llm"
+                except Exception:
+                    # Settlement is already committed; report persistence must not
+                    # turn a completed battle into a user-visible failure.
+                    battle_log = local_battle_log
+
+        return BattleResult(
+            attacker=updated_attacker,
+            defender=updated_defender,
+            winner=updated_winner,
+            loser=updated_loser,
+            attacker_strategy=attacker_strategy,
+            defender_strategy=defender_strategy,
+            attacker_strategy_random=attacker_strategy_random,
+            defender_strategy_random=defender_strategy_random,
+            attacker_win_rate=local_analysis.attacker_win_rate,
+            roll_value=legacy_roll_value,
+            winner_exp_gain=winner_exp_gain,
+            loser_exp_loss=loser_exp_loss,
+            analysis=analysis,
+            battle_log=battle_log,
+            level_ups=winner_exp.level_ups,
+            level_downs=loser_exp.level_downs,
+            source=source,
+            target_created=defender_created,
+            is_counterattack=challenge_limit["is_counterattack"],
+            simulation=simulation,
+        )
+
+    def _fighter_snapshot(self, user: User, strategy: str) -> FighterSnapshot:
+        return FighterSnapshot(
+            user_pk=user.id,
+            name=self._display_name(user),
+            level=user.level,
+            hp=user.hp,
+            atk=user.atk,
+            defense=user.defense,
+            speed=user.speed,
+            luck=user.luck,
+            strategy=strategy,
+        )
 
     async def _check_challenge_limit(
         self,

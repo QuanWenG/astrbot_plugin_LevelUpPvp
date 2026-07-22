@@ -130,6 +130,12 @@ async def init_db(db_path: str) -> None:
                 source TEXT NOT NULL DEFAULT 'local',
                 is_counterattack INTEGER NOT NULL DEFAULT 0,
                 countered_battle_id INTEGER,
+                battle_mode TEXT NOT NULL DEFAULT 'probability',
+                engine_version TEXT NOT NULL DEFAULT 'legacy-v1',
+                random_seed INTEGER,
+                duration_ticks INTEGER NOT NULL DEFAULT 0,
+                finish_reason TEXT NOT NULL DEFAULT '',
+                simulation_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 created_at_ts INTEGER NOT NULL,
                 FOREIGN KEY(attacker_pk) REFERENCES users(id) ON DELETE CASCADE,
@@ -211,6 +217,22 @@ async def init_db(db_path: str) -> None:
             "INTEGER NOT NULL DEFAULT 0",
         )
         await _ensure_column(db, "battles", "countered_battle_id", "INTEGER")
+        await _ensure_column(
+            db, "battles", "battle_mode", "TEXT NOT NULL DEFAULT 'probability'"
+        )
+        await _ensure_column(
+            db, "battles", "engine_version", "TEXT NOT NULL DEFAULT 'legacy-v1'"
+        )
+        await _ensure_column(db, "battles", "random_seed", "INTEGER")
+        await _ensure_column(
+            db, "battles", "duration_ticks", "INTEGER NOT NULL DEFAULT 0"
+        )
+        await _ensure_column(
+            db, "battles", "finish_reason", "TEXT NOT NULL DEFAULT ''"
+        )
+        await _ensure_column(
+            db, "battles", "simulation_json", "TEXT NOT NULL DEFAULT '{}'"
+        )
         await db.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_battles_countered
