@@ -274,21 +274,25 @@ class LLMService:
 攻击方：
 - 昵称：{attacker.nickname}
 - 等级：{attacker.level}
-- 生命：{attacker.hp}
-- 攻击：{attacker.atk}
-- 防御：{attacker.defense}
-- 速度：{attacker.speed}
-- 幸运：{attacker.luck}
+- 力量：{attacker.strength}
+- 体质：{attacker.constitution}
+- 灵巧：{attacker.dexterity}
+- 感知：{attacker.perception}
+- 魔力：{attacker.magic}
+- 意志：{attacker.willpower}
+
 - 本场策略：{attacker_strategy}
 
 防守方：
 - 昵称：{defender.nickname}
 - 等级：{defender.level}
-- 生命：{defender.hp}
-- 攻击：{defender.atk}
-- 防御：{defender.defense}
-- 速度：{defender.speed}
-- 幸运：{defender.luck}
+- 力量：{defender.strength}
+- 体质：{defender.constitution}
+- 灵巧：{defender.dexterity}
+- 感知：{defender.perception}
+- 魔力：{defender.magic}
+- 意志：{defender.willpower}
+
 - 本场策略：{defender_strategy}
 
 本地规则给出的攻击方基础胜率为：{local_win_rate:.2f}
@@ -309,28 +313,23 @@ class LLMService:
 
 自定义策略：{strategy}
 
-可选属性只能从以下英文键中选择：
-- hp：生命，代表耐久、承伤、持久战、血量压制
-- atk：攻击，代表爆发、破防、终结、压制
-- defense：防御，代表格挡、反击、稳守、抗爆发
-- speed：速度，代表先手、闪避、走位、拉扯
-- luck：幸运，代表奇招、欺骗、暴击、赌局、反转
+可选主属性英文键：strength、constitution、dexterity、perception、magic、willpower。
+分别表示力量近战、体质防护、灵巧操作、感知射击暴击、魔力法术、意志治疗辅助。
 
 已存在的内置策略：
 {strategies}
 
 输出要求：
-- primary_stats 必须正好给出 3 个英文属性键，按重要性排序。
+- primary_stats 必须正好给出 3 个英文主属性键，按重要性排序。
 - counters 可以给出 0 到 3 个它可能克制的内置策略名称。
 - 不要编造属性键，不要输出内置策略列表以外的 counters。
 
 输出格式：
 {{
-  "primary_stats": ["speed", "atk", "luck"],
+  "primary_stats": ["dexterity", "perception", "strength"],
   "counters": ["防守反击", "控制节奏"]
 }}
 """.strip()
-
     def _build_result_prompt(
         self,
         attacker: User,
@@ -346,9 +345,9 @@ class LLMService:
 请根据以下已经结算完成的战斗事实，写一段有画面感的群聊PVP战报。
 
 固定事实：
-- 攻击方：{attacker.nickname}，等级 {attacker.level}，属性：生命 {attacker.hp} / 攻击 {attacker.atk} / 防御 {attacker.defense} / 速度 {attacker.speed} / 幸运 {attacker.luck}
+- 攻击方：{attacker.nickname}，等级 {attacker.level}，属性：力量 {attacker.strength} / 体质 {attacker.constitution} / 灵巧 {attacker.dexterity} / 感知 {attacker.perception} / 魔力 {attacker.magic} / 意志 {attacker.willpower}
 - 攻击方策略：{attacker_strategy}
-- 防守方：{defender.nickname}，等级 {defender.level}，属性：生命 {defender.hp} / 攻击 {defender.atk} / 防御 {defender.defense} / 速度 {defender.speed} / 幸运 {defender.luck}
+- 防守方：{defender.nickname}，等级 {defender.level}，属性：力量 {defender.strength} / 体质 {defender.constitution} / 灵巧 {defender.dexterity} / 感知 {defender.perception} / 魔力 {defender.magic} / 意志 {defender.willpower}
 - 防守方策略：{defender_strategy}
 - 胜者：{winner.nickname}
 - 败者：{loser.nickname}
@@ -421,30 +420,24 @@ class LLMService:
 
     def _sanitize_stat_names(self, value) -> list[str]:
         aliases = {
-            "生命": "hp",
-            "血量": "hp",
-            "耐久": "hp",
-            "hp": "hp",
-            "攻击": "atk",
-            "爆发": "atk",
-            "atk": "atk",
-            "防御": "defense",
-            "防守": "defense",
-            "defense": "defense",
-            "速度": "speed",
-            "先手": "speed",
-            "speed": "speed",
-            "幸运": "luck",
-            "运气": "luck",
-            "luck": "luck",
+            "力量": "strength", "strength": "strength", "str": "strength",
+            "体质": "constitution", "constitution": "constitution", "con": "constitution",
+            "灵巧": "dexterity", "dexterity": "dexterity", "dex": "dexterity",
+            "感知": "perception", "perception": "perception", "per": "perception",
+            "魔力": "magic", "magic": "magic",
+            "意志": "willpower", "willpower": "willpower", "will": "willpower",
+            "生命": "strength", "血量": "strength", "hp": "strength",
+            "防御": "constitution", "defense": "constitution",
+            "速度": "dexterity", "speed": "dexterity",
+            "攻击": "perception", "atk": "perception",
+            "幸运": "magic", "luck": "magic",
         }
         stats = []
         for item in value:
-            stat = aliases.get(str(item).strip())
+            stat = aliases.get(str(item).strip().lower())
             if stat and stat not in stats:
                 stats.append(stat)
         return stats
-
     def _sanitize_strategy_names(self, value) -> list[str]:
         strategies = []
         allowed = set(config.BATTLE_STRATEGY_NAMES)

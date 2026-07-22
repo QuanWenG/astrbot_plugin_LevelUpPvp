@@ -7,40 +7,52 @@ try:
     from ..models.combat import FighterSnapshot
     from ..models.user import User, UserIdentity
     from . import config
+    from .attribute_service import AttributeService, normalize_attribute_id
     from .battle_report import BattleReportBuilder
+    from .build_service import CombatBuildService
+    from .equipment_service import EquipmentService
     from .combat_ai import profile_for_strategy
     from .combat_engine import SideviewCombatEngine
     from .db import connect_db
     from .llm_service import LLMService
+    from .skill_service import SkillService
+    from .spell_service import SpellService
     from .user_service import UserService, utc_now_text
 except ImportError:
     from models.battle import BattleAnalysis, BattleResult
     from models.combat import FighterSnapshot
     from models.user import User, UserIdentity
     from services import config
+    from services.attribute_service import AttributeService, normalize_attribute_id
     from services.battle_report import BattleReportBuilder
+    from services.build_service import CombatBuildService
+    from services.equipment_service import EquipmentService
     from services.combat_ai import profile_for_strategy
     from services.combat_engine import SideviewCombatEngine
     from services.db import connect_db
     from services.llm_service import LLMService
+    from services.skill_service import SkillService
+    from services.spell_service import SpellService
     from services.user_service import UserService, utc_now_text
 
 
 CUSTOM_STRATEGY_STAT_TARGETS = {
-    "hp": "hp",
-    "atk": "defense",
-    "defense": "atk",
-    "speed": "speed",
-    "luck": "luck",
+    "strength": "constitution",
+    "constitution": "strength",
+    "dexterity": "dexterity",
+    "perception": "constitution",
+    "magic": "magic",
+    "willpower": "magic",
 }
 CUSTOM_STRATEGY_KEYWORDS = (
-    ("speed", ("速", "闪", "躲", "先手", "拉扯", "走位", "突袭", "游走")),
-    ("atk", ("攻", "爆", "破", "打", "斩", "刀", "杀", "压制", "猛")),
-    ("defense", ("防", "守", "盾", "格挡", "反击", "架", "稳")),
-    ("hp", ("血", "肉", "耗", "拖", "持久", "续航", "扛")),
-    ("luck", ("赌", "运", "奇", "骗", "诈", "乱", "玄", "反转")),
+    ("dexterity", ("速", "闪", "躲", "先手", "拉扯", "走位", "突袭", "游走")),
+    ("strength", ("近战", "重击", "斩", "刀", "猛")),
+    ("perception", ("攻", "爆", "破", "枪", "射", "精准", "暴击")),
+    ("constitution", ("防", "守", "盾", "格挡", "反击", "肉", "扛")),
+    ("magic", ("魔", "元素", "法术", "奥术")),
+    ("willpower", ("恢复", "治疗", "祝福", "精神", "辅助")),
 )
-CUSTOM_STRATEGY_DEFAULT_STATS = ("atk", "speed", "luck")
+CUSTOM_STRATEGY_DEFAULT_STATS = ("perception", "dexterity", "strength")
 
 
 class BattleService:
@@ -49,10 +61,24 @@ class BattleService:
         db_path: str,
         user_service: UserService,
         llm_service: LLMService,
+        equipment_service=None,
+        skill_service=None,
+        attribute_service=None,
+        spell_service=None,
     ):
         self.db_path = db_path
         self.user_service = user_service
         self.llm_service = llm_service
+        self.equipment_service = equipment_service or EquipmentService(db_path)
+        self.skill_service = skill_service or SkillService(db_path)
+        self.attribute_service = attribute_service or AttributeService(db_path)
+        self.spell_service = spell_service or SpellService(
+            db_path, self.skill_service, self.equipment_service, self.attribute_service
+        )
+        self.build_service = CombatBuildService(
+            self.equipment_service, self.skill_service, self.attribute_service,
+            self.spell_service,
+        )
         self.combat_engine = SideviewCombatEngine()
         self.report_builder = BattleReportBuilder()
 
@@ -90,6 +116,8 @@ class BattleService:
                 await db.rollback()
                 raise ValueError("不能挑战自己")
             await self._check_challenge_limit(db, attacker.id, defender.id)
+            attacker_snapshot = await self.build_service.snapshot_in_db(db, attacker, attacker_strategy)
+            defender_snapshot = await self.build_service.snapshot_in_db(db, defender, defender_strategy)
             await db.commit()
 
         custom_strategy_profiles = {}
@@ -117,8 +145,6 @@ class BattleService:
             defender_strategy,
             custom_strategy_profiles,
         )
-        attacker_snapshot = self._fighter_snapshot(attacker, attacker_strategy)
-        defender_snapshot = self._fighter_snapshot(defender, defender_strategy)
         random_seed = random.SystemRandom().randrange(0, 2**63)
         simulation = self.combat_engine.simulate(
             attacker_snapshot,
@@ -227,6 +253,41 @@ class BattleService:
             battle_row = await cursor.fetchone()
             await cursor.close()
             battle_id = battle_row["id"]
+            usage = self.skill_service.usage_from_simulation(simulation)
+            spell_usage = self.spell_service.usage_from_simulation(simulation)
+            skill_growths = []
+            spell_growths = []
+            attribute_growths = []
+            for fighter_pk in (attacker.id, defender.id):
+                skill_growths.extend(
+                    await self.skill_service.apply_growth_in_db(
+                        db, fighter_pk, usage.get(fighter_pk, {}), battle_id
+                    )
+                )
+                spell_growths.extend(
+                    await self.spell_service.apply_growth_in_db(
+                        db, fighter_pk, spell_usage.get(fighter_pk, {}), battle_id
+                    )
+                )
+                attribute_growths.extend(
+                    await self.attribute_service.apply_battle_growth_in_db(
+                        db, fighter_pk, usage.get(fighter_pk, {}), battle_id
+                    )
+                )
+            updated_attacker = await self.user_service.get_user_by_pk_in_db(
+                db, attacker.id
+            )
+            updated_defender = await self.user_service.get_user_by_pk_in_db(
+                db, defender.id
+            )
+            updated_winner = (
+                updated_attacker
+                if winner.id == updated_attacker.id else updated_defender
+            )
+            updated_loser = (
+                updated_attacker
+                if loser.id == updated_attacker.id else updated_defender
+            )
             await db.commit()
 
         battle_log = local_battle_log
@@ -274,6 +335,9 @@ class BattleService:
             target_created=defender_created,
             is_counterattack=challenge_limit["is_counterattack"],
             simulation=simulation,
+            skill_growths=skill_growths,
+            attribute_growths=attribute_growths,
+            spell_growths=spell_growths,
         )
 
     def _fighter_snapshot(self, user: User, strategy: str) -> FighterSnapshot:
@@ -384,7 +448,7 @@ class BattleService:
             config.BATTLE_LEVEL_RATE_MAX,
         )
         rate += config.clamp(
-            (attacker.luck - defender.luck) * config.BATTLE_LUCK_RATE_STEP,
+            (attacker.perception - defender.perception) * config.BATTLE_LUCK_RATE_STEP,
             -config.BATTLE_LUCK_RATE_MAX,
             config.BATTLE_LUCK_RATE_MAX,
         )
@@ -668,7 +732,8 @@ class BattleService:
     def _normalize_custom_stats(self, stats) -> tuple[str, str, str]:
         normalized = []
         for stat in stats:
-            if stat in config.STAT_LABELS and stat not in normalized:
+            stat = normalize_attribute_id(str(stat))
+            if stat and stat not in normalized:
                 normalized.append(stat)
         for stat in CUSTOM_STRATEGY_DEFAULT_STATS:
             if stat not in normalized:
@@ -683,8 +748,8 @@ class BattleService:
             opponent_stat = CUSTOM_STRATEGY_STAT_TARGETS[stat]
             success_bonus = 0.028 if index == 0 else 0.018
             fail_penalty = -0.038 if index == 0 else -0.02
-            margin = 1 if index == 0 and stat in {"atk", "speed", "luck"} else 0
-            opponent_factor = 0.9 if stat in {"defense", "hp"} else 1.0
+            margin = 1 if index == 0 and stat in {"strength", "dexterity", "perception", "magic"} else 0
+            opponent_factor = 0.9 if stat in {"constitution", "willpower"} else 1.0
             rules.append(
                 (
                     stat,

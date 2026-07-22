@@ -30,17 +30,45 @@ class User:
     losses: int
     created_at: str
     updated_at: str
+    skill_points: int = 0
+    willpower: int = 5
+    life_growth: int = 100
+    mana_growth: int = 100
+    advanced_speed: int = 100
+    advanced_luck: int = 100
     frozen_stats: dict[str, int] = field(default_factory=dict)
     frozen_stat_points: int = 0
+    frozen_skill_points: int = 0
     frozen_levels: list[int] = field(default_factory=list)
+
+    @property
+    def strength(self) -> int:
+        return self.hp
+
+    @property
+    def constitution(self) -> int:
+        return self.defense
+
+    @property
+    def dexterity(self) -> int:
+        return self.speed
+
+    @property
+    def perception(self) -> int:
+        return self.atk
+
+    @property
+    def magic(self) -> int:
+        return self.luck
 
     def stats(self) -> dict[str, int]:
         return {
-            "hp": self.hp,
-            "atk": self.atk,
-            "defense": self.defense,
-            "speed": self.speed,
-            "luck": self.luck,
+            "strength": self.strength,
+            "constitution": self.constitution,
+            "dexterity": self.dexterity,
+            "perception": self.perception,
+            "magic": self.magic,
+            "willpower": self.willpower,
         }
 
 
@@ -51,6 +79,7 @@ class LevelUpEvent:
     auto_growth: dict[str, int]
     stat_points_gain: int
     restored_from_freeze: bool = False
+    skill_points_gain: int = 0
 
 
 @dataclass
@@ -59,6 +88,7 @@ class LevelDownEvent:
     to_level: int
     frozen_stats: dict[str, int]
     frozen_stat_points: int
+    frozen_skill_points: int = 0
 
 
 @dataclass
@@ -76,6 +106,7 @@ class CheckinResult:
     streak_days: int
     level_ups: list[LevelUpEvent]
     already_checked: bool = False
+    attribute_potential_restore: int = 0
 
 
 @dataclass

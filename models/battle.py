@@ -39,3 +39,6 @@ class BattleResult:
     target_created: bool = False
     is_counterattack: bool = False
     simulation: SimulationResult | None = None
+    skill_growths: list = field(default_factory=list)
+    attribute_growths: list = field(default_factory=list)
+    spell_growths: list = field(default_factory=list)

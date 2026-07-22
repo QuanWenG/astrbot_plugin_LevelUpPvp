@@ -25,6 +25,15 @@ except ImportError:
 
 
 STAT_NAMES = tuple(config.INITIAL_STATS.keys())
+STAT_STORAGE_COLUMNS = {
+    "strength": "hp", "constitution": "defense",
+    "dexterity": "speed", "perception": "atk",
+    "magic": "luck", "willpower": "willpower",
+}
+LEGACY_STAT_NAMES = {
+    value: key for key, value in STAT_STORAGE_COLUMNS.items()
+    if value != "willpower"
+}
 
 
 def utc_now_text() -> str:
@@ -52,6 +61,12 @@ def row_to_user(row) -> User:
         losses=row["losses"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        skill_points=row["skill_points"],
+        willpower=row["willpower"],
+        life_growth=row["life_growth"],
+        mana_growth=row["mana_growth"],
+        advanced_speed=row["advanced_speed"],
+        advanced_luck=row["advanced_luck"],
     )
 
 
@@ -59,6 +74,9 @@ class UserService:
     def __init__(self, db_path: str):
         self.db_path = db_path
 
+    async def get_user_by_pk(self, user_pk: int) -> User | None:
+        async with await connect_db(self.db_path) as db:
+            return await self.get_user_by_pk_in_db(db, user_pk)
     async def get_or_create_user(self, identity: UserIdentity) -> User:
         async with await connect_db(self.db_path) as db:
             user, _ = await self.get_or_create_user_in_db(db, identity)
@@ -117,9 +135,9 @@ class UserService:
             """
             INSERT INTO users (
                 platform, group_id, user_id, nickname, level, exp, total_exp,
-                stat_points, level_up_count, hp, atk, defense, speed, luck,
+                stat_points, level_up_count, hp, atk, defense, speed, luck, willpower,
                 wins, losses, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
             """,
             (
                 identity.platform,
@@ -131,11 +149,12 @@ class UserService:
                 config.INITIAL_TOTAL_EXP,
                 config.INITIAL_STAT_POINTS,
                 0,
-                config.INITIAL_STATS["hp"],
-                config.INITIAL_STATS["atk"],
-                config.INITIAL_STATS["defense"],
-                config.INITIAL_STATS["speed"],
-                config.INITIAL_STATS["luck"],
+                config.INITIAL_STATS["strength"],
+                config.INITIAL_STATS["perception"],
+                config.INITIAL_STATS["constitution"],
+                config.INITIAL_STATS["dexterity"],
+                config.INITIAL_STATS["magic"],
+                config.INITIAL_STATS["willpower"],
                 now,
                 now,
             ),
@@ -339,6 +358,7 @@ class UserService:
         exp = user.exp + amount
         total_exp = user.total_exp + amount
         stat_points = user.stat_points
+        skill_points = user.skill_points
         level_up_count = user.level_up_count
         stats = user.stats()
         level_ups: list[LevelUpEvent] = []
@@ -359,6 +379,7 @@ class UserService:
             level = to_level
             if released:
                 stat_points += released["frozen_stat_points"]
+                skill_points += released["frozen_skill_points"]
                 level_ups.append(
                     LevelUpEvent(
                         from_level=from_level,
@@ -366,12 +387,15 @@ class UserService:
                         auto_growth=released["frozen_stats"],
                         stat_points_gain=released["frozen_stat_points"],
                         restored_from_freeze=True,
+                        skill_points_gain=released["frozen_skill_points"],
                     )
                 )
                 continue
 
             level_up_count += 1
             stat_points += config.STAT_POINTS_PER_LEVEL
+            skill_point_gain = min(5, 1 + stats["magic"] // 25)
+            skill_points += skill_point_gain
             auto_growth = self._roll_auto_growth()
             for stat_name, gain in auto_growth.items():
                 stats[stat_name] += gain
@@ -382,14 +406,15 @@ class UserService:
                     to_level=level,
                     auto_growth=auto_growth,
                     stat_points_gain=config.STAT_POINTS_PER_LEVEL,
+                    skill_points_gain=skill_point_gain,
                 )
             )
             await db.execute(
                 """
                 INSERT INTO level_up_logs (
                     user_pk, from_level, to_level, auto_growth_json,
-                    stat_points_gain, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    stat_points_gain, skill_points_gain, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user.id,
@@ -397,6 +422,7 @@ class UserService:
                     level,
                     json.dumps(auto_growth, ensure_ascii=False),
                     config.STAT_POINTS_PER_LEVEL,
+                    skill_point_gain,
                     now,
                 ),
             )
@@ -412,6 +438,7 @@ class UserService:
             stats,
             now,
         )
+        await db.execute("UPDATE users SET skill_points = ? WHERE id = ?", (skill_points, user.id))
         updated = await self.get_user_by_pk_in_db(db, user.id)
         return ExpChangeResult(user=updated, exp_delta=amount, level_ups=level_ups)
 
@@ -425,6 +452,7 @@ class UserService:
         exp = user.exp
         total_exp = user.total_exp
         stat_points = user.stat_points
+        skill_points = user.skill_points
         level_up_count = user.level_up_count
         stats = user.stats()
         level_downs: list[LevelDownEvent] = []
@@ -452,9 +480,11 @@ class UserService:
                 to_level,
                 stats,
                 stat_points,
+                skill_points,
                 now,
             )
             stat_points = max(0, stat_points - level_down.frozen_stat_points)
+            skill_points = max(0, skill_points - level_down.frozen_skill_points)
             level_downs.append(level_down)
             level = to_level
             exp = config.exp_required_for_next_level(level)
@@ -470,6 +500,7 @@ class UserService:
             stats,
             now,
         )
+        await db.execute("UPDATE users SET skill_points = ? WHERE id = ?", (skill_points, user.id))
         updated = await self.get_user_by_pk_in_db(db, user.id)
         return ExpChangeResult(
             user=updated,
@@ -496,7 +527,7 @@ class UserService:
     async def _attach_freeze_summary_in_db(self, db, user: User) -> User:
         cursor = await db.execute(
             """
-            SELECT frozen_level, frozen_stats_json, frozen_stat_points
+            SELECT frozen_level, frozen_stats_json, frozen_stat_points, frozen_skill_points
             FROM level_freezes
             WHERE user_pk = ? AND status = 'frozen'
             ORDER BY frozen_level DESC, id DESC
@@ -508,9 +539,11 @@ class UserService:
         frozen_stats = {stat_name: 0 for stat_name in STAT_NAMES}
         frozen_levels = []
         frozen_stat_points = 0
+        frozen_skill_points = 0
         for row in rows:
             frozen_levels.append(int(row["frozen_level"]))
             frozen_stat_points += int(row["frozen_stat_points"])
+            frozen_skill_points += int(row["frozen_skill_points"])
             for stat_name, amount in self._load_stats_json(
                 row["frozen_stats_json"]
             ).items():
@@ -522,6 +555,7 @@ class UserService:
             if amount > 0
         }
         user.frozen_stat_points = frozen_stat_points
+        user.frozen_skill_points = frozen_skill_points
         user.frozen_levels = sorted(set(frozen_levels), reverse=True)
         return user
 
@@ -542,7 +576,7 @@ class UserService:
             UPDATE users
             SET level = ?, exp = ?, total_exp = ?, stat_points = ?,
                 level_up_count = ?, hp = ?, atk = ?, defense = ?,
-                speed = ?, luck = ?, updated_at = ?
+                speed = ?, luck = ?, willpower = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -551,11 +585,12 @@ class UserService:
                 total_exp,
                 stat_points,
                 level_up_count,
-                stats["hp"],
-                stats["atk"],
-                stats["defense"],
-                stats["speed"],
-                stats["luck"],
+                stats["strength"],
+                stats["perception"],
+                stats["constitution"],
+                stats["dexterity"],
+                stats["magic"],
+                stats["willpower"],
                 now,
                 user_id,
             ),
@@ -571,7 +606,7 @@ class UserService:
     ) -> dict | None:
         cursor = await db.execute(
             """
-            SELECT id, frozen_stats_json, frozen_stat_points
+            SELECT id, frozen_stats_json, frozen_stat_points, frozen_skill_points
             FROM level_freezes
             WHERE user_pk = ?
               AND frozen_level = ?
@@ -600,6 +635,7 @@ class UserService:
         return {
             "frozen_stats": frozen_stats,
             "frozen_stat_points": int(row["frozen_stat_points"]),
+            "frozen_skill_points": int(row["frozen_skill_points"]),
         }
 
     async def _freeze_level_in_db(
@@ -610,6 +646,7 @@ class UserService:
         to_level: int,
         stats: dict[str, int],
         stat_points: int,
+        skill_points: int,
         now: str,
     ) -> LevelDownEvent:
         frozen_stats = await self._level_auto_growth_in_db(db, user_id, from_level)
@@ -620,6 +657,10 @@ class UserService:
             )
 
         frozen_stat_points = min(stat_points, config.STAT_POINTS_PER_LEVEL)
+        level_skill_points = await self._level_skill_points_in_db(
+            db, user_id, from_level
+        )
+        frozen_skill_points = min(skill_points, level_skill_points)
         spent_points = config.STAT_POINTS_PER_LEVEL - frozen_stat_points
         spent_freeze = self._roll_spent_stat_freeze(stats, spent_points)
         for stat_name, amount in spent_freeze.items():
@@ -634,8 +675,8 @@ class UserService:
             """
             INSERT INTO level_freezes (
                 user_pk, frozen_level, from_level, to_level, frozen_stats_json,
-                frozen_stat_points, status, created_at, released_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'frozen', ?, NULL)
+                frozen_stat_points, frozen_skill_points, status, created_at, released_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'frozen', ?, NULL)
             """,
             (
                 user_id,
@@ -644,6 +685,7 @@ class UserService:
                 to_level,
                 json.dumps(frozen_stats, ensure_ascii=False),
                 frozen_stat_points,
+                frozen_skill_points,
                 now,
             ),
         )
@@ -652,8 +694,28 @@ class UserService:
             to_level=to_level,
             frozen_stats=frozen_stats,
             frozen_stat_points=frozen_stat_points,
+            frozen_skill_points=frozen_skill_points,
         )
 
+    async def _level_skill_points_in_db(
+        self,
+        db,
+        user_id: int,
+        level: int,
+    ) -> int:
+        cursor = await db.execute(
+            """
+            SELECT skill_points_gain
+            FROM level_up_logs
+            WHERE user_pk = ? AND to_level = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (user_id, level),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return max(1, int(row["skill_points_gain"])) if row else 1
     async def _level_auto_growth_in_db(
         self,
         db,
@@ -709,6 +771,7 @@ class UserService:
             return {}
         stats: dict[str, int] = {}
         for stat_name, amount in raw_stats.items():
+            stat_name = LEGACY_STAT_NAMES.get(stat_name, stat_name)
             if stat_name not in STAT_NAMES:
                 continue
             try:

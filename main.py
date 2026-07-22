@@ -6,21 +6,31 @@ from astrbot.core.star.filter.command import GreedyStr
 
 try:
     from .handles.command_handler import LevelUpPvpCommandHandler
+    from .services.attribute_service import AttributeService
     from .services.battle_service import BattleService
     from .services.checkin_service import CheckinService
     from .services.challenge_queue import ChallengeQueueService
     from .services.db import init_db
+    from .services.equipment_service import EquipmentService
     from .services.llm_service import LLMService
     from .services.stat_service import StatService
+    from .services.skill_service import SkillService
+    from .services.spell_service import SpellService
+    from .services.build_service import CombatBuildService
     from .services.user_service import UserService
 except ImportError:
     from handles.command_handler import LevelUpPvpCommandHandler
+    from services.attribute_service import AttributeService
     from services.battle_service import BattleService
     from services.checkin_service import CheckinService
     from services.challenge_queue import ChallengeQueueService
     from services.db import init_db
+    from services.equipment_service import EquipmentService
     from services.llm_service import LLMService
     from services.stat_service import StatService
+    from services.skill_service import SkillService
+    from services.spell_service import SpellService
+    from services.build_service import CombatBuildService
     from services.user_service import UserService
 
 
@@ -28,15 +38,29 @@ PLUGIN_DIR = os.path.dirname(__file__)
 DB_PATH = os.path.join(PLUGIN_DIR, "data", "db_level_up_pvp.db")
 
 
-@register("astrbot_plugin_LevelUpPvp", "QuanWenG", "群聊自动签到，升级就开打", "1.1.0")
+@register("astrbot_plugin_LevelUpPvp", "QuanWenG", "群聊自动签到，升级就开打", "1.6.1")
 class MyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         user_service = UserService(DB_PATH)
-        checkin_service = CheckinService(DB_PATH, user_service)
+        attribute_service = AttributeService(DB_PATH)
+        checkin_service = CheckinService(
+            DB_PATH, user_service, attribute_service
+        )
         stat_service = StatService(DB_PATH, user_service)
         llm_service = LLMService()
-        battle_service = BattleService(DB_PATH, user_service, llm_service)
+        equipment_service = EquipmentService(DB_PATH)
+        skill_service = SkillService(DB_PATH)
+        spell_service = SpellService(
+            DB_PATH, skill_service, equipment_service, attribute_service
+        )
+        build_service = CombatBuildService(
+            equipment_service, skill_service, attribute_service, spell_service
+        )
+        battle_service = BattleService(
+            DB_PATH, user_service, llm_service, equipment_service, skill_service,
+            attribute_service, spell_service
+        )
         self.challenge_queue = ChallengeQueueService(battle_service)
         self.command_handler = LevelUpPvpCommandHandler(
             context=context,
@@ -45,6 +69,11 @@ class MyPlugin(Star):
             stat_service=stat_service,
             battle_service=battle_service,
             challenge_queue=self.challenge_queue,
+            equipment_service=equipment_service,
+            skill_service=skill_service,
+            build_service=build_service,
+            attribute_service=attribute_service,
+            spell_service=spell_service,
         )
 
     async def initialize(self):
@@ -116,6 +145,56 @@ class MyPlugin(Star):
         ):
             yield result
 
+    @filter.command("背包")
+    async def inventory(self, event: AstrMessageEvent, page: int = 1):
+        async for result in self.command_handler.inventory(event, page): yield result
+
+    @filter.command("装备")
+    async def equipment(self, event: AstrMessageEvent):
+        async for result in self.command_handler.equipment(event): yield result
+
+    @filter.command("装备详情")
+    async def equipment_detail(self, event: AstrMessageEvent, equipment_id: int):
+        async for result in self.command_handler.equipment_detail(event, equipment_id): yield result
+
+    @filter.command("穿戴")
+    async def equip_item(self, event: AstrMessageEvent, equipment_id: int, slot: str = ""):
+        async for result in self.command_handler.equip_item(event, equipment_id, slot): yield result
+
+    @filter.command("卸下")
+    async def unequip_item(self, event: AstrMessageEvent, slot: str):
+        async for result in self.command_handler.unequip_item(event, slot): yield result
+
+    @filter.command("技能")
+    async def skills(self, event: AstrMessageEvent):
+        async for result in self.command_handler.skills(event): yield result
+
+    @filter.command("学习")
+    async def learn_skill(self, event: AstrMessageEvent, name: GreedyStr):
+        async for result in self.command_handler.learn_skill(event, name): yield result
+
+    @filter.command("训练技能")
+    async def train_skill(self, event: AstrMessageEvent, name: str, points: int = 1):
+        async for result in self.command_handler.train_skill(event, name, points): yield result
+
+    @filter.command("技能栏")
+    async def skill_slot(self, event: AstrMessageEvent, slot: int, name: GreedyStr):
+        async for result in self.command_handler.set_skill_slot(event, slot, name): yield result
+    @filter.command("魔法书")
+    async def spellbooks(self, event: AstrMessageEvent, page: int = 1):
+        async for result in self.command_handler.spellbooks(event, page): yield result
+
+    @filter.command("阅读")
+    async def read_spellbook(self, event: AstrMessageEvent, book_id: int):
+        async for result in self.command_handler.read_spellbook(event, book_id): yield result
+
+    @filter.command("法术")
+    async def spells(self, event: AstrMessageEvent):
+        async for result in self.command_handler.spells(event): yield result
+
+    @filter.command("战技")
+    async def techniques(self, event: AstrMessageEvent):
+        async for result in self.command_handler.techniques(event): yield result
     @filter.command("挑战")
     async def challenge(self, event: AstrMessageEvent):
         """At 一名用户发起概率战斗。"""
@@ -137,7 +216,7 @@ class MyPlugin(Star):
             elif command == "加点":
                 parsed_args = self.command_handler.parse_add_point_args(args)
                 if not parsed_args:
-                    yield event.plain_result("用法：/加点 攻击 2")
+                    yield event.plain_result("用法：/加点 力量 2")
                 else:
                     stat_name, amount = parsed_args
                     async for result in self.command_handler.add_point(
@@ -158,6 +237,47 @@ class MyPlugin(Star):
                     args,
                 ):
                     yield result
+            elif command == "背包":
+                page = int(args) if args.strip().isdigit() else 1
+                async for result in self.command_handler.inventory(event, page): yield result
+            elif command == "装备":
+                async for result in self.command_handler.equipment(event): yield result
+            elif command == "装备详情":
+                if args.strip().isdigit():
+                    async for result in self.command_handler.equipment_detail(event, int(args.strip())): yield result
+                else: yield event.plain_result("用法：/装备详情 装备ID")
+            elif command == "穿戴":
+                parts = args.split()
+                if parts and parts[0].isdigit():
+                    async for result in self.command_handler.equip_item(event, int(parts[0]), parts[1] if len(parts) > 1 else ""): yield result
+                else: yield event.plain_result("用法：/穿戴 装备ID [槽位]")
+            elif command == "卸下":
+                async for result in self.command_handler.unequip_item(event, args.strip()): yield result
+            elif command == "技能":
+                async for result in self.command_handler.skills(event): yield result
+            elif command == "学习":
+                async for result in self.command_handler.learn_skill(event, args.strip()): yield result
+            elif command == "训练技能":
+                parts = args.split()
+                points = int(parts[-1]) if parts and parts[-1].isdigit() else 1
+                name = " ".join(parts[:-1]) if parts and parts[-1].isdigit() else args.strip()
+                async for result in self.command_handler.train_skill(event, name, points): yield result
+            elif command == "技能栏":
+                parts = args.split(maxsplit=1)
+                if len(parts) == 2 and parts[0].isdigit():
+                    async for result in self.command_handler.set_skill_slot(event, int(parts[0]), parts[1]): yield result
+                else: yield event.plain_result("用法：/技能栏 位置 技能名|清空")
+            elif command == "魔法书":
+                page = int(args) if args.strip().isdigit() else 1
+                async for result in self.command_handler.spellbooks(event, page): yield result
+            elif command == "阅读":
+                if args.strip().isdigit():
+                    async for result in self.command_handler.read_spellbook(event, int(args.strip())): yield result
+                else: yield event.plain_result("用法：/阅读 魔法书ID")
+            elif command == "法术":
+                async for result in self.command_handler.spells(event): yield result
+            elif command == "战技":
+                async for result in self.command_handler.techniques(event): yield result
             elif command == "挑战":
                 async for result in self.command_handler.challenge(event):
                     yield result

@@ -5,12 +5,12 @@ try:
     from ..models.user import StatPointResult, UserIdentity
     from . import config
     from .db import connect_db
-    from .user_service import UserService, utc_now_text
+    from .user_service import STAT_STORAGE_COLUMNS, UserService, utc_now_text
 except ImportError:
     from models.user import StatPointResult, UserIdentity
     from services import config
     from services.db import connect_db
-    from services.user_service import UserService, utc_now_text
+    from services.user_service import STAT_STORAGE_COLUMNS, UserService, utc_now_text
 
 
 class StatService:
@@ -30,9 +30,16 @@ class StatService:
         raw_stat_name: str,
         points: int,
     ) -> StatPointResult:
+        if (raw_stat_name or "").strip().lower() in {
+            "速度", "speed", "幸运", "luck",
+        }:
+            raise ValueError(
+                "速度和幸运属于高级属性，不能使用普通属性点；"
+                "请使用灵巧或魔力。"
+            )
         stat_name = self.normalize_stat_name(raw_stat_name)
         if not stat_name:
-            raise ValueError("属性不存在。可用属性：生命、攻击、防御、速度、幸运")
+            raise ValueError("属性不存在。可用属性：力量、体质、灵巧、感知、魔力、意志")
         if points <= 0:
             raise ValueError("加点数量必须是正整数")
 
@@ -44,11 +51,12 @@ class StatService:
                 raise ValueError(f"自定义属性点不足，当前剩余 {user.stat_points} 点")
 
             rolls = [random.randint(*config.STAT_POINT_RANGES[stat_name]) for _ in range(points)]
+            storage_column = STAT_STORAGE_COLUMNS[stat_name]
             total_gain = sum(rolls)
             await db.execute(
                 f"""
                 UPDATE users
-                SET {stat_name} = {stat_name} + ?,
+                SET {storage_column} = {storage_column} + ?,
                     stat_points = stat_points - ?,
                     updated_at = ?
                 WHERE id = ?

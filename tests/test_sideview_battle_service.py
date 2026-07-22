@@ -46,7 +46,7 @@ class SideviewBattleServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNotNone(result.simulation)
-        self.assertEqual(result.simulation.engine_version, "sideview-v2")
+        self.assertEqual(result.simulation.engine_version, "sideview-v9")
         self.assertEqual(result.winner.id, result.simulation.winner_pk)
         self.assertGreaterEqual(len(result.battle_log), 6)
         self.assertLessEqual(len(result.battle_log), 10)
@@ -64,7 +64,7 @@ class SideviewBattleServiceTests(unittest.IsolatedAsyncioTestCase):
 
         payload = json.loads(row["simulation_json"])
         self.assertEqual(row["battle_mode"], "sideview")
-        self.assertEqual(row["engine_version"], "sideview-v2")
+        self.assertEqual(row["engine_version"], "sideview-v9")
         self.assertEqual(row["random_seed"], result.simulation.random_seed)
         self.assertEqual(row["duration_ticks"], result.simulation.duration_ticks)
         self.assertEqual(row["finish_reason"], result.simulation.finish_reason)

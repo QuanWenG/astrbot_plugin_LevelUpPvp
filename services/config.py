@@ -7,34 +7,37 @@ INITIAL_TOTAL_EXP = 0
 INITIAL_STAT_POINTS = 0
 
 INITIAL_STATS = {
-    "hp": 10,
-    "atk": 5,
-    "defense": 5,
-    "speed": 5,
-    "luck": 5,
+    "strength": 10,
+    "constitution": 5,
+    "dexterity": 5,
+    "perception": 5,
+    "magic": 5,
+    "willpower": 5,
 }
 
 STAT_LABELS = {
-    "hp": "生命",
-    "atk": "攻击",
-    "defense": "防御",
-    "speed": "速度",
-    "luck": "幸运",
+    "strength": "力量",
+    "constitution": "体质",
+    "dexterity": "灵巧",
+    "perception": "感知",
+    "magic": "魔力",
+    "willpower": "意志",
+    # Historical keys remain readable in old logs and LLM responses.
+    "hp": "力量",
+    "defense": "体质",
+    "speed": "灵巧",
+    "atk": "感知",
+    "luck": "魔力",
 }
 
 STAT_ALIASES = {
-    "生命": "hp",
-    "血量": "hp",
-    "hp": "hp",
-    "攻击": "atk",
-    "atk": "atk",
-    "防御": "defense",
-    "def": "defense",
-    "defense": "defense",
-    "速度": "speed",
-    "speed": "speed",
-    "幸运": "luck",
-    "luck": "luck",
+    **{key: key for key in INITIAL_STATS},
+    "力量": "strength", "str": "strength", "生命": "strength", "血量": "strength", "hp": "strength",
+    "体质": "constitution", "con": "constitution", "防御": "constitution", "def": "constitution", "defense": "constitution",
+    "灵巧": "dexterity", "dex": "dexterity",
+    "感知": "perception", "per": "perception", "攻击": "perception", "atk": "perception",
+    "魔力": "magic", "mag": "magic",
+    "意志": "willpower", "wil": "willpower", "will": "willpower",
 }
 
 LEVEL_EXP_BASE = 100
@@ -42,22 +45,8 @@ LEVEL_EXP_GROWTH = 1.18
 STAT_POINTS_PER_LEVEL = 3
 
 AUTO_GROWTH_STAT_COUNT_RANGE = (2, 3)
-AUTO_GROWTH_RANGES = {
-    "hp": (2, 5),
-    "atk": (1, 3),
-    "defense": (1, 3),
-    "speed": (1, 2),
-    "luck": (1, 2),
-}
-
-STAT_POINT_RANGES = {
-    "hp": (2, 4),
-    "atk": (1, 3),
-    "defense": (1, 3),
-    "speed": (1, 2),
-    "luck": (1, 2),
-}
-
+AUTO_GROWTH_RANGES = {name: (1, 2) for name in INITIAL_STATS}
+STAT_POINT_RANGES = {name: (1, 2) for name in INITIAL_STATS}
 CHECKIN_ROLL_EXP_RANGE = (1, 100)
 CHECKIN_FALLBACK_THRESHOLD_RATE = 0.10
 CHECKIN_FALLBACK_EXP_RATE_RANGE = (0.08, 0.12)
@@ -156,24 +145,24 @@ BATTLE_STRATEGY_COUNTERS = {
 }
 
 BATTLE_STRATEGY_BUILD_TYPES = {
-    "稳扎稳打": ("均衡", "防御", "生命"),
-    "全力猛攻": ("攻击",),
-    "防守反击": ("防御", "生命"),
-    "游走消耗": ("速度", "幸运"),
-    "先手压制": ("速度", "攻击"),
-    "诱敌深入": ("防御", "幸运"),
-    "持久消耗": ("生命", "防御"),
-    "奇袭爆发": ("攻击", "幸运"),
-    "以守为攻": ("防御", "攻击"),
-    "速度拉扯": ("速度",),
-    "幸运赌局": ("幸运",),
-    "破防强攻": ("攻击",),
-    "闪避拖延": ("速度", "幸运"),
-    "控制节奏": ("均衡", "速度"),
-    "血量压制": ("生命",),
-    "精准打击": ("攻击", "速度"),
-    "扰乱节奏": ("幸运", "速度"),
-    "背水一战": ("攻击", "生命", "幸运"),
+    "稳扎稳打": ("均衡", "体质", "力量"),
+    "全力猛攻": ("感知",),
+    "防守反击": ("体质", "力量"),
+    "游走消耗": ("灵巧", "魔力"),
+    "先手压制": ("灵巧", "感知"),
+    "诱敌深入": ("体质", "魔力"),
+    "持久消耗": ("力量", "体质"),
+    "奇袭爆发": ("感知", "魔力"),
+    "以守为攻": ("体质", "感知"),
+    "速度拉扯": ("灵巧",),
+    "幸运赌局": ("魔力",),
+    "破防强攻": ("感知",),
+    "闪避拖延": ("灵巧", "魔力"),
+    "控制节奏": ("均衡", "灵巧"),
+    "血量压制": ("力量",),
+    "精准打击": ("感知", "灵巧"),
+    "扰乱节奏": ("魔力", "灵巧"),
+    "背水一战": ("感知", "力量", "魔力"),
 }
 
 # Each rule is:
@@ -184,94 +173,94 @@ BATTLE_STRATEGY_BUILD_TYPES = {
 # critical checks pass and enough supporting checks are satisfied.
 BATTLE_STRATEGY_ATTRIBUTE_RULES = {
     "稳扎稳打": (
-        ("defense", "atk", 1.0, 0.9, 0, 0.018, -0.018, False),
-        ("hp", "hp", 1.0, 0.9, 0, 0.018, -0.018, True),
-        ("atk", "defense", 1.0, 0.65, 0, 0.012, -0.012, False),
+        ("constitution", "perception", 1.0, 0.9, 0, 0.018, -0.018, False),
+        ("strength", "strength", 1.0, 0.9, 0, 0.018, -0.018, True),
+        ("perception", "constitution", 1.0, 0.65, 0, 0.012, -0.012, False),
     ),
     "全力猛攻": (
-        ("atk", "defense", 1.0, 1.0, 1, 0.026, -0.028, True),
-        ("speed", "speed", 1.0, 0.85, 0, 0.016, -0.018, False),
-        ("hp", "hp", 1.0, 0.8, 0, 0.014, -0.018, False),
+        ("perception", "constitution", 1.0, 1.0, 1, 0.026, -0.028, True),
+        ("dexterity", "dexterity", 1.0, 0.85, 0, 0.016, -0.018, False),
+        ("strength", "strength", 1.0, 0.8, 0, 0.014, -0.018, False),
     ),
     "防守反击": (
-        ("defense", "atk", 1.0, 0.9, 0, 0.026, -0.032, True),
-        ("hp", "atk", 1.0, 1.6, 0, 0.018, -0.02, False),
-        ("speed", "speed", 1.0, 0.75, 0, 0.012, -0.014, False),
+        ("constitution", "perception", 1.0, 0.9, 0, 0.026, -0.032, True),
+        ("strength", "perception", 1.0, 1.6, 0, 0.018, -0.02, False),
+        ("dexterity", "dexterity", 1.0, 0.75, 0, 0.012, -0.014, False),
     ),
     "游走消耗": (
-        ("speed", "speed", 1.0, 1.0, 1, 0.028, -0.038, True),
-        ("defense", "speed", 1.0, 0.75, 0, 0.014, -0.018, False),
-        ("luck", "luck", 1.0, 0.8, 0, 0.014, -0.014, False),
+        ("dexterity", "dexterity", 1.0, 1.0, 1, 0.028, -0.038, True),
+        ("constitution", "dexterity", 1.0, 0.75, 0, 0.014, -0.018, False),
+        ("magic", "magic", 1.0, 0.8, 0, 0.014, -0.014, False),
     ),
     "先手压制": (
-        ("speed", "speed", 1.0, 1.0, 1, 0.03, -0.04, True),
-        ("atk", "defense", 1.0, 0.9, 0, 0.022, -0.022, False),
-        ("luck", "hp", 1.0, 0.55, 0, 0.012, -0.012, False),
+        ("dexterity", "dexterity", 1.0, 1.0, 1, 0.03, -0.04, True),
+        ("perception", "constitution", 1.0, 0.9, 0, 0.022, -0.022, False),
+        ("magic", "strength", 1.0, 0.55, 0, 0.012, -0.012, False),
     ),
     "诱敌深入": (
-        ("defense", "atk", 1.0, 0.85, 0, 0.024, -0.03, True),
-        ("hp", "atk", 1.0, 1.7, 0, 0.02, -0.022, False),
-        ("luck", "luck", 1.0, 0.9, 0, 0.014, -0.014, False),
+        ("constitution", "perception", 1.0, 0.85, 0, 0.024, -0.03, True),
+        ("strength", "perception", 1.0, 1.7, 0, 0.02, -0.022, False),
+        ("magic", "magic", 1.0, 0.9, 0, 0.014, -0.014, False),
     ),
     "持久消耗": (
-        ("hp", "hp", 1.0, 1.0, 0, 0.028, -0.034, True),
-        ("defense", "atk", 1.0, 0.8, 0, 0.018, -0.02, False),
-        ("luck", "luck", 1.0, 0.75, 0, 0.012, -0.012, False),
+        ("strength", "strength", 1.0, 1.0, 0, 0.028, -0.034, True),
+        ("constitution", "perception", 1.0, 0.8, 0, 0.018, -0.02, False),
+        ("magic", "magic", 1.0, 0.75, 0, 0.012, -0.012, False),
     ),
     "奇袭爆发": (
-        ("speed", "speed", 1.0, 1.0, 1, 0.03, -0.045, True),
-        ("atk", "defense", 1.0, 0.85, 0, 0.024, -0.024, False),
-        ("luck", "luck", 1.0, 0.9, 0, 0.018, -0.018, False),
+        ("dexterity", "dexterity", 1.0, 1.0, 1, 0.03, -0.045, True),
+        ("perception", "constitution", 1.0, 0.85, 0, 0.024, -0.024, False),
+        ("magic", "magic", 1.0, 0.9, 0, 0.018, -0.018, False),
     ),
     "以守为攻": (
-        ("defense", "atk", 1.0, 0.9, 0, 0.026, -0.032, True),
-        ("atk", "defense", 1.0, 0.75, 0, 0.016, -0.018, False),
-        ("hp", "hp", 1.0, 0.8, 0, 0.014, -0.016, False),
+        ("constitution", "perception", 1.0, 0.9, 0, 0.026, -0.032, True),
+        ("perception", "constitution", 1.0, 0.75, 0, 0.016, -0.018, False),
+        ("strength", "strength", 1.0, 0.8, 0, 0.014, -0.016, False),
     ),
     "速度拉扯": (
-        ("speed", "speed", 1.0, 1.0, 1, 0.032, -0.045, True),
-        ("atk", "hp", 1.0, 0.6, 0, 0.016, -0.016, False),
-        ("defense", "hp", 1.0, 0.5, 0, 0.012, -0.014, False),
+        ("dexterity", "dexterity", 1.0, 1.0, 1, 0.032, -0.045, True),
+        ("perception", "strength", 1.0, 0.6, 0, 0.016, -0.016, False),
+        ("constitution", "strength", 1.0, 0.5, 0, 0.012, -0.014, False),
     ),
     "幸运赌局": (
-        ("luck", "luck", 1.0, 1.0, 1, 0.03, -0.038, True),
-        ("defense", "atk", 1.0, 0.7, 0, 0.014, -0.014, False),
-        ("atk", "defense", 1.0, 0.7, 0, 0.012, -0.014, False),
+        ("magic", "magic", 1.0, 1.0, 1, 0.03, -0.038, True),
+        ("constitution", "perception", 1.0, 0.7, 0, 0.014, -0.014, False),
+        ("perception", "constitution", 1.0, 0.7, 0, 0.012, -0.014, False),
     ),
     "破防强攻": (
-        ("atk", "defense", 1.0, 1.0, 2, 0.032, -0.04, True),
-        ("speed", "speed", 1.0, 0.75, 0, 0.014, -0.016, False),
-        ("hp", "hp", 1.0, 0.8, 0, 0.012, -0.014, False),
+        ("perception", "constitution", 1.0, 1.0, 2, 0.032, -0.04, True),
+        ("dexterity", "dexterity", 1.0, 0.75, 0, 0.014, -0.016, False),
+        ("strength", "strength", 1.0, 0.8, 0, 0.012, -0.014, False),
     ),
     "闪避拖延": (
-        ("speed", "speed", 1.0, 1.0, 1, 0.03, -0.042, False),
-        ("luck", "luck", 1.0, 0.9, 0, 0.018, -0.018, True),
-        ("hp", "hp", 1.0, 0.8, 0, 0.012, -0.014, False),
+        ("dexterity", "dexterity", 1.0, 1.0, 1, 0.03, -0.042, False),
+        ("magic", "magic", 1.0, 0.9, 0, 0.018, -0.018, True),
+        ("strength", "strength", 1.0, 0.8, 0, 0.012, -0.014, False),
     ),
     "控制节奏": (
-        ("speed", "speed", 1.0, 0.9, 0, 0.022, -0.026, False),
-        ("defense", "speed", 1.0, 0.8, 0, 0.016, -0.016, True),
-        ("hp", "luck", 1.0, 1.2, 0, 0.014, -0.014, False),
+        ("dexterity", "dexterity", 1.0, 0.9, 0, 0.022, -0.026, False),
+        ("constitution", "dexterity", 1.0, 0.8, 0, 0.016, -0.016, True),
+        ("strength", "magic", 1.0, 1.2, 0, 0.014, -0.014, False),
     ),
     "血量压制": (
-        ("hp", "hp", 1.0, 1.0, 0, 0.032, -0.04, True),
-        ("defense", "atk", 1.0, 0.75, 0, 0.016, -0.018, False),
-        ("atk", "defense", 1.0, 0.7, 0, 0.012, -0.014, False),
+        ("strength", "strength", 1.0, 1.0, 0, 0.032, -0.04, True),
+        ("constitution", "perception", 1.0, 0.75, 0, 0.016, -0.018, False),
+        ("perception", "constitution", 1.0, 0.7, 0, 0.012, -0.014, False),
     ),
     "精准打击": (
-        ("atk", "defense", 1.0, 0.9, 0, 0.026, -0.03, True),
-        ("speed", "speed", 1.0, 0.9, 0, 0.018, -0.02, False),
-        ("luck", "luck", 1.0, 0.9, 0, 0.016, -0.016, False),
+        ("perception", "constitution", 1.0, 0.9, 0, 0.026, -0.03, True),
+        ("dexterity", "dexterity", 1.0, 0.9, 0, 0.018, -0.02, False),
+        ("magic", "magic", 1.0, 0.9, 0, 0.016, -0.016, False),
     ),
     "扰乱节奏": (
-        ("luck", "luck", 1.0, 0.95, 0, 0.024, -0.03, True),
-        ("speed", "speed", 1.0, 0.85, 0, 0.018, -0.02, False),
-        ("defense", "hp", 1.0, 0.5, 0, 0.012, -0.014, False),
+        ("magic", "magic", 1.0, 0.95, 0, 0.024, -0.03, True),
+        ("dexterity", "dexterity", 1.0, 0.85, 0, 0.018, -0.02, False),
+        ("constitution", "strength", 1.0, 0.5, 0, 0.012, -0.014, False),
     ),
     "背水一战": (
-        ("atk", "defense", 1.0, 0.9, 0, 0.026, -0.032, True),
-        ("luck", "luck", 1.0, 0.9, 0, 0.018, -0.018, False),
-        ("hp", "hp", 1.0, 0.7, 0, 0.012, -0.02, False),
+        ("perception", "constitution", 1.0, 0.9, 0, 0.026, -0.032, True),
+        ("magic", "magic", 1.0, 0.9, 0, 0.018, -0.018, False),
+        ("strength", "strength", 1.0, 0.7, 0, 0.012, -0.02, False),
     ),
 }
 

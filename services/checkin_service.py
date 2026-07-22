@@ -5,11 +5,13 @@ from datetime import date, datetime, timedelta
 try:
     from ..models.user import CheckinResult, UserIdentity
     from . import config
+    from .attribute_service import AttributeService
     from .db import connect_db
     from .user_service import UserService, utc_now_text
 except ImportError:
     from models.user import CheckinResult, UserIdentity
     from services import config
+    from services.attribute_service import AttributeService
     from services.db import connect_db
     from services.user_service import UserService, utc_now_text
 
@@ -22,9 +24,12 @@ def current_checkin_date(now: datetime | None = None) -> date:
 
 
 class CheckinService:
-    def __init__(self, db_path: str, user_service: UserService):
+    def __init__(
+        self, db_path: str, user_service: UserService, attribute_service=None
+    ):
         self.db_path = db_path
         self.user_service = user_service
+        self.attribute_service = attribute_service or AttributeService(db_path)
 
     async def checkin(self, identity: UserIdentity) -> CheckinResult:
         today = current_checkin_date()
@@ -64,12 +69,18 @@ class CheckinService:
                 """,
                 (user.id, today_text, streak_days, exp_gain, utc_now_text()),
             )
+            potential_restore = (
+                await self.attribute_service.restore_checkin_potential_in_db(
+                    db, user.id
+                )
+            )
             await db.commit()
             return CheckinResult(
                 user=exp_result.user,
                 exp_gain=exp_gain,
                 streak_days=streak_days,
                 level_ups=exp_result.level_ups,
+                attribute_potential_restore=potential_restore,
             )
 
     async def _calculate_streak_in_db(self, db, user_pk: int, today: date) -> int:

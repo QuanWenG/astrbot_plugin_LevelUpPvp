@@ -26,7 +26,7 @@ class CustomStrategyAIProfileTests(unittest.IsolatedAsyncioTestCase):
         )
         ai_profile = profile_for_strategy("疾风架势", profile_data)
 
-        self.assertEqual(profile_data["primary_stats"], ("speed", "defense", "luck"))
+        self.assertEqual(profile_data["primary_stats"], ("dexterity", "constitution", "magic"))
         self.assertEqual(profile_data["counters"], ("全力猛攻",))
         self.assertEqual(ai_profile.preferred_range, 125)
         self.assertGreater(ai_profile.guard_tendency, 0.2)
@@ -36,8 +36,8 @@ class CustomStrategyAIProfileTests(unittest.IsolatedAsyncioTestCase):
         profile_data = service._fallback_custom_strategy_profile("高速防守反击")
         ai_profile = profile_for_strategy("高速防守反击", profile_data)
 
-        self.assertIn("speed", profile_data["primary_stats"])
-        self.assertIn("defense", profile_data["primary_stats"])
+        self.assertIn("dexterity", profile_data["primary_stats"])
+        self.assertIn("constitution", profile_data["primary_stats"])
         self.assertEqual(ai_profile.preferred_range, 125)
         self.assertGreater(ai_profile.guard_tendency, 0.2)
 

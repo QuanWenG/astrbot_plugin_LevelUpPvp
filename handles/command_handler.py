@@ -12,10 +12,32 @@ from astrbot.core.utils.io import save_temp_img
 from astrbot.core.utils.t2i.local_strategy import FontManager
 
 try:
+    from ..models.equipment import SLOT_LABELS
     from ..models.user import LevelDownEvent, LevelUpEvent, User, UserIdentity
+    from ..services.attribute_service import (
+        ATTRIBUTE_LABELS, DAMAGE_TYPE_LABELS, attribute_exp_required, skill_level_cap,
+    )
+    from ..services.equipment_catalog import QUALITY_LABELS
+    from ..services.material_catalog import actual_weight, material_for
+    from ..services.skill_catalog import SKILL_DEFINITIONS
+    from ..services.ability_catalog import (
+        ACTIVE_ABILITY_DEFINITIONS, SPELL_DEFINITIONS, TECHNIQUE_DEFINITIONS,
+        ability_is_unlocked, spell_exp_required,
+    )
     from ..services import config
 except ImportError:
+    from models.equipment import SLOT_LABELS
     from models.user import LevelDownEvent, LevelUpEvent, User, UserIdentity
+    from services.attribute_service import (
+        ATTRIBUTE_LABELS, DAMAGE_TYPE_LABELS, attribute_exp_required, skill_level_cap,
+    )
+    from services.equipment_catalog import QUALITY_LABELS
+    from services.material_catalog import actual_weight, material_for
+    from services.skill_catalog import SKILL_DEFINITIONS
+    from services.ability_catalog import (
+        ACTIVE_ABILITY_DEFINITIONS, SPELL_DEFINITIONS, TECHNIQUE_DEFINITIONS,
+        ability_is_unlocked, spell_exp_required,
+    )
     from services import config
 
 
@@ -24,7 +46,7 @@ CHALLENGE_WAKE_WORDS = [
     "艾斯比",
     "啥比"
 ]
-MENTION_COMMAND_NAMES = ("修改登记", "签到", "面板", "加点", "排行", "登记", "挑战")
+MENTION_COMMAND_NAMES = ("魔法书", "阅读", "法术", "战技", "修改登记", "装备详情", "训练技能", "技能栏", "签到", "面板", "加点", "排行", "登记", "挑战", "背包", "装备", "穿戴", "卸下", "技能", "学习")
 MENTION_COMMAND_PATTERN = re.compile(
     rf"^/?({'|'.join(MENTION_COMMAND_NAMES)})(?:\s|$)"
 )
@@ -45,6 +67,11 @@ class LevelUpPvpCommandHandler:
         stat_service,
         battle_service,
         challenge_queue=None,
+        equipment_service=None,
+        skill_service=None,
+        build_service=None,
+        attribute_service=None,
+        spell_service=None,
     ):
         self.context = context
         self.user_service = user_service
@@ -52,6 +79,11 @@ class LevelUpPvpCommandHandler:
         self.stat_service = stat_service
         self.battle_service = battle_service
         self.challenge_queue = challenge_queue
+        self.equipment_service = equipment_service
+        self.skill_service = skill_service
+        self.build_service = build_service
+        self.attribute_service = attribute_service
+        self.spell_service = spell_service
 
     async def sign(self, event: AstrMessageEvent) -> AsyncGenerator:
         try:
@@ -107,7 +139,23 @@ class LevelUpPvpCommandHandler:
                 event
             )
             user = await self.user_service.get_or_create_user(identity)
-            yield event.plain_result(self._format_profile(user))
+            build = None
+            derived = None
+            progress = None
+            if self.equipment_service and self.skill_service and self.build_service:
+                slots, items = await self.equipment_service.get_loadout(user.id)
+                skills, _ = await self.skill_service.get_skills(user)
+                build = self.build_service.resolve_equipment(
+                    user, slots, items, skills
+                )
+                derived = self.build_service.resolve_derived(
+                    user, build, skills
+                )
+                if self.attribute_service and self.attribute_service.db_path:
+                    progress = await self.attribute_service.get_progress(user.id)
+            yield event.plain_result(
+                self._format_profile(user, build, derived, progress)
+            )
         except Exception as exc:
             logger.exception("LevelUpPvp profile failed")
             yield event.plain_result(f"查看面板失败：{exc}")
@@ -123,7 +171,7 @@ class LevelUpPvpCommandHandler:
             yield event.plain_result(registration_error)
             return
         if not stat_name:
-            yield event.plain_result("用法：/加点 攻击 2")
+            yield event.plain_result("用法：/加点 力量 2")
             return
         try:
             result = await self.stat_service.allocate(
@@ -147,6 +195,291 @@ class LevelUpPvpCommandHandler:
         except Exception as exc:
             yield event.plain_result(str(exc))
 
+    async def inventory(self, event, page: int = 1):
+        try:
+            user = await self._own_user(event)
+            items = await self.equipment_service.list_items(user.id)
+            _, equipped = await self.equipment_service.get_loadout(user.id)
+            equipped_ids = {item.id for item in equipped}
+            page = max(1, int(page or 1)); size = 10; start = (page - 1) * size
+            lines = [f"{self._display_name(user)} 的背包 第{page}页"]
+            for item in items[start:start + size]:
+                mark = "[已装备]" if item.id in equipped_ids else ""
+                material = material_for(item.material)
+                resolved_weight = actual_weight(item.weight, item.material)
+                lines.append(
+                    f"#{item.id} {QUALITY_LABELS.get(item.quality, item.quality)} {item.name} "
+                    f"Lv.{item.item_level} {material.name} "
+                    f"重量{item.weight:g}×{material.weight_multiplier:g}={resolved_weight:.3f}{mark}"
+                )
+            if len(lines) == 1: lines.append("这一页没有装备。")
+            yield event.plain_result("\n".join(lines))
+        except Exception as exc: yield event.plain_result(f"查看背包失败：{exc}")
+
+    async def equipment(self, event):
+        try:
+            registration_error = await self._registration_error(event)
+            if registration_error:
+                yield event.plain_result(registration_error)
+                return
+            identity = self._target_identity_from_event(event) or self._identity_from_event(event)
+            user = await self.user_service.get_or_create_user(identity)
+            slots, items = await self.equipment_service.get_loadout(user.id)
+            build = await self._combat_build(user, slots, items)
+            by_id = {item.id: item for item in items}
+            lines = [f"{self._display_name(user)} 的装备"]
+            for slot, label in SLOT_LABELS.items():
+                item = by_id.get(slots.get(slot)); lines.append(f"{label}：{item.name if item else '空'}")
+            lines.append(f"战斗方式：{self._weapon_mode_label(build.weapon_mode)}")
+            lines.append(f"护甲路线：{self._armor_style_label(build.armor_style)} 重量{build.total_weight:.2f}/{build.carry_capacity:.1f}{'（超负重）' if build.overloaded else ''}")
+            lines.append(f"命中修正：物理 {build.physical_accuracy_multiplier:.0%} / 法术 {build.spell_accuracy_multiplier:.0%}")
+            lines.append(self._format_advanced_stats(user, build))
+            yield event.plain_result("\n".join(lines))
+        except Exception as exc: yield event.plain_result(f"查看装备失败：{exc}")
+
+    async def equipment_detail(self, event, equipment_id: int):
+        try:
+            user = await self._own_user(event); item = await self.equipment_service.item_detail(user.id, int(equipment_id))
+            material = material_for(item.material)
+            resolved_weight = actual_weight(item.weight, item.material)
+            lines = [f"#{item.id} {item.name}", f"品质：{QUALITY_LABELS.get(item.quality, item.quality)} / {item.star_type}", f"等级：{item.item_level} 材质：{material.name} 状态：{item.blessing_state}", f"重量：基础{item.weight:g} × {material.weight_multiplier:g} = {resolved_weight:.3f} 强化：+{item.enhancement_level}", f"附魔容量：{item.used_capacity}/{item.enchant_capacity}", f"基础：{item.base_stats or '无'}", f"固有词条：{self._format_affixes(item.inherent_affixes)}", f"随机词条：{self._format_affixes(item.random_affixes)}", f"融合词条：{self._format_affixes(item.fusion_affixes)}"]
+            yield event.plain_result("\n".join(lines))
+        except Exception as exc: yield event.plain_result(f"查看装备详情失败：{exc}")
+
+    async def equip_item(self, event, equipment_id: int, slot: str = ""):
+        try:
+            user = await self._own_user(event); normalized = self._slot_id(slot) if slot else ""
+            item, slots = await self.equipment_service.equip(user.id, int(equipment_id), normalized)
+            yield event.plain_result(f"已穿戴 {item.name}：{'、'.join(SLOT_LABELS[s] for s in slots)}")
+        except Exception as exc: yield event.plain_result(f"穿戴失败：{exc}")
+
+    async def unequip_item(self, event, slot: str):
+        try:
+            user = await self._own_user(event); normalized = self._slot_id(slot) if slot else ""
+            await self.equipment_service.unequip(user.id, normalized)
+            yield event.plain_result(f"已卸下{SLOT_LABELS[normalized]}装备。")
+        except Exception as exc: yield event.plain_result(f"卸下失败：{exc}")
+
+    async def skills(self, event):
+        try:
+            registration_error = await self._registration_error(event)
+            if registration_error:
+                yield event.plain_result(registration_error)
+                return
+            identity = self._target_identity_from_event(event) or self._identity_from_event(event)
+            user = await self.user_service.get_or_create_user(identity)
+            skills, slots = await self.skill_service.get_skills(user)
+            attributes = self.attribute_service.attributes_for_user(user)
+            lines = [f"{self._display_name(user)} 的技能（技能点 {user.skill_points}）"]
+            learned = sorted(
+                skills.values(),
+                key=lambda value: (
+                    not SKILL_DEFINITIONS[value.skill_id].passive,
+                    SKILL_DEFINITIONS[value.skill_id].name,
+                ),
+            )
+            passive_lines = []
+            active_lines = []
+            for skill in learned:
+                definition = SKILL_DEFINITIONS[skill.skill_id]
+                level_cap = skill_level_cap(
+                    attributes, definition.governing_attributes
+                )
+                line = (
+                    f"{definition.name} Lv.{skill.level}/{level_cap} "
+                    f"EXP {skill.exp}/{50 + skill.level * 15} "
+                    f"潜力{skill.potential}%"
+                )
+                (passive_lines if definition.passive else active_lines).append(line)
+            if passive_lines:
+                lines.append("【被动天赋】")
+                lines.extend(passive_lines)
+            if active_lines:
+                lines.append("【主动技能】")
+                lines.extend(active_lines)
+
+            available = []
+            locked = []
+            active_available = []
+            for skill_id, definition in SKILL_DEFINITIONS.items():
+                if skill_id in skills:
+                    continue
+                missing = self.skill_service.missing_prerequisites(
+                    definition, skills
+                )
+                if missing:
+                    progress = "、".join(
+                        f"{SKILL_DEFINITIONS[required_id].name} "
+                        f"{skills.get(required_id).level if required_id in skills else 0}/{required_level}"
+                        for required_id, required_level in missing
+                    )
+                    locked.append(f"{definition.name}（{progress}）")
+                elif definition.passive:
+                    available.append(definition.name)
+                else:
+                    active_available.append(definition.name)
+            if available:
+                lines.append("可学习天赋：" + "、".join(available))
+            if active_available:
+                lines.append("可学习主动技能：" + "、".join(active_available))
+            if locked:
+                lines.append("未解锁进阶：" + "；".join(locked))
+            lines.append(
+                "技能栏：" + " / ".join(
+                    f"{i + 1}.{ACTIVE_ABILITY_DEFINITIONS[s].name if s in ACTIVE_ABILITY_DEFINITIONS else '空'}"
+                    for i, s in enumerate(slots)
+                )
+            )
+            yield event.plain_result("\n".join(lines))
+        except Exception as exc:
+            yield event.plain_result(f"查看技能失败：{exc}")
+    async def spellbooks(self, event, page: int = 1):
+        try:
+            user = await self._own_user(event)
+            books = await self.spell_service.list_books(user.id)
+            page = max(1, int(page)); page_size = 10
+            visible = books[(page - 1) * page_size:page * page_size]
+            lines = [f"{self._display_name(user)} 的魔法书（第{page}页）"]
+            if not visible:
+                lines.append("暂无魔法书。当前版本只提供内部原子发放接口。")
+            for book in visible:
+                definition = SPELL_DEFINITIONS[book.spell_id]
+                attribute = ATTRIBUTE_LABELS.get(definition.reading_attribute, definition.reading_attribute)
+                lines.append(
+                    f"#{book.id} {definition.name} ×{book.quantity}"
+                    f"（难度{definition.reading_difficulty}，主属性：{attribute}）"
+                )
+            yield event.plain_result("\n".join(lines))
+        except Exception as exc:
+            yield event.plain_result(f"查看魔法书失败：{exc}")
+
+    async def read_spellbook(self, event, book_id: int):
+        try:
+            user = await self._own_user(event)
+            result = await self.spell_service.read_book(user, int(book_id))
+            outcome = "阅读成功" if result.success else "阅读失败"
+            detail = ""
+            if result.spell:
+                definition = SPELL_DEFINITIONS[result.spell.spell_id]
+                detail = f"，{definition.name} Lv.{result.spell.level} 潜力{result.spell.potential}%"
+            attribute = ATTRIBUTE_LABELS.get(result.reading_attribute, result.reading_attribute)
+            yield event.plain_result(
+                f"{outcome}（阅读能力{result.reading_power:.0f}，"
+                f"难度{result.reading_difficulty}，主属性：{attribute}，"
+                f"成功率{result.chance:.1%}，已消耗1本）{detail}"
+            )
+        except Exception as exc:
+            yield event.plain_result(f"阅读失败：{exc}")
+
+    async def spells(self, event):
+        try:
+            registration_error = await self._registration_error(event)
+            if registration_error:
+                yield event.plain_result(registration_error); return
+            identity = self._target_identity_from_event(event) or self._identity_from_event(event)
+            user = await self.user_service.get_or_create_user(identity)
+            spells = await self.spell_service.get_spells(user.id)
+            lines = [f"{self._display_name(user)} 的法术"]
+            if not spells:
+                lines.append("尚未通过魔法书学会法术。")
+            for spell in sorted(spells.values(), key=lambda value: SPELL_DEFINITIONS[value.spell_id].name):
+                definition = SPELL_DEFINITIONS[spell.spell_id]
+                lines.append(f"{definition.name} Lv.{spell.level} EXP {spell.exp}/{spell_exp_required(spell.level)} 潜力{spell.potential}%")
+            yield event.plain_result("\n".join(lines))
+        except Exception as exc:
+            yield event.plain_result(f"查看法术失败：{exc}")
+
+    async def techniques(self, event):
+        try:
+            registration_error = await self._registration_error(event)
+            if registration_error:
+                yield event.plain_result(registration_error); return
+            identity = self._target_identity_from_event(event) or self._identity_from_event(event)
+            user = await self.user_service.get_or_create_user(identity)
+            skills, _ = await self.skill_service.get_skills(user)
+            unlocked, locked = [], []
+            for definition in TECHNIQUE_DEFINITIONS.values():
+                skill = skills.get(definition.unlock_skill_id)
+                level = skill.level if skill else 0
+                text = f"{definition.name}（{SKILL_DEFINITIONS[definition.unlock_skill_id].name} {level}/{definition.unlock_level}）"
+                (unlocked if ability_is_unlocked(definition, skills, {}) else locked).append(text)
+            lines = [f"{self._display_name(user)} 的战技", "【已解锁】" + ("、".join(unlocked) if unlocked else "无")]
+            if locked: lines.append("【未解锁】" + "、".join(locked))
+            yield event.plain_result("\n".join(lines))
+        except Exception as exc:
+            yield event.plain_result(f"查看战技失败：{exc}")
+    async def learn_skill(self, event, name: str):
+        try:
+            user = await self._own_user(event); skill = await self.skill_service.learn(user, name)
+            yield event.plain_result(f"已学习技能：{SKILL_DEFINITIONS[skill.skill_id].name} Lv.1")
+        except Exception as exc: yield event.plain_result(f"学习失败：{exc}")
+
+    async def train_skill(self, event, name: str, points: int):
+        try:
+            user = await self._own_user(event); skill = await self.skill_service.train_potential(user, name, int(points))
+            yield event.plain_result(f"训练完成：{SKILL_DEFINITIONS[skill.skill_id].name} 潜力提升至{skill.potential}%")
+        except Exception as exc: yield event.plain_result(f"训练失败：{exc}")
+
+    async def set_skill_slot(self, event, slot: int, name: str):
+        try:
+            user = await self._own_user(event); await self.skill_service.set_active_slot(user, int(slot), name)
+            yield event.plain_result(f"技能栏{slot}已{'清空' if name == '清空' else '设置为' + name}。")
+        except Exception as exc: yield event.plain_result(f"技能栏设置失败：{exc}")
+
+    async def _own_user(self, event):
+        error = await self._registration_error(event)
+        if error: raise ValueError(error)
+        return await self.user_service.get_or_create_user(self._identity_from_event(event))
+
+    async def _combat_build(self, user, slots=None, items=None):
+        if not self.equipment_service or not self.skill_service or not self.build_service:
+            return None
+        if slots is None: slots, items = await self.equipment_service.get_loadout(user.id)
+        skills, _ = await self.skill_service.get_skills(user)
+        return self.build_service.resolve_equipment(user, slots, items, skills)
+
+    def _slot_id(self, value: str) -> str:
+        aliases = {label: slot for slot, label in SLOT_LABELS.items()}; aliases.update({"手": "main_hand", "主手": "main_hand", "副手": "off_hand", "左指": "left_finger", "右指": "right_finger"})
+        result = aliases.get((value or "").strip(), (value or "").strip())
+        if result not in SLOT_LABELS: raise ValueError("未知装备槽")
+        return result
+
+    def _format_affixes(self, affixes) -> str:
+        if not affixes:
+            return "无"
+        labels = {
+            "skill_level": "技能等级", "block_rate": "格挡",
+            "knockback_resistance": "击退抗性", "melee_followup": "追打",
+            "ranged_followup": "追射", "element_resistance": "元素耐性",
+            "status_immunity": "异常免疫", "spell_power": "法术增益",
+            "accuracy": "命中", "evasion": "回避",
+            "critical_rate": "暴击率", "critical_damage": "暴击伤害",
+            "physical_reduction": "物理减伤",
+            "magical_reduction": "魔法减伤", "action_speed": "行动速度",
+        }
+        rendered = []
+        for item in affixes:
+            kind = str(item.get("type", ""))
+            if kind == "stat_flat":
+                label = ATTRIBUTE_LABELS.get(
+                    str(item.get("stat", "")), "主属性"
+                )
+            elif kind.startswith("resistance_"):
+                label = DAMAGE_TYPE_LABELS.get(
+                    kind.removeprefix("resistance_"), kind
+                ) + "耐性"
+            elif kind.startswith("damage_"):
+                label = DAMAGE_TYPE_LABELS.get(
+                    kind.removeprefix("damage_"), kind
+                ) + "伤害"
+            else:
+                label = labels.get(kind, kind)
+            rendered.append(f"{label}+{item.get('value', 0)}")
+        return "、".join(rendered)
+    def _armor_style_label(self, style: str) -> str:
+        return {"light": "轻甲", "medium": "中甲", "heavy": "重甲"}.get(style, style)
+    def _weapon_mode_label(self, mode: str) -> str:
+        return {"unarmed": "空手", "one_hand": "单持", "sword_shield": "剑盾", "dual_wield": "双持", "two_hand_melee": "双手武器", "two_hand_heavy": "重武器", "two_hand_ranged": "远程武器"}.get(mode, mode)
     async def ranking(self, event: AstrMessageEvent) -> AsyncGenerator:
         registration_error = await self._registration_error(event)
         if registration_error:
@@ -487,13 +820,51 @@ class LevelUpPvpCommandHandler:
         text = MODIFY_REGISTER_COMMAND_PATTERN.sub("", text).strip()
         return " ".join(text.split())
 
-    def _format_profile(self, user: User) -> str:
+    def _format_profile(
+        self, user: User, build=None, derived=None, progress=None
+    ) -> str:
         lines = [
             f"{self._display_name(user)} 的面板",
             self._format_level_progress(user),
-            f"自定义属性点：{user.stat_points}",
+            f"自定义属性点：{user.stat_points} / 技能点：{user.skill_points}",
             self._format_stats(user),
+            self._format_advanced_stats(user, build),
         ]
+        if build:
+            lines.append(
+                f"构筑：{self._weapon_mode_label(build.weapon_mode)} / "
+                f"{self._armor_style_label(build.armor_style)} / "
+                f"重量 {build.total_weight:.2f}/{build.carry_capacity:.1f}"
+                f"{'（超负重）' if build.overloaded else ''}"
+            )
+            lines.append(
+                f"命中修正：物理 {build.physical_accuracy_multiplier:.0%} / "
+                f"法术 {build.spell_accuracy_multiplier:.0%}"
+            )
+        if derived:
+            lines.append(
+                f"资源：HP {derived.max_hp} / MP {derived.max_mp} / SP {derived.max_sp}"
+            )
+            lines.append(
+                f"战斗：攻击 {derived.attack_power:.1f} / 命中 {derived.accuracy:.1f} / "
+                f"防御 {derived.defense:.1f} / 回避 {derived.evasion:.1f} / "
+                f"暴击 {derived.critical_rate:.1%}×{derived.critical_damage:.2f} / "
+                f"速度 {derived.action_speed:.0f}"
+            )
+        if progress:
+            lines.append(
+                "属性潜力：" + " / ".join(
+                    f"{ATTRIBUTE_LABELS[key]} {progress[key].potential}%"
+                    for key in ATTRIBUTE_LABELS
+                )
+            )
+            lines.append(
+                "属性经验：" + " / ".join(
+                    f"{ATTRIBUTE_LABELS[key]} {progress[key].exp}/"
+                    f"{attribute_exp_required(user.stats()[key])}"
+                    for key in ATTRIBUTE_LABELS
+                )
+            )
         freeze_summary = self._format_freeze_summary(user)
         if freeze_summary:
             lines.append(freeze_summary)
@@ -507,6 +878,10 @@ class LevelUpPvpCommandHandler:
             f"连续签到：{result.streak_days} 天",
             self._format_level_progress(result.user),
         ]
+        if result.attribute_potential_restore:
+            lines.append(
+                f"六项属性潜力合计恢复：+{result.attribute_potential_restore}%"
+            )
         if result.level_ups:
             lines.append(self._format_level_ups(result.level_ups))
         return "\n".join(lines)
@@ -527,10 +902,22 @@ class LevelUpPvpCommandHandler:
 
     def _format_stats(self, user: User) -> str:
         return (
-            f"属性：生命 {user.hp} / 攻击 {user.atk} / 防御 {user.defense} / "
-            f"速度 {user.speed} / 幸运 {user.luck}"
+            f"主属性：力量 {user.strength} / 体质 {user.constitution} / "
+            f"灵巧 {user.dexterity} / 感知 {user.perception} / "
+            f"魔力 {user.magic} / 意志 {user.willpower}"
         )
 
+    def _format_advanced_stats(self, user: User, build=None) -> str:
+        modifiers = build.advanced_stat_modifiers if build else {}
+        def value(base, key):
+            bonus = modifiers.get(key, 0.0)
+            return f"{base + bonus:g}" + (f"（基础{base:g}+{bonus:g}）" if bonus else "")
+        return (
+            f"高级属性：生命成长 {value(user.life_growth, 'life_growth')} / "
+            f"魔法成长 {value(user.mana_growth, 'mana_growth')} / "
+            f"速度 {value(user.advanced_speed, 'speed')} / "
+            f"幸运 {value(user.advanced_luck, 'luck')}"
+        )
     def _format_ranking_line(self, rank: int, user: User) -> str:
         required = config.exp_required_for_next_level(user.level)
         return f"{rank} {self._display_name(user)} Lv.{user.level} {user.exp}/{required}"
@@ -543,6 +930,8 @@ class LevelUpPvpCommandHandler:
             parts = [growth]
             if item.stat_points_gain:
                 parts.append(f"自定义属性点 +{item.stat_points_gain}")
+            if item.skill_points_gain:
+                parts.append(f"技能点 +{item.skill_points_gain}")
             lines.append(
                 f"{label} Lv.{item.from_level} -> Lv.{item.to_level}："
                 + "，".join(parts)
@@ -558,6 +947,8 @@ class LevelUpPvpCommandHandler:
                 parts.append(frozen_stats)
             if item.frozen_stat_points:
                 parts.append(f"自定义属性点 -{item.frozen_stat_points}")
+            if item.frozen_skill_points:
+                parts.append(f"技能点 -{item.frozen_skill_points}")
             detail = "，".join(parts) or "无属性冻结"
             lines.append(f"Lv.{item.from_level} -> Lv.{item.to_level}：{detail}")
         return "\n".join(lines)
@@ -569,6 +960,8 @@ class LevelUpPvpCommandHandler:
             parts.append(frozen_stats)
         if user.frozen_stat_points:
             parts.append(f"自定义属性点 -{user.frozen_stat_points}")
+        if user.frozen_skill_points:
+            parts.append(f"技能点 -{user.frozen_skill_points}")
         if not parts:
             return ""
         levels = "、".join(f"Lv.{level}" for level in user.frozen_levels) or "等级"
@@ -611,6 +1004,31 @@ class LevelUpPvpCommandHandler:
             lines.append(self._format_level_ups(result.level_ups))
         if result.level_downs:
             lines.append(self._format_level_downs(result.level_downs))
+        if result.skill_growths:
+            growth = " / ".join(
+                f"{attacker_name if item.user_pk == result.attacker.id else defender_name}·{item.skill_name}+{item.exp_gain}EXP"
+                + (f"→Lv.{item.to_level}" if item.to_level > item.from_level else "")
+                for item in result.skill_growths[:10]
+            )
+            lines.append("技能成长：" + growth)
+        if result.spell_growths:
+            lines.append("法术成长：")
+            lines.extend(
+                f"- {item.spell_name} +{item.exp_gain} EXP"
+                + (f"，Lv.{item.from_level}→{item.to_level}" if item.to_level > item.from_level else "")
+                for item in result.spell_growths[:10]
+            )
+        if result.attribute_growths:
+            growth = " / ".join(
+                f"{attacker_name if item.user_pk == result.attacker.id else defender_name}·"
+                f"{ATTRIBUTE_LABELS[item.attribute_id]}+{item.exp_gain}EXP"
+                + (
+                    f"→{item.to_value}"
+                    if item.to_value > item.from_value else ""
+                )
+                for item in result.attribute_growths[:8]
+            )
+            lines.append("属性成长：" + growth)
         lines.append("结果：" + ("攻击方获胜" if winner_is_attacker else "防守方获胜"))
         return "\n".join(lines)
 
