@@ -3,6 +3,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+try:
+    from .balance_rules import spell_power_multiplier
+except ImportError:
+    from services.balance_rules import spell_power_multiplier
+
 
 @dataclass(frozen=True)
 class SpellRule:
@@ -151,13 +156,40 @@ def spell_level_for(definition, fighter) -> int:
 
 
 def spell_power_for(definition, fighter, spell_level: int) -> float:
+    return spell_base_power(definition, fighter, spell_level) * (
+        spell_multiplier_for(definition, fighter)
+    )
+
+
+def _fighter_attributes(fighter) -> dict[str, float]:
+    return {
+        attribute_id: fighter.primary(attribute_id)
+        for attribute_id in (
+            "strength", "constitution", "dexterity",
+            "perception", "magic", "willpower",
+        )
+    }
+
+
+def spell_base_power(definition, fighter, spell_level: int) -> float:
+    equipment_power = 0.0
+    if fighter.snapshot.equipment:
+        equipment_power = float(
+            fighter.snapshot.equipment.combat_effects.get("spell_power", 0.0)
+        )
+    return 8 + spell_level * 1.5 + equipment_power
+
+
+def healing_base_power(spell_level: int) -> float:
+    return 10 + spell_level * 2
+
+
+def spell_multiplier_for(definition, fighter) -> float:
     school_level = fighter.skill_level(definition.unlock_skill_id)
-    return (
-        8
-        + spell_level * 1.5
-        + fighter.primary("magic") * 0.8
-        + fighter.primary("perception") * 0.5
-        + school_level * 0.4
+    return spell_power_multiplier(
+        school_id=definition.unlock_skill_id,
+        school_level=school_level,
+        attributes=_fighter_attributes(fighter),
     )
 
 

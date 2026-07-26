@@ -11,7 +11,11 @@ try:
         FighterState,
         SimulationResult,
     )
-    from .attribute_service import elemental_multiplier
+    from .balance_rules import (
+        hit_chance,
+        physical_damage_amount,
+        resistance_multiplier,
+    )
     from .ability_runtime import AbilityRuntime
     from .combat_ai import choose_action
 except ImportError:
@@ -24,13 +28,17 @@ except ImportError:
         FighterState,
         SimulationResult,
     )
-    from services.attribute_service import elemental_multiplier
+    from services.balance_rules import (
+        hit_chance,
+        physical_damage_amount,
+        resistance_multiplier,
+    )
     from services.ability_runtime import AbilityRuntime
     from services.combat_ai import choose_action
 
 
 class SideviewCombatEngine:
-    ENGINE_VERSION = "sideview-v9"
+    ENGINE_VERSION = "sideview-v10"
     FIELD_MIN = 0
     FIELD_MAX = 1000
     ATTACKER_START = 200
@@ -615,23 +623,34 @@ class SideviewCombatEngine:
 
         if actor.current_derived and target.current_derived:
             target_defense = target.current_derived.defense * max(0.1, 1 + self.ability_runtime.modifier(target, "defense"))
-            base = max(1.0, actor.current_derived.attack_power * 1.8 - target_defense * 0.75)
+            attack_power = actor.current_derived.attack_power
+            offense_multiplier = actor.current_derived.physical_damage_multiplier
         else:
-            base = max(1.0, actor.snapshot.stat("atk") * 4.0 - target.snapshot.stat("defense") * 0.8)
-        multiplier = actor.snapshot.equipment.damage_multiplier if actor.snapshot.equipment else 1.0
-        physical_multiplier = multiplier * (actor.current_derived.physical_damage_multiplier if actor.current_derived else 1.0)
-        physical_multiplier *= 1 + self.ability_runtime.modifier(actor, "physical_damage") - self.ability_runtime.modifier(actor, "damage_penalty")
+            target_defense = target.snapshot.stat("defense")
+            attack_power = actor.snapshot.stat("atk") * 4.0
+            offense_multiplier = 1.0
+        effect_multiplier = 1 + self.ability_runtime.modifier(actor, "physical_damage") - self.ability_runtime.modifier(actor, "damage_penalty")
         variance = rng.uniform(0.90, 1.10)
         physical_reduction = (target.current_derived.physical_reduction if target.current_derived else 0.0) + self.ability_runtime.modifier(target, "physical_reduction")
-        breakdown = {"physical": max(1, round(base * physical_multiplier * variance * max(0.05, 1 - physical_reduction)))}
+        breakdown = {
+            "physical": physical_damage_amount(
+                attack_power=attack_power,
+                offense_multiplier=offense_multiplier,
+                effect_multiplier=effect_multiplier,
+                variance=variance,
+                defense=target_defense,
+                attacker_level=actor.snapshot.level,
+                physical_reduction=physical_reduction,
+            )
+        }
         if actor.current_derived and target.current_derived:
             for damage_type, bonus in actor.current_derived.elemental_damage.items():
                 if bonus <= 0:
                     continue
                 resistance = target.current_derived.resistances.get(damage_type, 0.0)
                 elemental = round(
-                    bonus * multiplier * variance
-                    * elemental_multiplier(resistance)
+                    bonus * variance
+                    * resistance_multiplier(resistance, actor.snapshot.level)
                     * (1 - target.current_derived.magical_reduction)
                 )
                 if elemental > 0:
@@ -767,8 +786,9 @@ class SideviewCombatEngine:
                 * max(0.1, 1 + self.ability_runtime.modifier(actor, "accuracy"))
             )
             evasion = target.current_derived.evasion * max(0.1, 1 + self.ability_runtime.modifier(target, "evasion"))
-            hit_chance = accuracy / max(1.0, accuracy + evasion + 15)
-            evade = 1.0 - max(0.75, min(0.98, hit_chance))
+            evade = 1.0 - hit_chance(
+                accuracy, evasion, is_spell=is_spell
+            )
             if self.ability_runtime.has(target, "martial_awakening"):
                 level = target.skill_level("unarmed")
                 if level >= 80: evade = max(evade, 0.10)

@@ -6,14 +6,32 @@ from dataclasses import replace
 try:
     from ..models.ability import BattleEntity, BattleZone, CombatStatus
     from ..models.combat import BattleEvent
-    from .attribute_service import elemental_multiplier
-    from .spell_rules import calculate_mana_cost
+    from .balance_rules import (
+        physical_damage_amount,
+        resistance_multiplier,
+        spell_damage_amount,
+    )
+    from .spell_rules import (
+        calculate_mana_cost,
+        healing_base_power,
+        spell_base_power,
+        spell_multiplier_for,
+    )
     from .runtime_stat_resolver import RuntimeStatResolver
 except ImportError:
     from models.ability import BattleEntity, BattleZone, CombatStatus
     from models.combat import BattleEvent
-    from services.attribute_service import elemental_multiplier
-    from services.spell_rules import calculate_mana_cost
+    from services.balance_rules import (
+        physical_damage_amount,
+        resistance_multiplier,
+        spell_damage_amount,
+    )
+    from services.spell_rules import (
+        calculate_mana_cost,
+        healing_base_power,
+        spell_base_power,
+        spell_multiplier_for,
+    )
     from services.runtime_stat_resolver import RuntimeStatResolver
 
 
@@ -177,9 +195,48 @@ class AbilityRuntime:
                     continue
                 for effect in zone.effects:
                     if effect.effect_type == "magic_damage" and state.tick % 5 == 0:
-                        damage = max(1, round(effect.value))
+                        source = (
+                            state.attacker
+                            if state.attacker.snapshot.user_pk == zone.owner_pk
+                            else state.defender
+                        )
+                        ability_id = zone.zone_id.split(":", 1)[0]
+                        definition = (
+                            source.snapshot.skills.active_definitions.get(
+                                ability_id
+                            )
+                            if source.snapshot.skills else None
+                        )
+                        if definition:
+                            spell = source.snapshot.skills.spells.get(
+                                ability_id
+                            )
+                            spell_level = spell.level if spell else 1
+                            resistance = (
+                                fighter.current_derived.resistances.get(
+                                    effect.damage_type, 0.0
+                                )
+                                if fighter.current_derived else 0.0
+                            )
+                            damage = spell_damage_amount(
+                                base_power=spell_base_power(
+                                    definition, source, spell_level
+                                ),
+                                effect_multiplier=effect.value,
+                                spell_multiplier=spell_multiplier_for(
+                                    definition, source
+                                ),
+                                variance=1.0,
+                                resistance=resistance,
+                                attacker_level=source.snapshot.level,
+                                magical_reduction=(
+                                    fighter.current_derived.magical_reduction
+                                    if fighter.current_derived else 0.0
+                                ),
+                            )
+                        else:
+                            damage = max(1, round(effect.value))
                         fighter.current_hp = max(0, fighter.current_hp - damage)
-                        source = state.attacker if state.attacker.snapshot.user_pk == zone.owner_pk else state.defender
                         if source is not fighter: source.damage_dealt += damage
                         state.events.append(BattleEvent(state.tick, "zone_damage", zone.owner_pk, fighter.snapshot.user_pk, value=damage, remaining_hp=fighter.current_hp, damage_type=effect.damage_type, zone_id=zone.zone_id))
                     elif effect.effect_type == "apply_status":
@@ -238,7 +295,14 @@ class AbilityRuntime:
             resistance_key = "mind" if status_id in {"confusion", "paralysis", "haze", "blind"} else "nature"
             resistance = target.current_derived.resistances.get(resistance_key, 0.0) if target.current_derived else 0.0
             status_resistance = sum(s.magnitude for s in target.statuses.values() if s.status_id == "status_resistance")
-            chance *= max(0.1, 1 - max(0.0, resistance) - status_resistance)
+            source = (
+                state.attacker
+                if state.attacker.snapshot.user_pk == source_pk
+                else state.defender
+            )
+            chance *= resistance_multiplier(
+                resistance, source.snapshot.level
+            ) * max(0.0, 1 - status_resistance)
             if status_id == "bleed" and self.has(target, "tree_skin"):
                 chance *= max(
                     0.0,
@@ -288,7 +352,6 @@ class AbilityRuntime:
             derived = actor.current_derived
             target_derived = target.current_derived
             target_defense = (target_derived.defense if target_derived else target.snapshot.stat("defense")) * max(0.1, 1 + self.modifier(target, "defense"))
-            base = max(1.0, (derived.attack_power * 1.8 if derived else actor.snapshot.stat("atk") * 4) - target_defense * (0.75 if target_derived else 0.8))
             multiplier = effect.value * (derived.physical_damage_multiplier if derived else 1.0)
             multiplier *= 1 + self.modifier(actor, "physical_damage") - self.modifier(actor, "damage_penalty")
             threshold = effect.params.get("bonus_above_hp")
@@ -313,14 +376,32 @@ class AbilityRuntime:
                         )
                     ),
                 )
-            breakdown["physical"] = breakdown.get("physical", 0) + max(1, round(base * multiplier * variance * max(0.05, 1 - reduction)))
+            amount = physical_damage_amount(
+                attack_power=(
+                    derived.attack_power
+                    if derived else actor.snapshot.stat("atk") * 4
+                ),
+                offense_multiplier=(
+                    derived.physical_damage_multiplier if derived else 1.0
+                ),
+                effect_multiplier=multiplier / (
+                    derived.physical_damage_multiplier if derived else 1.0
+                ),
+                variance=variance,
+                defense=target_defense,
+                attacker_level=actor.snapshot.level,
+                physical_reduction=reduction,
+            )
+            breakdown["physical"] = breakdown.get("physical", 0) + amount
         if physical_effects and actor.current_derived and target.current_derived:
             for damage_type, bonus in actor.current_derived.elemental_damage.items():
                 if bonus <= 0:
                     continue
                 resistance = target.current_derived.resistances.get(damage_type, 0.0)
                 amount = round(
-                    bonus * variance * elemental_multiplier(resistance)
+                    bonus * variance * resistance_multiplier(
+                        resistance, actor.snapshot.level
+                    )
                     * (1 - target.current_derived.magical_reduction)
                 )
                 if amount > 0:
@@ -328,18 +409,24 @@ class AbilityRuntime:
         for effect in magic_effects:
             spell = actor.snapshot.skills.spells.get(definition.ability_id) if actor.snapshot.skills else None
             spell_level = spell.level if spell else 1
-            school_level = actor.skill_level(definition.unlock_skill_id)
-            base = 8 + spell_level * 1.5 + actor.primary("magic") * 0.8 + actor.primary("perception") * 0.5 + school_level * 0.4
-            multiplier_key = SPELL_MULTIPLIER_KEYS.get(effect.damage_type, effect.damage_type)
-            school_multiplier = actor.current_derived.spell_multipliers.get(multiplier_key, 1.0) if actor.current_derived else 1.0
+            base = spell_base_power(definition, actor, spell_level)
+            school_multiplier = spell_multiplier_for(definition, actor)
             resistance = target.current_derived.resistances.get(effect.damage_type, 0.0) if target.current_derived else 0.0
             resistance += self.modifier(target, f"resistance_{effect.damage_type}")
             if effect.damage_type == "fire" and self.has(target, "wet"):
-                resistance += 0.30
+                resistance += 30
             if effect.damage_type == "lightning" and self.has(target, "wet"):
-                resistance -= 0.30
+                resistance -= 30
             magical_reduction = target.current_derived.magical_reduction if target.current_derived else 0.0
-            amount = max(1, round(base * effect.value * school_multiplier * variance * elemental_multiplier(resistance) * (1 - magical_reduction)))
+            amount = spell_damage_amount(
+                base_power=base,
+                effect_multiplier=effect.value,
+                spell_multiplier=school_multiplier,
+                variance=variance,
+                resistance=resistance,
+                attacker_level=actor.snapshot.level,
+                magical_reduction=magical_reduction,
+            )
             breakdown[effect.damage_type] = breakdown.get(effect.damage_type, 0) + amount
         critical = bool(physical_effects) and rng.random() < (actor.current_derived.critical_rate if actor.current_derived else 0.05)
         if critical:
@@ -404,10 +491,10 @@ class AbilityRuntime:
                     continue
                 spell = actor.snapshot.skills.spells.get(definition.ability_id) if actor.snapshot.skills else None
                 spell_level = spell.level if spell else 1
-                recovery = actor.skill_level("restoration")
-                base = 10 + spell_level * 2 + actor.primary("willpower") * 1.2 + actor.primary("magic") * 0.5 + recovery * 0.5
+                base = healing_base_power(spell_level)
+                spell_multiplier = spell_multiplier_for(definition, actor)
                 power = actor.current_derived.healing_power if actor.current_derived else 1.0
-                amount = min(recipient.max_hp - recipient.current_hp, max(1, round(base * effect.value * power * max(0.0, 1 + self.modifier(actor, "healing") + self.modifier(recipient, "healing")))))
+                amount = min(recipient.max_hp - recipient.current_hp, max(1, round(base * spell_multiplier * effect.value * power * max(0.0, 1 + self.modifier(actor, "healing") + self.modifier(recipient, "healing")))))
                 recipient.current_hp += amount
                 state.events.append(BattleEvent(state.tick, "ability_heal", actor.snapshot.user_pk, recipient.snapshot.user_pk, value=amount, remaining_hp=recipient.current_hp, skill_id=definition.ability_id))
             elif effect.effect_type == "restore_resource":
@@ -447,7 +534,7 @@ class AbilityRuntime:
                 zone_id = f"{effect.params.get('zone_id', definition.ability_id)}:{actor.snapshot.user_pk}:{state.tick}"
                 zone_effects = []
                 if effect.params.get("periodic_damage"):
-                    zone_effects.append(type(effect)("magic_damage", "enemy", float(effect.params["periodic_damage"]) * 10, 0, 1.0, effect.damage_type))
+                    zone_effects.append(type(effect)("magic_damage", "enemy", float(effect.params["periodic_damage"]), 0, 1.0, effect.damage_type))
                 if effect.params.get("status"):
                     zone_effects.append(type(effect)("apply_status", "enemy", 0.1, 6, 0.7, effect.damage_type, str(effect.params["status"])))
                 state.zones.append(BattleZone(zone_id, actor.snapshot.user_pk, target.position, effect.radius, effect.duration_ticks, tuple(zone_effects)))

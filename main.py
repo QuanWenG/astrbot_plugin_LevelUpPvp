@@ -1,7 +1,8 @@
+import asyncio
 import os
 
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.star.filter.command import GreedyStr
 
 try:
@@ -14,6 +15,7 @@ try:
     from .services.equipment_service import EquipmentService
     from .services.llm_service import LLMService
     from .services.stat_service import StatService
+    from .services.storage import prepare_persistent_database
     from .services.skill_service import SkillService
     from .services.spell_service import SpellService
     from .services.build_service import CombatBuildService
@@ -28,6 +30,7 @@ except ImportError:
     from services.equipment_service import EquipmentService
     from services.llm_service import LLMService
     from services.stat_service import StatService
+    from services.storage import prepare_persistent_database
     from services.skill_service import SkillService
     from services.spell_service import SpellService
     from services.build_service import CombatBuildService
@@ -35,30 +38,39 @@ except ImportError:
 
 
 PLUGIN_DIR = os.path.dirname(__file__)
-DB_PATH = os.path.join(PLUGIN_DIR, "data", "db_level_up_pvp.db")
+PLUGIN_NAME = "astrbot_plugin_LevelUpPvp"
+LEGACY_DB_PATH = os.path.join(PLUGIN_DIR, "data", "db_level_up_pvp.db")
 
 
-@register("astrbot_plugin_LevelUpPvp", "QuanWenG", "群聊自动签到，升级就开打", "1.6.1")
+@register(PLUGIN_NAME, "QuanWenG", "群聊自动签到，升级就开打", "1.6.7")
 class MyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        user_service = UserService(DB_PATH)
-        attribute_service = AttributeService(DB_PATH)
-        checkin_service = CheckinService(
-            DB_PATH, user_service, attribute_service
+        self.db_path = prepare_persistent_database(
+            StarTools.get_data_dir(PLUGIN_NAME),
+            LEGACY_DB_PATH,
         )
-        stat_service = StatService(DB_PATH, user_service)
+        self._db_init_task = asyncio.create_task(
+            init_db(self.db_path),
+            name=f"{PLUGIN_NAME}-database-init",
+        )
+        user_service = UserService(self.db_path)
+        attribute_service = AttributeService(self.db_path)
+        checkin_service = CheckinService(
+            self.db_path, user_service, attribute_service
+        )
+        stat_service = StatService(self.db_path, user_service)
         llm_service = LLMService()
-        equipment_service = EquipmentService(DB_PATH)
-        skill_service = SkillService(DB_PATH)
+        equipment_service = EquipmentService(self.db_path)
+        skill_service = SkillService(self.db_path)
         spell_service = SpellService(
-            DB_PATH, skill_service, equipment_service, attribute_service
+            self.db_path, skill_service, equipment_service, attribute_service
         )
         build_service = CombatBuildService(
             equipment_service, skill_service, attribute_service, spell_service
         )
         battle_service = BattleService(
-            DB_PATH, user_service, llm_service, equipment_service, skill_service,
+            self.db_path, user_service, llm_service, equipment_service, skill_service,
             attribute_service, spell_service
         )
         self.challenge_queue = ChallengeQueueService(battle_service)
@@ -78,15 +90,21 @@ class MyPlugin(Star):
 
     async def initialize(self):
         """初始化插件数据库。"""
-        await init_db(DB_PATH)
+        await self._ensure_database_ready()
         self.challenge_queue.start()
+
+    async def _ensure_database_ready(self) -> None:
+        """Block every event until schema creation and migrations finish."""
+        await self._db_init_task
 
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE,
         priority=100,
     )
     async def auto_checkin(self, event: AstrMessageEvent):
-        """优先处理显式签到，其余群消息尝试自动签到。"""
+        """自动登记群成员，并处理签到。"""
+        await self._ensure_database_ready()
+        await self.command_handler.ensure_sender_registered(event)
         if self.command_handler.is_explicit_checkin_event(event):
             async for result in self.command_handler.sign(event):
                 yield result
@@ -99,12 +117,14 @@ class MyPlugin(Star):
     @filter.command("签到")
     async def sign(self, event: AstrMessageEvent):
         """每日签到获取随机经验。"""
+        await self._ensure_database_ready()
         async for result in self.command_handler.sign(event):
             yield result
 
     @filter.command("面板")
     async def profile(self, event: AstrMessageEvent):
         """查看自己的等级、经验和属性。"""
+        await self._ensure_database_ready()
         async for result in self.command_handler.profile(event):
             yield result
 
@@ -115,19 +135,22 @@ class MyPlugin(Star):
         stat_name: str = "",
         amount: int = 1,
     ):
-        """消耗自定义属性点，按属性随机范围提升属性。"""
+        """消耗自定义属性点，按 1:1 固定提升主属性。"""
+        await self._ensure_database_ready()
         async for result in self.command_handler.add_point(event, stat_name, amount):
             yield result
 
     @filter.command("排行")
     async def ranking(self, event: AstrMessageEvent):
         """查看当前群等级排行榜，At 用户时查看该用户排名。"""
+        await self._ensure_database_ready()
         async for result in self.command_handler.ranking(event):
             yield result
 
     @filter.command("登记")
     async def register_nickname(self, event: AstrMessageEvent, nickname: str = ""):
-        """登记 QQ official openid 对应的展示昵称。"""
+        """使用平台用户名登记展示昵称，可选手动覆盖。"""
+        await self._ensure_database_ready()
         async for result in self.command_handler.register_nickname(event, nickname):
             yield result
 
@@ -139,6 +162,7 @@ class MyPlugin(Star):
         nickname: GreedyStr,
     ):
         """管理员修改指定用户的展示昵称。"""
+        await self._ensure_database_ready()
         async for result in self.command_handler.modify_registered_nickname(
             event,
             nickname,
@@ -147,63 +171,78 @@ class MyPlugin(Star):
 
     @filter.command("背包")
     async def inventory(self, event: AstrMessageEvent, page: int = 1):
+        await self._ensure_database_ready()
         async for result in self.command_handler.inventory(event, page): yield result
 
     @filter.command("装备")
     async def equipment(self, event: AstrMessageEvent):
+        await self._ensure_database_ready()
         async for result in self.command_handler.equipment(event): yield result
 
     @filter.command("装备详情")
     async def equipment_detail(self, event: AstrMessageEvent, equipment_id: int):
+        await self._ensure_database_ready()
         async for result in self.command_handler.equipment_detail(event, equipment_id): yield result
 
     @filter.command("穿戴")
     async def equip_item(self, event: AstrMessageEvent, equipment_id: int, slot: str = ""):
+        await self._ensure_database_ready()
         async for result in self.command_handler.equip_item(event, equipment_id, slot): yield result
 
     @filter.command("卸下")
     async def unequip_item(self, event: AstrMessageEvent, slot: str):
+        await self._ensure_database_ready()
         async for result in self.command_handler.unequip_item(event, slot): yield result
 
     @filter.command("技能")
     async def skills(self, event: AstrMessageEvent):
+        await self._ensure_database_ready()
         async for result in self.command_handler.skills(event): yield result
 
     @filter.command("学习")
     async def learn_skill(self, event: AstrMessageEvent, name: GreedyStr):
+        await self._ensure_database_ready()
         async for result in self.command_handler.learn_skill(event, name): yield result
 
     @filter.command("训练技能")
     async def train_skill(self, event: AstrMessageEvent, name: str, points: int = 1):
+        await self._ensure_database_ready()
         async for result in self.command_handler.train_skill(event, name, points): yield result
 
     @filter.command("技能栏")
     async def skill_slot(self, event: AstrMessageEvent, slot: int, name: GreedyStr):
+        await self._ensure_database_ready()
         async for result in self.command_handler.set_skill_slot(event, slot, name): yield result
     @filter.command("魔法书")
     async def spellbooks(self, event: AstrMessageEvent, page: int = 1):
+        await self._ensure_database_ready()
         async for result in self.command_handler.spellbooks(event, page): yield result
 
     @filter.command("阅读")
     async def read_spellbook(self, event: AstrMessageEvent, book_id: int):
+        await self._ensure_database_ready()
         async for result in self.command_handler.read_spellbook(event, book_id): yield result
 
     @filter.command("法术")
     async def spells(self, event: AstrMessageEvent):
+        await self._ensure_database_ready()
         async for result in self.command_handler.spells(event): yield result
 
     @filter.command("战技")
     async def techniques(self, event: AstrMessageEvent):
+        await self._ensure_database_ready()
         async for result in self.command_handler.techniques(event): yield result
     @filter.command("挑战")
     async def challenge(self, event: AstrMessageEvent):
         """At 一名用户发起概率战斗。"""
+        await self._ensure_database_ready()
         async for result in self.command_handler.challenge(event):
             yield result
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def mentioned_command(self, event: AstrMessageEvent):
         """普通消息里的 @机器人指令 或挑战唤起词。"""
+        await self._ensure_database_ready()
         mentioned_command = self.command_handler.parse_mentioned_command(event)
         if mentioned_command:
             command, args = mentioned_command

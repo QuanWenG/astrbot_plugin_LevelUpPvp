@@ -188,7 +188,7 @@ class UserExpDowngradeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.level_downs, [])
 
     async def test_downgrade_freezes_growth_and_unspent_points(self):
-        user = await self._prepare_user(level=3, exp=5, stat_points=3, hp=12, atk=6)
+        user = await self._prepare_user(level=3, exp=5, stat_points=1, hp=3, atk=2)
         await self._insert_level_log(user.id, from_level=2, to_level=3, growth={"strength": 2, "perception": 1})
 
         async with await connect_db(self.db_path) as db:
@@ -198,17 +198,32 @@ class UserExpDowngradeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.exp_delta, -10)
         self.assertEqual(result.user.level, 2)
         self.assertEqual(result.user.exp, config.exp_required_for_next_level(2) - 5)
-        self.assertEqual(result.user.hp, 10)
-        self.assertEqual(result.user.atk, 5)
+        self.assertEqual(result.user.hp, 3)
+        self.assertEqual(result.user.atk, 2)
         self.assertEqual(result.user.stat_points, 0)
-        self.assertEqual(result.level_downs[0].frozen_stats, {"strength": 2, "perception": 1})
-        self.assertEqual(result.level_downs[0].frozen_stat_points, 3)
+        self.assertEqual(result.level_downs[0].frozen_stats, {})
+        self.assertEqual(result.level_downs[0].frozen_stat_points, 1)
         self.assertEqual(result.user.frozen_levels, [3])
-        self.assertEqual(result.user.frozen_stats, {"strength": 2, "perception": 1})
-        self.assertEqual(result.user.frozen_stat_points, 3)
+        self.assertEqual(result.user.frozen_stats, {})
+        self.assertEqual(result.user.frozen_stat_points, 1)
+
+    async def test_downgrade_freezes_one_spent_point(self):
+        user = await self._prepare_user(
+            level=2, exp=0, stat_points=0, hp=2, atk=1
+        )
+
+        async with await connect_db(self.db_path) as db:
+            with patch("services.user_service.random.choice", return_value="strength"):
+                result = await self.user_service.deduct_exp_in_db(db, user, 1)
+            await db.commit()
+
+        self.assertEqual(result.user.level, 1)
+        self.assertEqual(result.user.hp, 1)
+        self.assertEqual(result.level_downs[0].frozen_stats, {"strength": 1})
+        self.assertEqual(result.level_downs[0].frozen_stat_points, 0)
 
     async def test_multi_level_downgrade_and_level_one_clamp(self):
-        user = await self._prepare_user(level=3, exp=0, stat_points=0, hp=13, atk=6)
+        user = await self._prepare_user(level=3, exp=0, stat_points=0, hp=3, atk=2)
         await self._insert_level_log(user.id, from_level=1, to_level=2, growth={"hp": 1})
         await self._insert_level_log(user.id, from_level=2, to_level=3, growth={"strength": 2, "perception": 1})
 
@@ -230,7 +245,7 @@ class UserExpDowngradeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clamped.user.exp, 0)
 
     async def test_relevel_releases_freeze_without_new_growth_log(self):
-        user = await self._prepare_user(level=3, exp=0, stat_points=3, hp=12, atk=6)
+        user = await self._prepare_user(level=3, exp=0, stat_points=1, hp=3, atk=2)
         await self._insert_level_log(user.id, from_level=2, to_level=3, growth={"strength": 2, "perception": 1})
 
         async with await connect_db(self.db_path) as db:
@@ -246,14 +261,14 @@ class UserExpDowngradeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(restored.user.level, 3)
         self.assertEqual(restored.user.exp, 1)
-        self.assertEqual(restored.user.hp, 12)
-        self.assertEqual(restored.user.atk, 6)
-        self.assertEqual(restored.user.stat_points, 3)
+        self.assertEqual(restored.user.hp, 3)
+        self.assertEqual(restored.user.atk, 2)
+        self.assertEqual(restored.user.stat_points, 1)
         self.assertEqual(restored.user.frozen_levels, [])
         self.assertEqual(len(restored.level_ups), 1)
         self.assertTrue(restored.level_ups[0].restored_from_freeze)
-        self.assertEqual(restored.level_ups[0].auto_growth, {"strength": 2, "perception": 1})
-        self.assertEqual(restored.level_ups[0].stat_points_gain, 3)
+        self.assertEqual(restored.level_ups[0].auto_growth, {})
+        self.assertEqual(restored.level_ups[0].stat_points_gain, 1)
         self.assertEqual(await self._count_level_logs(to_level=3), before_logs)
         self.assertEqual(await self._count_active_freezes(), 0)
 
@@ -263,8 +278,8 @@ class UserExpDowngradeTests(unittest.IsolatedAsyncioTestCase):
         level=1,
         exp=0,
         stat_points=0,
-        hp=10,
-        atk=5,
+        hp=1,
+        atk=1,
     ):
         async with await connect_db(self.db_path) as db:
             user, _ = await self.user_service.get_or_create_user_in_db(db, self.identity)
@@ -272,8 +287,8 @@ class UserExpDowngradeTests(unittest.IsolatedAsyncioTestCase):
                 """
                 UPDATE users
                 SET level = ?, exp = ?, total_exp = ?, stat_points = ?,
-                    level_up_count = ?, hp = ?, atk = ?, defense = 5,
-                    speed = 5, luck = 5
+                    level_up_count = ?, hp = ?, atk = ?, defense = 1,
+                    speed = 1, luck = 1, willpower = 1
                 WHERE id = ?
                 """,
                 (level, exp, 0, stat_points, max(0, level - 1), hp, atk, user.id),

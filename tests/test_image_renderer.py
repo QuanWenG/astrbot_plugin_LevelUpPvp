@@ -1,12 +1,36 @@
 import unittest
 
 from services.battle_image_renderer import RENDERER_REVISION
-from services.image_renderer import COLORS, _text_units, _wrap_text
+from services.image_renderer import (
+    COLORS,
+    _font_supports_cjk,
+    _text_units,
+    _wrap_text,
+)
 
 
 class _FakeDraw:
     def textbbox(self, position, text, font):
         return (0, 0, len(text) * 10, 20)
+
+
+class _FakeFont:
+    def __init__(self, distinct):
+        self.distinct = distinct
+
+    def getmask(self, char):
+        value = ord(char) if self.distinct else 0
+        return _FakeMask(value)
+
+
+class _FakeMask:
+    size = (2, 2)
+
+    def __init__(self, value):
+        self.value = value
+
+    def __bytes__(self):
+        return bytes((self.value % 256,))
 
 
 class SharedImageRendererTests(unittest.TestCase):
@@ -29,6 +53,10 @@ class SharedImageRendererTests(unittest.TestCase):
 
     def test_battle_report_revision_identifies_light_theme(self):
         self.assertEqual("astrbot-card-v3-light", RENDERER_REVISION)
+
+    def test_cjk_font_check_rejects_repeated_missing_glyph_boxes(self):
+        self.assertTrue(_font_supports_cjk(_FakeFont(distinct=True)))
+        self.assertFalse(_font_supports_cjk(_FakeFont(distinct=False)))
 
 
 if __name__ == "__main__":

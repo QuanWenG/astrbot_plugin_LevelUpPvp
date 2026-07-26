@@ -394,11 +394,9 @@ class UserService:
 
             level_up_count += 1
             stat_points += config.STAT_POINTS_PER_LEVEL
-            skill_point_gain = min(5, 1 + stats["magic"] // 25)
+            skill_point_gain = config.SKILL_POINTS_PER_LEVEL
             skill_points += skill_point_gain
-            auto_growth = self._roll_auto_growth()
-            for stat_name, gain in auto_growth.items():
-                stats[stat_name] += gain
+            auto_growth = {}
 
             level_ups.append(
                 LevelUpEvent(
@@ -649,13 +647,7 @@ class UserService:
         skill_points: int,
         now: str,
     ) -> LevelDownEvent:
-        frozen_stats = await self._level_auto_growth_in_db(db, user_id, from_level)
-        for stat_name, amount in frozen_stats.items():
-            stats[stat_name] = max(
-                config.INITIAL_STATS[stat_name],
-                stats[stat_name] - amount,
-            )
-
+        frozen_stats: dict[str, int] = {}
         frozen_stat_points = min(stat_points, config.STAT_POINTS_PER_LEVEL)
         level_skill_points = await self._level_skill_points_in_db(
             db, user_id, from_level
@@ -716,28 +708,6 @@ class UserService:
         row = await cursor.fetchone()
         await cursor.close()
         return max(1, int(row["skill_points_gain"])) if row else 1
-    async def _level_auto_growth_in_db(
-        self,
-        db,
-        user_id: int,
-        level: int,
-    ) -> dict[str, int]:
-        cursor = await db.execute(
-            """
-            SELECT auto_growth_json
-            FROM level_up_logs
-            WHERE user_pk = ? AND to_level = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (user_id, level),
-        )
-        row = await cursor.fetchone()
-        await cursor.close()
-        if not row:
-            return {}
-        return self._load_stats_json(row["auto_growth_json"])
-
     def _roll_spent_stat_freeze(
         self,
         stats: dict[str, int],
@@ -753,9 +723,8 @@ class UserService:
             if not eligible_stats:
                 break
             stat_name = random.choice(eligible_stats)
-            rolled = random.randint(*config.STAT_POINT_RANGES[stat_name])
             available = stats[stat_name] - config.INITIAL_STATS[stat_name]
-            amount = min(rolled, available)
+            amount = min(1, available)
             if amount <= 0:
                 continue
             stats[stat_name] -= amount
@@ -781,15 +750,6 @@ class UserService:
             if normalized_amount > 0:
                 stats[stat_name] = normalized_amount
         return stats
-
-    def _roll_auto_growth(self) -> dict[str, int]:
-        min_count, max_count = config.AUTO_GROWTH_STAT_COUNT_RANGE
-        count = random.randint(min_count, max_count)
-        selected = random.sample(list(config.AUTO_GROWTH_RANGES.keys()), count)
-        return {
-            stat_name: random.randint(*config.AUTO_GROWTH_RANGES[stat_name])
-            for stat_name in selected
-        }
 
     def _default_nickname(self, identity: UserIdentity) -> str:
         if identity.platform == "qq_official":

@@ -40,15 +40,15 @@ except ImportError:
 
 
 WEAPON_RULES = {
-    "unarmed": (80, 0.70, 1, 2, 5, 6),
+    "unarmed": (80, 1.15, 1, 2, 5, 6),
     "one_hand": (100, 1.00, 1, 2, 6, 8),
-    "sword_shield": (100, 1.00, 1, 2, 6, 9),
-    "dual_wield": (100, 0.65, 1, 3, 7, 14),
+    "sword_shield": (100, 0.85, 1, 2, 6, 9),
+    "dual_wield": (100, 0.80, 1, 3, 7, 14),
     "two_hand_melee": (150, 1.15, 2, 3, 7, 16),
-    "two_hand_heavy": (110, 1.35, 2, 3, 8, 18),
-    "bow": (350, 1.10, 2, 2, 7, 12),
-    "crossbow": (400, 1.25, 2, 3, 8, 13),
-    "firearm": (450, 1.35, 1, 4, 9, 10),
+    "two_hand_heavy": (110, 0.70, 2, 3, 8, 18),
+    "bow": (350, 0.70, 2, 2, 7, 12),
+    "crossbow": (400, 0.75, 2, 3, 8, 13),
+    "firearm": (450, 0.60, 1, 4, 9, 10),
     "throwing": (250, 1.05, 1, 2, 6, 10),
 }
 
@@ -83,6 +83,7 @@ class CombatBuildService:
             skill_id: skill_level_cap(
                 permanent_attributes,
                 SKILL_DEFINITIONS[skill_id].governing_attributes,
+                skill_id,
             )
             for skill_id in skills
             if skill_id in SKILL_DEFINITIONS
@@ -175,13 +176,32 @@ class CombatBuildService:
                 0.50,
                 1.0 - max(0, item.item_level - user.level) * 0.03,
             )
-            factor = (
-                QUALITY_MULTIPLIERS.get(item.quality, 1.0)
-                * (1 + item.enhancement_level * 0.03)
-                * level_factor
-            )
+            quality_factor = QUALITY_MULTIPLIERS.get(item.quality, 1.0)
+            factor = quality_factor * level_factor
             for stat, raw_value in item.base_stats.items():
-                value = float(raw_value) * factor
+                raw_value = float(raw_value)
+                value = raw_value * factor
+                if stat in {"atk", "weapon_power"} and item.item_type == "weapon":
+                    value = (
+                        raw_value
+                        * material.attack_factor
+                        * quality_factor
+                        + item.enhancement_level
+                        + item.item_level // 10
+                    ) * level_factor
+                elif stat in {"defense", "armor_power"}:
+                    value = (
+                        raw_value
+                        * material.defense_factor
+                        * quality_factor
+                        + item.enhancement_level * 2
+                    ) * level_factor
+                elif stat == "accuracy":
+                    value = (
+                        raw_value * material.accuracy_factor * factor
+                    )
+                elif stat == "evasion":
+                    value = raw_value * material.evasion_factor * factor
                 if stat in PRIMARY_ATTRIBUTE_IDS:
                     stat_values[stat] += value
                 elif stat == "atk":

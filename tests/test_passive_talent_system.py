@@ -77,9 +77,9 @@ class PassiveTalentSystemTests(unittest.IsolatedAsyncioTestCase):
             "weightlifting": 100,
         }
         bonuses = resolve_passive_bonuses(levels, snapshot.equipment)
-        self.assertAlmostEqual(bonuses.attack_power, 20.0)
+        self.assertAlmostEqual(bonuses.attack_power, 0.0)
         self.assertAlmostEqual(bonuses.accuracy, 55.0)
-        self.assertAlmostEqual(bonuses.physical_damage_bonus, 0.30)
+        self.assertAlmostEqual(bonuses.physical_damage_bonus, 0.0)
         self.assertAlmostEqual(bonuses.block_rate, 0.10)
         self.assertAlmostEqual(bonuses.knockback_resistance, 0.20)
         self.assertAlmostEqual(bonuses.defense, 23.0)

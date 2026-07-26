@@ -7,6 +7,12 @@ except ImportError:
     aiosqlite = None
 
 
+PRIMARY_ATTRIBUTE_REBALANCE_MIGRATION = "2026-07-primary-attributes-v2"
+PRIMARY_ATTRIBUTE_REBALANCE_BACKUP_SUFFIX = ".pre-primary-attributes-v2.bak"
+ELONA_BALANCE_MIGRATION = "2026-07-elona-balance-v1"
+ELONA_BALANCE_BACKUP_SUFFIX = ".pre-elona-balance-v1.bak"
+
+
 class _AsyncSQLiteCursor:
     def __init__(self, cursor: sqlite3.Cursor):
         self._cursor = cursor
@@ -90,12 +96,12 @@ async def init_db(db_path: str) -> None:
                 stat_points INTEGER NOT NULL DEFAULT 0,
                 skill_points INTEGER NOT NULL DEFAULT 0,
                 level_up_count INTEGER NOT NULL DEFAULT 0,
-                hp INTEGER NOT NULL DEFAULT 10,
-                atk INTEGER NOT NULL DEFAULT 5,
-                defense INTEGER NOT NULL DEFAULT 5,
-                speed INTEGER NOT NULL DEFAULT 5,
-                luck INTEGER NOT NULL DEFAULT 5,
-                willpower INTEGER NOT NULL DEFAULT 5,
+                hp INTEGER NOT NULL DEFAULT 1,
+                atk INTEGER NOT NULL DEFAULT 1,
+                defense INTEGER NOT NULL DEFAULT 1,
+                speed INTEGER NOT NULL DEFAULT 1,
+                luck INTEGER NOT NULL DEFAULT 1,
+                willpower INTEGER NOT NULL DEFAULT 1,
                 life_growth INTEGER NOT NULL DEFAULT 100,
                 mana_growth INTEGER NOT NULL DEFAULT 100,
                 advanced_speed INTEGER NOT NULL DEFAULT 100,
@@ -105,6 +111,11 @@ async def init_db(db_path: str) -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(platform, group_id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                migration_id TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS checkins (
@@ -359,7 +370,7 @@ async def init_db(db_path: str) -> None:
         await _ensure_column(db, "users", "advanced_speed", "INTEGER NOT NULL DEFAULT 100")
         await _ensure_column(db, "users", "advanced_luck", "INTEGER NOT NULL DEFAULT 100")
         await _ensure_column(db, "users", "skill_points", "INTEGER NOT NULL DEFAULT 0")
-        await _ensure_column(db, "users", "willpower", "INTEGER NOT NULL DEFAULT 5")
+        await _ensure_column(db, "users", "willpower", "INTEGER NOT NULL DEFAULT 1")
         await _ensure_column(db, "level_up_logs", "skill_points_gain", "INTEGER NOT NULL DEFAULT 0")
         await _ensure_column(db, "level_freezes", "frozen_skill_points", "INTEGER NOT NULL DEFAULT 0")
         await db.execute(
@@ -369,6 +380,8 @@ async def init_db(db_path: str) -> None:
             """
         )
         await db.commit()
+        await _apply_primary_attribute_rebalance(db, db_path)
+        await _apply_elona_balance_reset(db, db_path)
 
 
 async def _ensure_column(db, table_name: str, column_name: str, definition: str) -> None:
@@ -378,3 +391,167 @@ async def _ensure_column(db, table_name: str, column_name: str, definition: str)
     if any(row["name"] == column_name for row in rows):
         return
     await db.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+
+
+def _backup_database_once(db_path: str) -> str | None:
+    return _backup_database_with_suffix(
+        db_path, PRIMARY_ATTRIBUTE_REBALANCE_BACKUP_SUFFIX
+    )
+
+
+def _backup_database_with_suffix(
+    db_path: str, suffix: str
+) -> str | None:
+    if db_path == ":memory:" or not os.path.isfile(db_path):
+        return None
+    backup_path = db_path + suffix
+    if os.path.exists(backup_path):
+        return backup_path
+    temporary_path = backup_path + ".tmp"
+    if os.path.exists(temporary_path):
+        os.remove(temporary_path)
+    source = sqlite3.connect(db_path)
+    destination = sqlite3.connect(temporary_path)
+    try:
+        source.backup(destination)
+        destination.close()
+        source.close()
+        os.replace(temporary_path, backup_path)
+        return backup_path
+    except Exception:
+        destination.close()
+        source.close()
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+        raise
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
+async def _apply_primary_attribute_rebalance(db, db_path: str) -> None:
+    cursor = await db.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_id = ?",
+        (PRIMARY_ATTRIBUTE_REBALANCE_MIGRATION,),
+    )
+    already_applied = await cursor.fetchone()
+    await cursor.close()
+    if already_applied:
+        return
+
+    cursor = await db.execute("SELECT COUNT(*) AS count FROM users")
+    user_count = int((await cursor.fetchone())["count"])
+    await cursor.close()
+    if user_count:
+        _backup_database_once(db_path)
+
+    await db.execute("BEGIN")
+    try:
+        await db.execute(
+            """
+            UPDATE users
+            SET hp = 1, atk = 1, defense = 1,
+                speed = 1, luck = 1, willpower = 1,
+                stat_points = MAX(0, level - 1),
+                life_growth = 100, mana_growth = 100,
+                advanced_speed = 100, advanced_luck = 100
+            """
+        )
+        await db.execute(
+            """
+            UPDATE user_attribute_progress
+            SET exp = 0, potential = 100
+            """
+        )
+        await db.execute(
+            """
+            UPDATE level_freezes
+            SET frozen_stats_json = '{}', frozen_stat_points = 1
+            WHERE status = 'frozen'
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO schema_migrations (migration_id, applied_at)
+            VALUES (?, datetime('now'))
+            """,
+            (PRIMARY_ATTRIBUTE_REBALANCE_MIGRATION,),
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+
+async def _apply_elona_balance_reset(db, db_path: str) -> None:
+    cursor = await db.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_id = ?",
+        (ELONA_BALANCE_MIGRATION,),
+    )
+    already_applied = await cursor.fetchone()
+    await cursor.close()
+    if already_applied:
+        return
+
+    cursor = await db.execute("SELECT COUNT(*) AS count FROM users")
+    user_count = int((await cursor.fetchone())["count"])
+    await cursor.close()
+    if user_count:
+        _backup_database_with_suffix(
+            db_path, ELONA_BALANCE_BACKUP_SUFFIX
+        )
+
+    await db.execute("BEGIN")
+    try:
+        await db.execute(
+            """
+            UPDATE users
+            SET hp = 1, atk = 1, defense = 1,
+                speed = 1, luck = 1, willpower = 1,
+                stat_points = MAX(0, level - 1),
+                skill_points = MAX(0, level - 1),
+                life_growth = 100, mana_growth = 100,
+                advanced_speed = 100, advanced_luck = 100
+            """
+        )
+        await db.execute(
+            """
+            UPDATE user_attribute_progress
+            SET exp = 0, potential = 100
+            """
+        )
+        await db.execute(
+            """
+            UPDATE level_freezes
+            SET status = 'released',
+                released_at = COALESCE(released_at, datetime('now'))
+            WHERE status = 'frozen'
+            """
+        )
+        await db.execute("DELETE FROM active_skill_slots")
+        await db.execute("DELETE FROM user_skills")
+        await db.execute("DELETE FROM user_spells")
+        await db.execute("DELETE FROM spellbook_items")
+        await db.execute("DELETE FROM equipment_loadout")
+        await db.execute("DELETE FROM equipment_items")
+        await db.execute(
+            """
+            DELETE FROM feature_grants
+            WHERE grant_key IN (
+                'skills-v1',
+                'starter-armory-v1',
+                'starter-armory-v2-materials'
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO schema_migrations (migration_id, applied_at)
+            VALUES (?, datetime('now'))
+            """,
+            (ELONA_BALANCE_MIGRATION,),
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise

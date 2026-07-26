@@ -14,8 +14,10 @@ from services.ability_catalog import (
 )
 from services.ability_runtime import AbilityRuntime
 from services.attribute_service import AttributeService
+from services.balance_rules import spell_damage_amount
 from services.combat_engine import SideviewCombatEngine
 from services.skill_service import SkillService
+from services.spell_rules import spell_base_power, spell_multiplier_for
 
 
 def equipment(weight=10.0, style="light"):
@@ -148,16 +150,20 @@ class SpellMultiplierTests(unittest.TestCase):
                         if item.effect_type == "magic_damage"
                     )
                     spell_level = 20
-                    base = (
-                        8 + spell_level * 1.5
-                        + actor.primary("magic") * 0.8
-                        + actor.primary("perception") * 0.5
-                        + level * 0.4
+                    base = spell_base_power(
+                        definition, actor, spell_level
                     )
                     variance = random.Random(91).uniform(0.90, 1.10)
-                    expected = max(
-                        1,
-                        round(base * effect.value * (1 + level * 0.004) * variance),
+                    expected = spell_damage_amount(
+                        base_power=base,
+                        effect_multiplier=effect.value,
+                        spell_multiplier=spell_multiplier_for(
+                            definition, actor
+                        ),
+                        variance=variance,
+                        resistance=0,
+                        attacker_level=actor.snapshot.level,
+                        magical_reduction=0,
                     )
                     actual = runtime.damage_result(
                         actor, target, definition, random.Random(91)

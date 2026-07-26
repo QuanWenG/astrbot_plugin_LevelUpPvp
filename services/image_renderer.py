@@ -45,10 +45,24 @@ def _load_font(size: int, bold: bool = False):
 
     candidates = [
         "C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/NotoSansSC-VF.ttf",
         "C:/Windows/Fonts/simhei.ttf",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
         if bold
         else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc"
+        if bold
+        else "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc"
+        if bold
+        else "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Bold.ttc"
+        if bold
+        else "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansSC-Bold.otf"
+        if bold
+        else "/usr/share/fonts/opentype/noto/NotoSansSC-Regular.otf",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
         "/System/Library/Fonts/PingFang.ttc",
     ]
@@ -61,11 +75,26 @@ def _load_font(size: int, bold: bool = False):
     if FontManager is not None:
         try:
             font = FontManager.get_font(size)
-            if font is not None:
+            if font is not None and _font_supports_cjk(font):
                 return font
         except Exception:
             pass
-    return ImageFont.load_default()
+    raise RuntimeError(
+        "No CJK-capable font found. Install fonts-noto-cjk or place a "
+        "Chinese font at AstrBot's data/font.ttf."
+    )
+
+
+def _font_supports_cjk(font) -> bool:
+    """Return whether a Pillow font contains distinct common CJK glyphs."""
+    try:
+        glyphs = {
+            (font.getmask(char).size, bytes(font.getmask(char)))
+            for char in "测试战斗"
+        }
+        return len(glyphs) > 1
+    except Exception:
+        return False
 
 
 def _load_emoji_font(size: int):
@@ -74,6 +103,8 @@ def _load_emoji_font(size: int):
     candidates = [
         "C:/Windows/Fonts/seguiemj.ttf",
         "/System/Library/Fonts/Apple Color Emoji.ttc",
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/noto/NotoColorEmoji.ttf",
         "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
         "/usr/share/fonts/noto/NotoEmoji-Regular.ttf",
         "NotoEmoji-Regular.ttf",

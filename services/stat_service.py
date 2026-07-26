@@ -1,5 +1,4 @@
 import json
-import random
 
 try:
     from ..models.user import StatPointResult, UserIdentity
@@ -50,9 +49,9 @@ class StatService:
                 await db.rollback()
                 raise ValueError(f"自定义属性点不足，当前剩余 {user.stat_points} 点")
 
-            rolls = [random.randint(*config.STAT_POINT_RANGES[stat_name]) for _ in range(points)]
+            rolls = [1] * points
             storage_column = STAT_STORAGE_COLUMNS[stat_name]
-            total_gain = sum(rolls)
+            total_gain = points
             await db.execute(
                 f"""
                 UPDATE users

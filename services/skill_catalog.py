@@ -49,7 +49,6 @@ def _passive(
 
 def _weapon_effects(weapon_type: str) -> tuple[SkillEffect, ...]:
     return (
-        _effect("attack_power", 0.20, weapon_types=(weapon_type,)),
         _effect("accuracy", 0.35, weapon_types=(weapon_type,)),
     )
 
@@ -70,7 +69,6 @@ SKILL_DEFINITIONS = {
         _passive("scythe", "镰刀专精", "strength", ("strength",), "提高镰刀类武器的命中与伤害。", _weapon_effects("scythe")),
         _passive("tactics", "战术", "strength", ("strength",), "提高近战和投掷攻击的命中与伤害倍率。", (
             _effect("accuracy", 0.20, weapon_types=MELEE_AND_THROWING),
-            _effect("physical_damage_bonus", 0.003, weapon_types=MELEE_AND_THROWING),
         )),
         _passive("two_handed", "双手武器", "strength", ("strength",), "单独持有一把近战武器且没有盾牌时提高攻击能力。", (
             _effect("two_handed_style", 0.003, weapon_modes=("one_hand", "two_hand_melee", "two_hand_heavy")),
@@ -115,7 +113,6 @@ SKILL_DEFINITIONS = {
         _passive("firearm", "枪械专精", "perception", ("perception",), "提高枪械的命中与伤害。", _weapon_effects("firearm")),
         _passive("marksmanship", "射术", "perception", ("perception",), "提高弓、弩和枪械攻击的命中与综合伤害。", (
             _effect("accuracy", 0.15, weapon_types=RANGED_PHYSICAL),
-            _effect("physical_damage_bonus", 0.003, weapon_types=RANGED_PHYSICAL),
         )),
         _passive("mind_eye", "心眼", "perception", ("perception",), "提高物理攻击的暴击率和暴击伤害。", (
             _effect("critical_rate", 0.001),

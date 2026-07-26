@@ -15,9 +15,15 @@ from services.build_service import CombatBuildService
 from services.checkin_service import CheckinService
 from services.combat_ai import STRATEGY_PROFILES
 from services.combat_engine import SideviewCombatEngine
-from services.db import connect_db, init_db
+from services.db import (
+    PRIMARY_ATTRIBUTE_REBALANCE_MIGRATION,
+    PRIMARY_ATTRIBUTE_REBALANCE_BACKUP_SUFFIX,
+    connect_db,
+    init_db,
+)
 from services.equipment_service import EquipmentService
 from services.skill_service import SkillService
+from services.stat_service import StatService
 from services.user_service import UserService
 
 
@@ -89,7 +95,7 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
                     legacy_user.magic,
                     legacy_user.willpower,
                 ),
-                (12, 7, 6, 8, 9, 5),
+                (1, 1, 1, 1, 1, 1),
             )
             async with await connect_db(legacy_path) as db:
                 cursor = await db.execute(
@@ -102,13 +108,16 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("advanced_attribute_logs", tables)
         finally:
             os.remove(legacy_path)
+            backup_path = legacy_path + PRIMARY_ATTRIBUTE_REBALANCE_BACKUP_SUFFIX
+            if os.path.exists(backup_path):
+                os.remove(backup_path)
     async def test_legacy_columns_expose_six_primary_attributes(self):
         self.assertEqual(self.user.strength, self.user.hp)
         self.assertEqual(self.user.constitution, self.user.defense)
         self.assertEqual(self.user.dexterity, self.user.speed)
         self.assertEqual(self.user.perception, self.user.atk)
         self.assertEqual(self.user.magic, self.user.luck)
-        self.assertEqual(self.user.willpower, 5)
+        self.assertEqual(self.user.willpower, 1)
         self.assertEqual(
             set(self.user.stats()),
             {
@@ -116,6 +125,143 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
                 "perception", "magic", "willpower",
             },
         )
+
+    async def test_stat_allocation_is_fixed_one_to_one(self):
+        async with await connect_db(self.db_path) as db:
+            await db.execute(
+                "UPDATE users SET stat_points = 3 WHERE id = ?",
+                (self.user.id,),
+            )
+            await db.commit()
+
+        result = await StatService(self.db_path, self.users).allocate(
+            UserIdentity("test", "group", "attribute-user", "属性测试"),
+            "力量",
+            3,
+        )
+
+        self.assertEqual(result.points_spent, 3)
+        self.assertEqual(result.rolls, [1, 1, 1])
+        self.assertEqual(result.total_gain, 3)
+        self.assertEqual(result.user.strength, 4)
+        self.assertEqual(result.user.stat_points, 0)
+
+    async def test_primary_attribute_rebalance_migrates_once(self):
+        handle, migration_path = tempfile.mkstemp(suffix=".db")
+        os.close(handle)
+        backup_path = migration_path + PRIMARY_ATTRIBUTE_REBALANCE_BACKUP_SUFFIX
+        try:
+            await init_db(migration_path)
+            users = UserService(migration_path)
+            identity = UserIdentity("test", "group", "legacy", "旧玩家")
+            user = await users.get_or_create_user(identity)
+            skills = SkillService(migration_path)
+            await skills.get_skills(user)
+            equipment = EquipmentService(migration_path)
+            items = await equipment.list_items(user.id)
+
+            async with await connect_db(migration_path) as db:
+                await AttributeService().ensure_progress_in_db(db, user.id)
+                await db.execute(
+                    """
+                    UPDATE users
+                    SET level = 5, exp = 77, total_exp = 999,
+                        stat_points = 8, skill_points = 6,
+                        hp = 18, atk = 12, defense = 13,
+                        speed = 14, luck = 15, willpower = 16,
+                        life_growth = 125, mana_growth = 130,
+                        advanced_speed = 140, advanced_luck = 150,
+                        wins = 9, losses = 4
+                    WHERE id = ?
+                    """,
+                    (user.id,),
+                )
+                await db.execute(
+                    """
+                    UPDATE user_attribute_progress
+                    SET exp = 88, potential = 250
+                    WHERE user_pk = ?
+                    """,
+                    (user.id,),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO level_freezes (
+                        user_pk, frozen_level, from_level, to_level,
+                        frozen_stats_json, frozen_stat_points,
+                        frozen_skill_points, status, created_at
+                    ) VALUES (?, 6, 6, 5, '{"strength": 4}', 3, 2, 'frozen', 'x')
+                    """,
+                    (user.id,),
+                )
+                await db.execute(
+                    "DELETE FROM schema_migrations WHERE migration_id = ?",
+                    (PRIMARY_ATTRIBUTE_REBALANCE_MIGRATION,),
+                )
+                await db.commit()
+
+            await init_db(migration_path)
+            migrated = await users.get_user_by_pk(user.id)
+            self.assertEqual(migrated.level, 5)
+            self.assertEqual(migrated.exp, 77)
+            self.assertEqual(migrated.total_exp, 999)
+            self.assertEqual(migrated.stat_points, 4)
+            self.assertEqual(tuple(migrated.stats().values()), (1, 1, 1, 1, 1, 1))
+            self.assertEqual(
+                (
+                    migrated.life_growth,
+                    migrated.mana_growth,
+                    migrated.advanced_speed,
+                    migrated.advanced_luck,
+                ),
+                (100, 100, 100, 100),
+            )
+            self.assertEqual(migrated.skill_points, 6)
+            self.assertEqual((migrated.wins, migrated.losses), (9, 4))
+            self.assertEqual(len(await equipment.list_items(user.id)), len(items))
+            self.assertTrue(os.path.exists(backup_path))
+            backup = sqlite3.connect(backup_path)
+            try:
+                backed_up = backup.execute(
+                    "SELECT hp, atk, defense, speed, luck, willpower FROM users WHERE id = ?",
+                    (user.id,),
+                ).fetchone()
+            finally:
+                backup.close()
+            self.assertEqual(backed_up, (18, 12, 13, 14, 15, 16))
+
+            async with await connect_db(migration_path) as db:
+                progress = await AttributeService().progress_in_db(db, user.id)
+                cursor = await db.execute(
+                    """
+                    SELECT frozen_stats_json, frozen_stat_points,
+                           frozen_skill_points
+                    FROM level_freezes
+                    WHERE user_pk = ? AND status = 'frozen'
+                    """,
+                    (user.id,),
+                )
+                frozen = await cursor.fetchone()
+                await cursor.close()
+                await db.execute(
+                    "UPDATE users SET hp = 2 WHERE id = ?",
+                    (user.id,),
+                )
+                await db.commit()
+            self.assertTrue(
+                all(item.exp == 0 and item.potential == 100 for item in progress.values())
+            )
+            self.assertEqual(frozen["frozen_stats_json"], "{}")
+            self.assertEqual(frozen["frozen_stat_points"], 1)
+            self.assertEqual(frozen["frozen_skill_points"], 2)
+
+            await init_db(migration_path)
+            self.assertEqual((await users.get_user_by_pk(user.id)).strength, 2)
+        finally:
+            if os.path.exists(migration_path):
+                os.remove(migration_path)
+            if os.path.exists(backup_path):
+                os.remove(backup_path)
 
     async def test_snapshot_contains_resources_and_independent_action_speed(self):
         first = await self._snapshot()
@@ -140,7 +286,13 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
     def test_skill_caps_use_governing_attribute_and_global_magic(self):
         base = PrimaryAttributes(10, 5, 5, 5, 5, 5)
         magical = replace(base, magic=25)
-        self.assertEqual(skill_level_cap(base, ("strength",)), 42)
+        self.assertEqual(skill_level_cap(base, ("strength",)), 29)
+        self.assertEqual(
+            skill_level_cap(base, ("constitution",), "healing"), 5
+        )
+        self.assertEqual(
+            skill_level_cap(base, ("willpower",), "meditation"), 5
+        )
         self.assertGreater(
             skill_level_cap(magical, ("strength",)),
             skill_level_cap(base, ("strength",)),
@@ -150,7 +302,7 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
             skill_level_cap(base, ("dexterity",)),
         )
 
-    async def test_magic_increases_future_level_skill_points(self):
+    async def test_future_level_skill_points_are_fixed(self):
         async with await connect_db(self.db_path) as db:
             await db.execute(
                 "UPDATE users SET luck = 50 WHERE id = ?", (self.user.id,)
@@ -160,10 +312,12 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
         async with await connect_db(self.db_path) as db:
             result = await self.users.add_exp_in_db(db, self.user, 100)
             await db.commit()
-        self.assertEqual(result.level_ups[0].skill_points_gain, 3)
-        self.assertEqual(result.user.skill_points, 3)
+        self.assertEqual(result.level_ups[0].skill_points_gain, 1)
+        self.assertEqual(result.user.skill_points, 1)
+        self.assertEqual(result.level_ups[0].stat_points_gain, 1)
+        self.assertEqual(result.level_ups[0].auto_growth, {})
 
-    async def test_magic_bonus_skill_points_freeze_and_restore_with_level(self):
+    async def test_fixed_skill_points_freeze_and_restore_with_level(self):
         async with await connect_db(self.db_path) as db:
             await db.execute(
                 "UPDATE users SET luck = 50 WHERE id = ?", (self.user.id,)
@@ -177,9 +331,9 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
                 db, downgraded.user, 1
             )
             await db.commit()
-        self.assertEqual(downgraded.level_downs[0].frozen_skill_points, 3)
+        self.assertEqual(downgraded.level_downs[0].frozen_skill_points, 1)
         self.assertEqual(downgraded.user.skill_points, 0)
-        self.assertEqual(restored.user.skill_points, 3)
+        self.assertEqual(restored.user.skill_points, 1)
         self.assertTrue(restored.level_ups[0].restored_from_freeze)
     async def test_will_and_potential_drive_attribute_growth(self):
         await self.skills.get_skills(self.user)
@@ -188,7 +342,7 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
             await db.execute(
                 """
                 UPDATE user_attribute_progress
-                SET exp = 299, potential = 100
+                SET exp = 119, potential = 100
                 WHERE user_pk = ? AND attribute_id = 'strength'
                 """,
                 (self.user.id,),
@@ -198,9 +352,9 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
             )
             await db.commit()
         strength = next(item for item in growth if item.attribute_id == "strength")
-        self.assertEqual(strength.exp_gain, 21)
-        self.assertEqual(strength.from_value, 10)
-        self.assertEqual(strength.to_value, 11)
+        self.assertEqual(strength.exp_gain, 20)
+        self.assertEqual(strength.from_value, 1)
+        self.assertEqual(strength.to_value, 2)
         self.assertEqual(strength.potential_after, 50)
 
     async def test_successful_checkin_restores_each_attribute_potential_once(self):
@@ -233,7 +387,7 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
         )
         resistant_defense = replace(
             snapshot.derived,
-            resistances={key: 0.5 for key in DAMAGE_TYPES},
+            resistances={key: 50.0 for key in DAMAGE_TYPES},
         )
         attacker = replace(
             snapshot, user_pk=1, name="攻击者", derived=attacker_derived
@@ -267,7 +421,7 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
                 resistant_hit.damage_breakdown[damage_type],
                 open_hit.damage_breakdown[damage_type],
             )
-            self.assertEqual(elemental_multiplier(0.5), 0.5)
+            self.assertEqual(elemental_multiplier(50, 10), 0.5)
 
 
 if __name__ == "__main__":

@@ -7,12 +7,12 @@ INITIAL_TOTAL_EXP = 0
 INITIAL_STAT_POINTS = 0
 
 INITIAL_STATS = {
-    "strength": 10,
-    "constitution": 5,
-    "dexterity": 5,
-    "perception": 5,
-    "magic": 5,
-    "willpower": 5,
+    "strength": 1,
+    "constitution": 1,
+    "dexterity": 1,
+    "perception": 1,
+    "magic": 1,
+    "willpower": 1,
 }
 
 STAT_LABELS = {
@@ -42,11 +42,8 @@ STAT_ALIASES = {
 
 LEVEL_EXP_BASE = 100
 LEVEL_EXP_GROWTH = 1.18
-STAT_POINTS_PER_LEVEL = 3
-
-AUTO_GROWTH_STAT_COUNT_RANGE = (2, 3)
-AUTO_GROWTH_RANGES = {name: (1, 2) for name in INITIAL_STATS}
-STAT_POINT_RANGES = {name: (1, 2) for name in INITIAL_STATS}
+STAT_POINTS_PER_LEVEL = 1
+SKILL_POINTS_PER_LEVEL = 1
 CHECKIN_ROLL_EXP_RANGE = (1, 100)
 CHECKIN_FALLBACK_THRESHOLD_RATE = 0.10
 CHECKIN_FALLBACK_EXP_RATE_RANGE = (0.08, 0.12)

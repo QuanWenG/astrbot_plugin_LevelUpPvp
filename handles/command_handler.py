@@ -74,7 +74,15 @@ SLASH_CHALLENGE_COMMAND_PATTERN = re.compile(r"^/挑战(?:\s|$)")
 MODIFY_REGISTER_COMMAND_PATTERN = re.compile(r"^/?修改登记(?:\s|$)")
 SLASH_CHECKIN_COMMAND_PATTERN = re.compile(r"^/签到(?:\s|$)")
 CHECKIN_COMMAND_PATTERN = re.compile(r"^/?签到(?:\s|$)")
-REGISTRATION_REQUIRED_MESSAGE = "请先使用 /登记 昵称 完成昵称登记后再使用本插件指令。"
+MENTION_MARKUP_PATTERN = re.compile(
+    r"(?:<@!?(?P<legacy_id>[^>\s]+)>|"
+    r"<qqbot-at-user\b[^>]*\bid\s*=\s*[\"']?"
+    r"(?P<qqbot_id>[^\"'\s/>]+)[\"']?[^>]*/?>)",
+    re.IGNORECASE,
+)
+REGISTRATION_REQUIRED_MESSAGE = (
+    "当前消息未携带平台用户名，暂时无法自动登记，请稍后再试。"
+)
 ADMIN_REQUIRED_MESSAGE = "只有 AstrBot 管理员可以使用该指令。"
 class LevelUpPvpCommandHandler:
     def __init__(
@@ -169,6 +177,25 @@ class LevelUpPvpCommandHandler:
         except Exception:
             logger.exception("LevelUpPvp automatic check-in failed")
 
+    async def ensure_sender_registered(self, event: AstrMessageEvent) -> bool:
+        """Silently register a new group member from the platform username."""
+        identity = self._identity_from_event(event)
+        nickname = " ".join((event.get_sender_name() or "").split())
+        if (
+            not identity.group_id
+            or not identity.user_id
+            or nickname in {"", identity.user_id, "未知用户"}
+        ):
+            return False
+        try:
+            if await self.user_service.has_registered_nickname(identity):
+                return True
+            await self.user_service.register_nickname(identity, nickname)
+            return True
+        except Exception:
+            logger.exception("LevelUpPvp automatic nickname registration failed")
+            return False
+
     def is_auto_checkin_event(self, event: AstrMessageEvent) -> bool:
         group_id = event.get_group_id()
         sender_id = event.get_sender_id()
@@ -242,14 +269,13 @@ class LevelUpPvpCommandHandler:
                 amount,
             )
             label = config.STAT_LABELS[result.stat_name]
-            rolls = " + ".join(str(item) for item in result.rolls)
             yield await self.reply_text(
                 event,
                 "\n".join(
                     [
                         f"加点成功：{label} +{result.total_gain}",
                         f"消耗属性点：{result.points_spent}",
-                        f"随机结果：{rolls}",
+                        "换算规则：1 属性点 = 1 主属性",
                         f"剩余属性点：{result.user.stat_points}",
                         self._format_stats(result.user),
                     ]
@@ -625,8 +651,12 @@ class LevelUpPvpCommandHandler:
         event: AstrMessageEvent,
         nickname: str = "",
     ) -> AsyncGenerator:
+        nickname = " ".join((nickname or event.get_sender_name() or "").split())
         if not nickname:
-            yield await self.reply_text(event, "用法：/登记 昵称")
+            yield await self.reply_text(
+                event,
+                "当前消息未携带平台用户名，无法自动登记。",
+            )
             return
         try:
             user = await self.user_service.register_nickname(
@@ -679,7 +709,7 @@ class LevelUpPvpCommandHandler:
                     event, "请 At 一个要挑战的用户。用法：/挑战 @用户 策略描述"
                 )
                 return
-            if target_identity.user_id == event.get_self_id():
+            if self._is_bot_target_id(event, target_identity.user_id):
                 yield await self.reply_text(event, "不能挑战机器人。")
                 return
 
@@ -750,8 +780,7 @@ class LevelUpPvpCommandHandler:
         return stat_name, amount
 
     async def _registration_error(self, event: AstrMessageEvent) -> str:
-        identity = self._identity_from_event(event)
-        if await self.user_service.has_registered_nickname(identity):
+        if await self.ensure_sender_registered(event):
             return ""
         return REGISTRATION_REQUIRED_MESSAGE
 
@@ -776,14 +805,34 @@ class LevelUpPvpCommandHandler:
             nickname=event.get_sender_name() or event.get_sender_id() or "未知用户",
         )
 
+    def _is_bot_target_id(self, event: AstrMessageEvent, target_id: str) -> bool:
+        """Account for QQ Official events that expose the target At as self_id."""
+        if str(target_id) in {"qq_official", "unknown_selfid"}:
+            return True
+        self_id = str(event.get_self_id() or "")
+        if str(target_id) != self_id:
+            return False
+        if (event.get_platform_name() or "") != "qq_official":
+            return True
+
+        message = (event.get_message_str() or "").strip()
+        is_challenge = any(word in message for word in CHALLENGE_WAKE_WORDS)
+        if not is_challenge:
+            command_text = self._text_without_mentions(event)
+            is_challenge = CHALLENGE_COMMAND_PATTERN.match(command_text) is not None
+        return not is_challenge
+
     def _target_identity_from_event(self, event: AstrMessageEvent) -> UserIdentity | None:
         sender_id = event.get_sender_id()
-        self_id = event.get_self_id()
         for comp in event.get_messages():
             if not isinstance(comp, At):
                 continue
             target_id = str(comp.qq)
-            if target_id == "all" or target_id == sender_id or target_id == self_id:
+            if (
+                target_id == "all"
+                or target_id == sender_id
+                or self._is_bot_target_id(event, target_id)
+            ):
                 continue
             return UserIdentity(
                 platform=event.get_platform_id() or event.get_platform_name() or "unknown",
@@ -793,8 +842,8 @@ class LevelUpPvpCommandHandler:
             )
         message = event.get_message_str() or ""
         ignored_ids = self._ignored_target_ids(event)
-        for match in re.finditer(r"<@!?([^>\s]+)>", message):
-            target_id = match.group(1).strip()
+        for match in MENTION_MARKUP_PATTERN.finditer(message):
+            target_id = (match.group("legacy_id") or match.group("qqbot_id")).strip()
             if target_id and target_id not in ignored_ids:
                 return UserIdentity(
                     platform=event.get_platform_id() or event.get_platform_name() or "unknown",
@@ -810,8 +859,8 @@ class LevelUpPvpCommandHandler:
         text: str,
     ) -> UserIdentity | None:
         ignored_ids = self._ignored_target_ids(event)
-        for match in re.finditer(r"<@!?([^>\s]+)>", text or ""):
-            target_id = match.group(1).strip()
+        for match in MENTION_MARKUP_PATTERN.finditer(text or ""):
+            target_id = (match.group("legacy_id") or match.group("qqbot_id")).strip()
             if target_id and target_id not in ignored_ids:
                 return UserIdentity(
                     platform=event.get_platform_id() or event.get_platform_name() or "unknown",
@@ -828,8 +877,9 @@ class LevelUpPvpCommandHandler:
                 return True
         message = event.get_message_str() or ""
         return any(
-            match.group(1).strip() in ignored_ids
-            for match in re.finditer(r"<@!?([^>\s]+)>", message)
+            (match.group("legacy_id") or match.group("qqbot_id")).strip()
+            in ignored_ids
+            for match in MENTION_MARKUP_PATTERN.finditer(message)
         )
 
     def _ignored_target_ids(self, event: AstrMessageEvent) -> set[str]:
@@ -838,7 +888,7 @@ class LevelUpPvpCommandHandler:
         ignored_ids = {"all", "qq_official"}
         if sender_id:
             ignored_ids.add(sender_id)
-        if self_id:
+        if self_id and self._is_bot_target_id(event, self_id):
             ignored_ids.add(self_id)
 
         has_self_component = any(
@@ -847,10 +897,12 @@ class LevelUpPvpCommandHandler:
         )
         if has_self_component:
             message = event.get_message_str() or ""
-            match = re.search(r"<@!?([^>\s]+)>", message)
+            match = MENTION_MARKUP_PATTERN.search(message)
             command_index = self._first_command_index(message)
             if match and command_index != -1 and match.start() < command_index:
-                ignored_ids.add(match.group(1).strip())
+                ignored_ids.add(
+                    (match.group("legacy_id") or match.group("qqbot_id")).strip()
+                )
         return ignored_ids
 
     def _first_command_index(self, message: str) -> int:
@@ -863,7 +915,7 @@ class LevelUpPvpCommandHandler:
 
     def _text_without_mentions(self, event: AstrMessageEvent) -> str:
         text = event.get_message_str() or ""
-        text = re.sub(r"<@!?[^>\s]+>", " ", text)
+        text = MENTION_MARKUP_PATTERN.sub(" ", text)
         text = re.sub(r"@\S+", " ", text)
         return " ".join(text.split())
 
@@ -877,6 +929,7 @@ class LevelUpPvpCommandHandler:
         if not text:
             message = event.get_message_str().strip()
             text = CHALLENGE_COMMAND_PATTERN.sub("", message).strip()
+        text = MENTION_MARKUP_PATTERN.sub(" ", text)
         for token in [
             *CHALLENGE_WAKE_WORDS,
             f"<@{target_identity.user_id}>",
@@ -888,7 +941,6 @@ class LevelUpPvpCommandHandler:
         ]:
             if token:
                 text = text.replace(token, " ")
-        text = re.sub(r"<@!?[^>\s]+>", " ", text)
         text = " ".join(text.split())
         text = CHALLENGE_COMMAND_PATTERN.sub("", text).strip()
         text = " ".join(text.split())

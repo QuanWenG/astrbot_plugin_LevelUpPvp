@@ -268,7 +268,7 @@ class SkillService:
             if not skill or not definition or raw <= 0:
                 continue
             level_cap = skill_level_cap(
-                attributes, definition.governing_attributes
+                attributes, definition.governing_attributes, skill_id
             )
             if skill.level >= min(self.MAX_LEVEL, level_cap):
                 continue

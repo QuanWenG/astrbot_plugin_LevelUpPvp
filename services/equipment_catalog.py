@@ -19,8 +19,8 @@ QUALITY_LABELS = {
     "epic": "史诗", "mythic": "传说", "legendary": "传奇",
 }
 QUALITY_MULTIPLIERS = {
-    "common": 1.0, "excellent": 1.10, "rare": 1.25,
-    "epic": 1.45, "mythic": 1.70, "legendary": 1.0,
+    "common": 0.67, "excellent": 0.83, "rare": 1.00,
+    "epic": 1.25, "mythic": 1.40, "legendary": 1.0,
 }
 QUALITY_COLORS = {
     "common": "白色", "excellent": "绿色", "rare": "蓝色",
@@ -89,6 +89,8 @@ class EquipmentFactory:
                     ),
                     value=rng.randint(1, 3),
                 )
+            elif kind.startswith("resistance_"):
+                affix["value"] = rng.randint(10, 50)
             elif kind in {"accuracy", "evasion"} or kind.startswith("damage_"):
                 affix["value"] = rng.randint(1, 5)
             else:

@@ -208,3 +208,6 @@ __marimo__/
 
 # Local unittest SQLite scratch files
 .test_tmp/
+
+# Runtime state belongs in AstrBot data/plugin_data, never in the plugin package.
+/data/

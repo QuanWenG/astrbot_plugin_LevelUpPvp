@@ -167,7 +167,7 @@ class EquipmentSkillSystemTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(build.armor_style, "heavy")
         self.assertTrue(build.overloaded)
-        self.assertEqual(build.weapon_power, 50)
+        self.assertEqual(build.weapon_power, 38.5)
 
         async with await connect_db(self.db_path) as db:
             await db.execute(
@@ -234,7 +234,7 @@ class EquipmentSkillSystemTests(unittest.IsolatedAsyncioTestCase):
             STRATEGY_PROFILES["全力猛攻"],
             17,
         )
-        self.assertEqual(result.engine_version, "sideview-v9")
+        self.assertEqual(result.engine_version, "sideview-v10")
         self.assertTrue(any(event.stamina is not None for event in result.events))
         self.assertTrue(any(event.kind == "skill_use" for event in result.events))
         usage = self.skills.usage_from_simulation(result)

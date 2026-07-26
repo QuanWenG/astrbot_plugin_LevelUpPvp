@@ -295,7 +295,7 @@ class SpellBookPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(learned.success)
         self.assertEqual(learned.chance, 0.95)
         self.assertEqual(learned.spell.spell_id, "mana_storm")
-    async def test_learned_spell_enters_reproducible_v9_simulation(self):
+    async def test_learned_spell_enters_reproducible_v10_simulation(self):
         book = await self.spells.grant_book(self.user.id, "magic_arrow", 1)
         await self.spells.read_book(self.user, book.id, random_seed=1)
         await self.skills.set_active_slot(self.user, 1, "魔法箭")
@@ -313,7 +313,7 @@ class SpellBookPersistenceTests(unittest.IsolatedAsyncioTestCase):
         first = engine.simulate(left, right, profile, profile, 20260722)
         second = engine.simulate(left, right, profile, profile, 20260722)
         self.assertEqual(first.to_dict(), second.to_dict())
-        self.assertEqual(first.engine_version, "sideview-v9")
+        self.assertEqual(first.engine_version, "sideview-v10")
         self.assertTrue(any(event.kind == "spell_cast" for event in first.events))
         profiles = tuple(STRATEGY_PROFILES.values())
         for attacker_index, attacker_profile in enumerate(profiles):
@@ -322,7 +322,7 @@ class SpellBookPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     left, right, attacker_profile, defender_profile,
                     attacker_index * len(profiles) + defender_index,
                 )
-                self.assertEqual(result.engine_version, "sideview-v9")
+                self.assertEqual(result.engine_version, "sideview-v10")
     async def test_battle_settlement_persists_spell_growth_atomically(self):
         book = await self.spells.grant_book(self.user.id, "magic_arrow", 1)
         await self.spells.read_book(self.user, book.id, random_seed=1)

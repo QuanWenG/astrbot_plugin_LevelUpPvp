@@ -196,8 +196,8 @@ class MaterialBuildPersistenceTests(unittest.IsolatedAsyncioTestCase):
         build = self.builds.resolve_equipment(self.user, slots, material_items, skills)
         self.assertEqual(build.advanced_stat_modifiers["life_growth"], 6)
         self.assertEqual(build.skill_modifiers["magic_training"], 2)
-        self.assertAlmostEqual(build.combat_effects["resistance_fire"], 0.25)
-        self.assertAlmostEqual(build.combat_effects["resistance_cold"], 0.25)
+        self.assertAlmostEqual(build.combat_effects["resistance_fire"], 25)
+        self.assertAlmostEqual(build.combat_effects["resistance_cold"], 25)
 
     async def test_growth_changes_hp_mp_speed_but_luck_not_pvp(self):
         skills, _ = await self.skills.get_skills(self.user)
@@ -272,7 +272,7 @@ class MaterialBuildPersistenceTests(unittest.IsolatedAsyncioTestCase):
         engine.ability_runtime.remove_status(state, actor, "floating")
         self.assertEqual(engine._accuracy_multiplier(actor, False), 0.85 * 0.85)
         self.assertEqual(engine._accuracy_multiplier(actor, True), 0.75 * 0.85)
-    async def test_snapshot_serializes_v9_advanced_and_accuracy_data(self):
+    async def test_snapshot_serializes_v10_advanced_and_accuracy_data(self):
         async with await connect_db(self.db_path) as db:
             snapshot = await self.builds.snapshot_in_db(
                 db, self.user, "稳扎稳打"
@@ -285,7 +285,7 @@ class MaterialBuildPersistenceTests(unittest.IsolatedAsyncioTestCase):
             snapshot, snapshot,
             STRATEGY_PROFILES["稳扎稳打"], STRATEGY_PROFILES["稳扎稳打"], 8,
         )
-        self.assertEqual(result.engine_version, "sideview-v9")
+        self.assertEqual(result.engine_version, "sideview-v10")
 
 
 if __name__ == "__main__":

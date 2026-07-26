@@ -78,6 +78,7 @@ class FakeEvent:
         platform="test",
         message="",
         messages=None,
+        sender_name="测试用户",
     ):
         self.group_id = group_id
         self.sender_id = sender_id
@@ -85,6 +86,7 @@ class FakeEvent:
         self.platform = platform
         self.message = message
         self.messages = messages or []
+        self.sender_name = sender_name
 
     def get_group_id(self):
         return self.group_id
@@ -111,7 +113,7 @@ class FakeEvent:
         return self.group_id
 
     def get_sender_name(self):
-        return "测试用户"
+        return self.sender_name
 
     def plain_result(self, text):
         return text
@@ -321,3 +323,280 @@ class LongTextReplyTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await self.handler.reply_text(event, original)
         self.assertEqual(original, result)
+
+
+class NicknameRegistrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_argument_uses_event_sender_name(self):
+        registered_user = _user()
+        registered_user.nickname = "荃翁龟"
+        user_service = types.SimpleNamespace(
+            register_nickname=mock.AsyncMock(return_value=registered_user),
+        )
+        handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=user_service,
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+        )
+        event = FakeEvent(
+            platform="qq_official",
+            sender_id="BC729CFA021694764C24EF8C285DD78B",
+            sender_name="荃翁龟",
+        )
+
+        replies = [reply async for reply in handler.register_nickname(event)]
+
+        self.assertEqual(["登记成功：荃翁龟"], replies)
+        identity, nickname = user_service.register_nickname.await_args.args
+        self.assertEqual("荃翁龟", identity.nickname)
+        self.assertEqual("荃翁龟", nickname)
+
+    async def test_explicit_nickname_remains_an_override(self):
+        registered_user = _user()
+        registered_user.nickname = "自定义昵称"
+        user_service = types.SimpleNamespace(
+            register_nickname=mock.AsyncMock(return_value=registered_user),
+        )
+        handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=user_service,
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+        )
+
+        replies = [
+            reply
+            async for reply in handler.register_nickname(
+                FakeEvent(sender_name="事件用户名"),
+                "自定义昵称",
+            )
+        ]
+
+        self.assertEqual(["登记成功：自定义昵称"], replies)
+        self.assertEqual(
+            "自定义昵称",
+            user_service.register_nickname.await_args.args[1],
+        )
+
+    async def test_missing_event_name_keeps_manual_fallback(self):
+        user_service = types.SimpleNamespace(
+            register_nickname=mock.AsyncMock(),
+        )
+        handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=user_service,
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+        )
+
+        replies = [
+            reply
+            async for reply in handler.register_nickname(
+                FakeEvent(sender_name=""),
+            )
+        ]
+
+        self.assertEqual(
+            ["当前消息未携带平台用户名，无法自动登记。"],
+            replies,
+        )
+        user_service.register_nickname.assert_not_awaited()
+
+
+class AutomaticNicknameRegistrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_group_message_registers_platform_username(self):
+        user_service = types.SimpleNamespace(
+            has_registered_nickname=mock.AsyncMock(return_value=False),
+            register_nickname=mock.AsyncMock(return_value=_user()),
+        )
+        handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=user_service,
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+        )
+        event = FakeEvent(
+            platform="qq_official",
+            sender_id="BC729CFA021694764C24EF8C285DD78B",
+            sender_name="荃翁龟",
+            message="",
+            messages=[object()],
+        )
+
+        self.assertTrue(await handler.ensure_sender_registered(event))
+        identity, nickname = user_service.register_nickname.await_args.args
+        self.assertEqual("BC729CFA021694764C24EF8C285DD78B", identity.user_id)
+        self.assertEqual("荃翁龟", identity.nickname)
+        self.assertEqual("荃翁龟", nickname)
+
+    async def test_existing_registration_is_not_overwritten(self):
+        user_service = types.SimpleNamespace(
+            has_registered_nickname=mock.AsyncMock(return_value=True),
+            register_nickname=mock.AsyncMock(),
+        )
+        handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=user_service,
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+        )
+
+        self.assertTrue(
+            await handler.ensure_sender_registered(
+                FakeEvent(sender_name="平台新名字"),
+            )
+        )
+        user_service.register_nickname.assert_not_awaited()
+
+    async def test_restricted_command_registration_gate_is_automatic(self):
+        user_service = types.SimpleNamespace(
+            has_registered_nickname=mock.AsyncMock(return_value=False),
+            register_nickname=mock.AsyncMock(return_value=_user()),
+        )
+        handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=user_service,
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+        )
+
+        error = await handler._registration_error(
+            FakeEvent(sender_name="荃翁龟"),
+        )
+
+        self.assertEqual("", error)
+        user_service.register_nickname.assert_awaited_once()
+
+    async def test_missing_platform_username_does_not_create_mapping(self):
+        user_service = types.SimpleNamespace(
+            has_registered_nickname=mock.AsyncMock(),
+            register_nickname=mock.AsyncMock(),
+        )
+        handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=user_service,
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+        )
+
+        self.assertFalse(
+            await handler.ensure_sender_registered(
+                FakeEvent(sender_name=""),
+            )
+        )
+        user_service.has_registered_nickname.assert_not_awaited()
+        user_service.register_nickname.assert_not_awaited()
+
+
+class AstrBotMentionCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        self.handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=None,
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+        )
+
+    def test_qqofficial_markup_triggers_alias_challenge(self):
+        event = FakeEvent(
+            platform="qq_official",
+            message='<qqbot-at-user id="target-openid" /> 艾斯比 防守反击',
+            messages=[At("qq_official", "机器人")],
+            self_id="qq_official",
+        )
+
+        self.assertTrue(self.handler.is_alias_challenge_event(event))
+        target = self.handler._target_identity_from_event(event)
+        self.assertIsNotNone(target)
+        self.assertEqual("target-openid", target.user_id)
+        self.assertEqual(
+            "防守反击",
+            self.handler._extract_strategy(event, target, ""),
+        )
+
+    def test_qqofficial_target_at_misreported_as_self_id_still_triggers(self):
+        target_id = "B2DDC6FFD2F562C68CC02CAD749EF622"
+        event = FakeEvent(
+            platform="qq_official",
+            sender_id="BC729CFA021694764C24EF8C285DD78B",
+            self_id=target_id,
+            message="艾斯比",
+            messages=[At(target_id, "")],
+        )
+
+        self.assertTrue(self.handler.is_alias_challenge_event(event))
+        target = self.handler._target_identity_from_event(event)
+        self.assertIsNotNone(target)
+        self.assertEqual(target_id, target.user_id)
+        self.assertFalse(self.handler._is_bot_target_id(event, target.user_id))
+
+    def test_non_qqofficial_self_at_remains_a_bot_target(self):
+        event = FakeEvent(
+            platform="aiocqhttp",
+            self_id="bot-1",
+            message="艾斯比",
+            messages=[At("bot-1", "机器人")],
+        )
+
+        self.assertFalse(self.handler.is_alias_challenge_event(event))
+        self.assertTrue(self.handler._is_bot_target_id(event, "bot-1"))
+
+    def test_qqofficial_markup_supports_bot_mentioned_command(self):
+        event = FakeEvent(
+            platform="qq_official",
+            message=(
+                '<qqbot-at-user id="qq_official" /> 挑战 '
+                '<qqbot-at-user id="target-openid" /> 游走消耗'
+            ),
+            messages=[At("qq_official", "机器人")],
+            self_id="qq_official",
+        )
+
+        self.assertEqual(
+            ("挑战", "游走消耗"),
+            self.handler.parse_mentioned_command(event),
+        )
+        target = self.handler._target_identity_from_event(event)
+        self.assertIsNotNone(target)
+        self.assertEqual("target-openid", target.user_id)
+
+
+class QQOfficialChallengeDispatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_misreported_self_id_reaches_battle_service(self):
+        target_id = "B2DDC6FFD2F562C68CC02CAD749EF622"
+        battle_result = object()
+        user_service = types.SimpleNamespace(
+            has_registered_nickname=mock.AsyncMock(return_value=True),
+        )
+        battle_service = types.SimpleNamespace(
+            battle=mock.AsyncMock(return_value=battle_result),
+        )
+        handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=user_service,
+            checkin_service=None,
+            stat_service=None,
+            battle_service=battle_service,
+        )
+        handler._battle_result = mock.AsyncMock(return_value="战斗已触发")
+        event = FakeEvent(
+            platform="qq_official",
+            sender_id="BC729CFA021694764C24EF8C285DD78B",
+            self_id=target_id,
+            message="艾斯比",
+            messages=[At(target_id, "")],
+        )
+
+        replies = [reply async for reply in handler.challenge(event)]
+
+        self.assertEqual(["战斗已触发"], replies)
+        battle_service.battle.assert_awaited_once()
+        self.assertEqual(target_id, battle_service.battle.await_args.args[1].user_id)

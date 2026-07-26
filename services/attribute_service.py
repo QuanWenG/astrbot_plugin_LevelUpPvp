@@ -12,6 +12,11 @@ try:
         PrimaryAttributes,
     )
     from .db import connect_db
+    from .balance_rules import (
+        attack_mode_attribute,
+        physical_offense_multiplier,
+        resistance_multiplier,
+    )
     from .user_service import utc_now_text
 except ImportError:
     from models.attributes import (
@@ -25,6 +30,11 @@ except ImportError:
         PrimaryAttributes,
     )
     from services.db import connect_db
+    from services.balance_rules import (
+        attack_mode_attribute,
+        physical_offense_multiplier,
+        resistance_multiplier,
+    )
     from services.user_service import utc_now_text
 
 
@@ -123,9 +133,21 @@ def normalize_attribute_id(value: str) -> str | None:
     return aliases.get(normalized)
 
 
-def skill_level_cap(attributes: PrimaryAttributes, governing: tuple[str, ...]) -> int:
+def skill_level_cap(
+    attributes: PrimaryAttributes,
+    governing: tuple[str, ...],
+    skill_id: str = "",
+) -> int:
     primary = max((attributes.get(name) for name in governing), default=0)
-    return min(100, max(1, math.floor(20 + primary * 2 + attributes.magic * 0.5)))
+    cap = min(
+        100,
+        max(1, math.floor(20 + primary * 0.8 + attributes.magic * 0.25)),
+    )
+    if skill_id == "healing":
+        cap = min(cap, max(1, attributes.constitution))
+    elif skill_id == "meditation":
+        cap = min(cap, max(1, attributes.willpower))
+    return cap
 
 
 def attribute_exp_required(attribute_value: int) -> int:
@@ -136,8 +158,9 @@ def training_efficiency(willpower: int) -> float:
     return min(2.0, 1.0 + max(0, willpower) * 0.01)
 
 
-def elemental_multiplier(resistance: float) -> float:
-    return max(0.20, min(1.50, 1.0 - resistance))
+def elemental_multiplier(resistance: float, attacker_level: int = 1) -> float:
+    """Compatibility wrapper for the level-relative resistance-point curve."""
+    return resistance_multiplier(resistance, attacker_level)
 
 
 class AttributeService:
@@ -255,34 +278,57 @@ class AttributeService:
         advanced = advanced or AdvancedAttributes()
         primary = self.weapon_primary(attributes, equipment.weapon_type)
         passives = resolve_passive_bonuses(effective_skills, equipment)
+        attribute_values = {
+            name: attributes.get(name) for name in PRIMARY_ATTRIBUTE_IDS
+        }
+        mode_attribute = attack_mode_attribute(
+            equipment.weapon_mode,
+            equipment.weapon_type,
+            attribute_values,
+        )
+        combat_skill_id = (
+            "marksmanship"
+            if equipment.weapon_type in {"bow", "crossbow", "firearm"}
+            else "tactics"
+        )
+        offense_multiplier = physical_offense_multiplier(
+            weapon_primary=primary,
+            mode_attribute=mode_attribute,
+            combat_skill_level=effective_skills.get(combat_skill_id, 0),
+            weapon_skill_level=effective_skills.get(
+                equipment.weapon_type or "unarmed", 0
+            ),
+            weapon_weight=equipment.weapon_weight,
+            style_multiplier=equipment.damage_multiplier,
+        )
 
         base_hp = (
             50
             + level * 2
-            + attributes.strength * 4
-            + attributes.constitution * 8
-            + attributes.willpower * 3
+            + attributes.strength * 3
+            + attributes.constitution * 7
+            + attributes.willpower * 2
             + effects.get("max_hp", 0)
         )
         max_hp = round(base_hp * advanced.life_growth / 100)
         base_mp = (
             20
             + level
+            + attributes.constitution
             + attributes.perception * 2
-            + attributes.magic * 8
-            + attributes.willpower * 3
+            + attributes.magic * 7
+            + attributes.willpower * 2
             + effects.get("max_mp", 0)
         )
         max_mp = round(base_mp * advanced.mana_growth / 100)
         max_sp = round(
             60
-            + attributes.constitution * 4
+            + attributes.constitution * 3
             + attributes.willpower * 2
             + effects.get("max_sp", 0)
         )
         attack_power = (
             equipment.weapon_power * 3
-            + primary
             + passives.attack_power
             + effects.get("attack_power", 0)
         )
@@ -303,9 +349,9 @@ class AttributeService:
             + effects.get("evasion", 0)
         )
         critical_rate = min(
-            0.25,
-            0.05
-            + attributes.perception * 0.002
+            0.35,
+            0.03
+            + attributes.perception * 0.0015
             + passives.critical_rate
             + effects.get("critical_rate", 0),
         )
@@ -318,9 +364,8 @@ class AttributeService:
         )
         action_speed = max(50.0, min(180.0, equipment.action_speed))
         resistances = {
-            damage_type: max(
-                -0.50,
-                min(0.80, effects.get(f"resistance_{damage_type}", 0.0)),
+            damage_type: float(
+                effects.get(f"resistance_{damage_type}", 0.0)
             )
             for damage_type in DAMAGE_TYPES
         }
@@ -350,9 +395,7 @@ class AttributeService:
             carry_capacity=equipment.carry_capacity,
             physical_accuracy_multiplier=equipment.physical_accuracy_multiplier,
             spell_accuracy_multiplier=equipment.spell_accuracy_multiplier,
-            physical_damage_multiplier=max(
-                0.1, 1.0 + passives.physical_damage_bonus
-            ),
+            physical_damage_multiplier=offense_multiplier,
             hp_regen_per_tick=max(0.0, passives.hp_regen_per_tick),
             mp_regen_per_tick=max(0.0, passives.mp_regen_per_tick),
             healing_power=max(0.0, 1.0 + passives.healing_power_bonus),
