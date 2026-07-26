@@ -25,9 +25,14 @@ def _install_dependency_stubs() -> None:
         def __init__(self, text=""):
             self.text = text
 
+    class Image:
+        def __init__(self, file=""):
+            self.file = file
+
     components.At = At
     components.Node = Node
     components.Plain = Plain
+    components.Image = Image
 
     io_module = types.ModuleType("astrbot.core.utils.io")
     io_module.save_temp_img = lambda image: "temp.png"

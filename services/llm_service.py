@@ -196,10 +196,10 @@ class LLMService:
 
 固定规则：
 - 必须仍然输出 {len(local_battle_log)} 行，顺序与输入完全一致。
-- 每一行的所有昵称、数字和开头 Emoji 必须原样保留。
+- 每一行的所有昵称和数字必须原样保留。
 - 不得增加输入中不存在的伤害、暴击、闪避、技能或移动事件。
 - 最后一行必须明确 {winner_name} 获胜。
-- 每行最多一个 Emoji，不要写胜率、概率、随机值或系统提示。
+- 不要写胜率、概率、随机值或系统提示。
 
 原始战报：
 {numbered_lines}
@@ -220,28 +220,16 @@ class LLMService:
             return []
         if not config.BATTLE_LOG_MIN_LINES <= len(original) <= config.BATTLE_LOG_MAX_LINES:
             return []
-        allowed_emojis = ("⚔️", "🏃", "🛡️", "💥", "✨", "❤️‍🔥", "🏆", "⏱️")
         names = (simulation.attacker.name, simulation.defender.name)
         validated = []
         for raw_line, source_line in zip(candidate, original):
             line = str(raw_line or "").strip()
             if not line or len(line) > 120:
                 return []
-            source_emoji = next(
-                (emoji for emoji in allowed_emojis if source_line.startswith(emoji)),
-                None,
-            )
-            if source_emoji is None or not line.startswith(source_emoji):
-                return []
-            if sum(line.count(emoji) for emoji in allowed_emojis) != 1:
-                return []
-            stripped = line
-            for emoji in allowed_emojis:
-                stripped = stripped.replace(emoji, "")
             if any(
                 0x1F000 <= ord(char) <= 0x1FAFF
                 or 0x2600 <= ord(char) <= 0x27BF
-                for char in stripped
+                for char in line
             ):
                 return []
             if re.findall(r"\d+", line) != re.findall(r"\d+", source_line):

@@ -96,7 +96,7 @@ class SideviewCombatEngineTests(unittest.TestCase):
                 self.assertIn(result.winner_pk, {1, 2})
                 self.assertLessEqual(result.duration_ticks, self.engine.MAX_TICKS)
 
-    def test_report_has_compact_emoji_event_lines(self):
+    def test_report_has_compact_event_lines_without_forced_emoji(self):
         result = self.engine.simulate(
             self.attacker,
             self.defender,
@@ -108,13 +108,21 @@ class SideviewCombatEngineTests(unittest.TestCase):
         self.assertGreaterEqual(len(lines), 6)
         self.assertLessEqual(len(lines), 10)
         allowed = ("⚔️", "🏃", "🛡️", "💥", "✨", "❤️‍🔥", "🏆", "⏱️")
-        for line in lines:
-            self.assertEqual(sum(line.count(emoji) for emoji in allowed), 1)
+        self.assertFalse(any(emoji in "".join(lines) for emoji in allowed))
         self.assertNotIn("Tick", "".join(lines))
         self.assertIn("秒", "".join(lines))
         self.assertIn("击退", "".join(lines))
         self.assertIn("硬直", "".join(lines))
         self.assertIn("攻击方", lines[-1] + "".join(lines))
+
+    def test_image_renderer_keeps_composite_emoji_as_one_text_unit(self):
+        from services.battle_image_renderer import RENDERER_REVISION, _text_units
+
+        self.assertEqual("astrbot-card-v2", RENDERER_REVISION)
+        self.assertEqual(
+            ["甲", "❤️‍🔥", "乙", "⚔️"],
+            _text_units("甲❤️‍🔥乙⚔️"),
+        )
 
 
 if __name__ == "__main__":

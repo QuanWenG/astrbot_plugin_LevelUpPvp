@@ -71,7 +71,86 @@ class SideviewBattleServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["winner_pk"], result.winner.id)
         self.assertTrue(payload["events"])
 
-    async def test_qq_official_uses_plain_text_report(self):
+    async def test_qq_official_uses_image_report(self):
+        class Event:
+            def get_platform_name(self):
+                return "qq_official"
+            def plain_result(self, text):
+                return ("plain", text)
+            def get_self_id(self):
+                return "0"
+            def image_result(self, url):
+                return ("image", url)
+
+        from models.user import User
+        attrs = dict(id=1, platform="test", group_id="g", user_id="a", nickname="Alice",
+                     level=1, exp=0, total_exp=0, stat_points=0, level_up_count=0,
+                     hp=10, atk=5, defense=5, speed=5, luck=5, wins=0, losses=0,
+                     willpower=5, life_growth=100, mana_growth=100, advanced_speed=100,
+                     advanced_luck=100, created_at="", updated_at="",
+                     frozen_stats={}, frozen_stat_points=0, frozen_skill_points=0,
+                     frozen_levels=[], skill_points=0)
+        a = User(**attrs)
+        b = User(**{**attrs, "id": 2, "user_id": "b", "nickname": "Bob"})
+        result = type("Result", (), dict(
+            attacker=a, defender=b, winner=a, loser=b,
+            attacker_strategy="strat", defender_strategy="strat2",
+            attacker_strategy_random=False, defender_strategy_random=False,
+            winner_exp_gain=50, loser_exp_loss=25,
+            battle_log=["line1"], analysis="",
+            level_ups=[], level_downs=[],
+            skill_growths=[], spell_growths=[], attribute_growths=[],
+            simulation=None, is_counterattack=False, source="local",
+        ))
+
+        handler = LevelUpPvpCommandHandler(
+            context=None, user_service=None, checkin_service=None,
+            stat_service=None, battle_service=None,
+        )
+        report_image = object()
+        with unittest.mock.patch(
+            "handles.command_handler.render_battle_report",
+            return_value=report_image,
+        ), unittest.mock.patch(
+            "handles.command_handler.save_temp_img",
+            return_value="temp.png",
+        ) as save_temp_img:
+            result_val = await handler._battle_result(Event(), result)
+        save_temp_img.assert_called_once_with(report_image)
+        self.assertEqual(("image", "temp.png"), result_val)
+
+    async def test_aiocqhttp_forward_contains_image_report(self):
+        class Event:
+            def get_platform_name(self):
+                return "aiocqhttp"
+
+            def get_self_id(self):
+                return "bot"
+
+            def chain_result(self, chain):
+                return chain
+
+        result = await self.service.battle(
+            UserIdentity("test", "group", "attacker", "攻击方"),
+            UserIdentity("test", "group", "defender", "防守方"),
+            "稳扎稳打",
+        )
+        handler = LevelUpPvpCommandHandler(
+            context=None, user_service=None, checkin_service=None,
+            stat_service=None, battle_service=None,
+        )
+
+        with unittest.mock.patch(
+            "handles.command_handler.render_battle_report",
+            return_value=b"png",
+        ):
+            chain = await handler._battle_result(Event(), result)
+
+        self.assertEqual(1, len(chain))
+        self.assertEqual("LevelUpPvp 战报", chain[0].name)
+        self.assertEqual("temp.png", chain[0].content[0].file)
+
+    async def test_image_render_failure_falls_back_to_plain_text(self):
         class Event:
             def get_platform_name(self):
                 return "qq_official"
@@ -79,18 +158,25 @@ class SideviewBattleServiceTests(unittest.IsolatedAsyncioTestCase):
             def plain_result(self, text):
                 return ("plain", text)
 
+        result = await self.service.battle(
+            UserIdentity("test", "group", "attacker", "攻击方"),
+            UserIdentity("test", "group", "defender", "防守方"),
+            "稳扎稳打",
+        )
         handler = LevelUpPvpCommandHandler(
-            context=None,
-            user_service=None,
-            checkin_service=None,
-            stat_service=None,
-            battle_service=None,
+            context=None, user_service=None, checkin_service=None,
+            stat_service=None, battle_service=None,
         )
 
-        self.assertEqual(
-            await handler._battle_result(Event(), "文字战报"),
-            ("plain", "文字战报"),
-        )
+        with unittest.mock.patch(
+            "handles.command_handler.render_battle_report",
+            side_effect=RuntimeError("render failed"),
+        ):
+            result_value = await handler._battle_result(Event(), result)
+
+        self.assertEqual("plain", result_value[0])
+        self.assertIn("战报：", result_value[1])
+
     async def test_formatted_sideview_report_hides_legacy_probability(self):
         result = await self.service.battle(
             UserIdentity("test", "group", "attacker", "攻击方"),
@@ -103,7 +189,8 @@ class SideviewBattleServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("攻击方胜率", text)
         self.assertNotIn("随机值", text)
         self.assertIn("战报：", text)
-        self.assertTrue("🏆" in text or "⏱️" in text)
+        self.assertNotIn("🏆", text)
+        self.assertNotIn("⏱️", text)
 
 
 class SimulationLLMValidationTests(unittest.TestCase):
@@ -124,10 +211,23 @@ class SimulationLLMValidationTests(unittest.TestCase):
         )
         original = BattleReportBuilder().build(simulation)
         service = LLMService()
+        prompt = service._build_simulation_result_prompt(simulation, original)
 
+        self.assertNotIn("Emoji", prompt)
+        self.assertNotIn("emoji", prompt)
         self.assertEqual(
             service._validate_simulation_battle_log(original, original, simulation),
             original,
+        )
+        optional_emoji = list(original)
+        optional_emoji[0] = "⚔️ " + optional_emoji[0]
+        self.assertEqual(
+            service._validate_simulation_battle_log(
+                optional_emoji,
+                original,
+                simulation,
+            ),
+            [],
         )
         changed = list(original)
         changed[1] = changed[1].replace("秒", "999秒", 1)

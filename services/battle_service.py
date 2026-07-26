@@ -187,7 +187,13 @@ class BattleService:
             )
             loser_exp_loss = abs(loser_exp.exp_delta)
             winner_exp_gain = self._winner_exp_gain_from_loss(winner, loser_exp_loss)
-            winner_exp = await self.user_service.add_exp_in_db(db, winner, winner_exp_gain)
+            if winner_exp_gain == 0 and requested_loser_exp_loss > 0:
+                consolation = max(1, min(requested_loser_exp_loss,
+                    round(config.exp_required_for_next_level(winner.level) * 0.02)))
+                winner_exp = await self.user_service.add_exp_in_db(db, winner, consolation)
+                winner_exp_gain = abs(winner_exp.exp_delta)
+            else:
+                winner_exp = await self.user_service.add_exp_in_db(db, winner, winner_exp_gain)
             await self.user_service.increment_battle_stats_in_db(db, winner.id, loser.id)
 
             updated_attacker = await self.user_service.get_user_by_pk_in_db(db, attacker.id)

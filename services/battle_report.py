@@ -35,18 +35,18 @@ class BattleReportBuilder:
         first_attack_tick = attack_events[0].tick if attack_events else result.duration_ticks
         lines = [
             (
-                f"⚔️ {result.attacker.name}以「{result.attacker.strategy}」迎战，"
+                f"{result.attacker.name}以「{result.attacker.strategy}」迎战，"
                 f"{result.defender.name}采用「{result.defender.strategy}」。"
             ),
             (
-                f"🏃 双方沿一维战场接近，在战斗开始后"
+                f"双方沿一维战场接近，在战斗开始后"
                 f"{self._seconds(first_attack_tick)}秒进入交锋距离。"
             ),
         ]
         if damage_events:
-            lines.append(self._damage_line(damage_events[0], names, "💥"))
+            lines.append(self._damage_line(damage_events[0], names))
         else:
-            lines.append("💥 双方始终没有形成有效命中，战局陷入僵持。")
+            lines.append("双方始终没有形成有效命中，战局陷入僵持。")
 
         if ability_events:
             event = ability_events[0]
@@ -54,35 +54,35 @@ class BattleReportBuilder:
             definition = ACTIVE_ABILITY_DEFINITIONS.get(event.skill_id or "")
             ability_name = definition.name if definition else "特殊能力"
             if event.kind == "mana_backlash":
-                lines.append(f"✨ 战斗开始后{self._seconds(event.tick)}秒，{actor}透支施法并承受{event.value}点魔力反噬。")
+                lines.append(f"战斗开始后{self._seconds(event.tick)}秒，{actor}透支施法并承受{event.value}点魔力反噬。")
             else:
                 action = "施放" if definition and definition.ability_type == "spell" else "发动"
-                lines.append(f"✨ 战斗开始后{self._seconds(event.tick)}秒，{actor}{action}「{ability_name}」，战局随之改变。")
+                lines.append(f"战斗开始后{self._seconds(event.tick)}秒，{actor}{action}「{ability_name}」，战局随之改变。")
         if guard_count or evade_count:
-            lines.append(f"🛡️ 全场出现{guard_count}次有效防御、{evade_count}次闪避，攻防节奏反复变化。")
+            lines.append(f"全场出现{guard_count}次有效防御、{evade_count}次闪避，攻防节奏反复变化。")
         else:
-            lines.append("🛡️ 双方没有选择退让，以连续正面交锋争夺主动。")
+            lines.append("双方没有选择退让，以连续正面交锋争夺主动。")
 
         special = next(
             (event for event in damage_events if event.critical or event.guarded),
             damage_events[len(damage_events) // 2] if damage_events else None,
         )
         if special is not None:
-            lines.append(self._damage_line(special, names, "✨"))
+            lines.append(self._damage_line(special, names))
         else:
-            lines.append("✨ 体力差距逐渐显现，最后阶段的每次判断都更加关键。")
+            lines.append("体力差距逐渐显现，最后阶段的每次判断都更加关键。")
 
         if knockback_events:
             knockback = max(knockback_events, key=lambda event: event.value)
             actor = names.get(knockback.actor_pk, "进攻方")
             target = names.get(knockback.target_pk, "防守方")
             lines.append(
-                f"🏃 战斗开始后{self._seconds(knockback.tick)}秒，"
+                f"战斗开始后{self._seconds(knockback.tick)}秒，"
                 f"{target}被{actor}击退{knockback.value}距离并陷入受击硬直。"
             )
 
         lines.append(
-            f"❤️‍🔥 交锋结束时，{result.attacker.name}剩余"
+            f"交锋结束时，{result.attacker.name}剩余"
             f"{result.attacker_remaining_hp}/{result.attacker.max_hp}生命，"
             f"{result.defender.name}剩余{result.defender_remaining_hp}/{result.defender.max_hp}生命；"
             f"双方SP为{result.attacker_remaining_stamina}/{result.defender_remaining_stamina}，"
@@ -90,14 +90,14 @@ class BattleReportBuilder:
         )
         if result.finish_reason == "timeout_hp_ratio":
             lines.append(
-                f"⏱️ 战斗在{self._seconds(result.duration_ticks)}秒时达到上限，"
+                f"战斗在{self._seconds(result.duration_ticks)}秒时达到上限，"
                 f"{winner_name}凭剩余生命比例与有效输出取得裁决胜利。"
             )
         elif result.finish_reason == "double_ko_tiebreak":
-            lines.append(f"🏆 双方在同一时刻倒下，经规则裁决由{winner_name}击败{loser_name}。")
+            lines.append(f"双方在同一时刻倒下，经规则裁决由{winner_name}击败{loser_name}。")
         else:
             lines.append(
-                f"🏆 战斗开始后{self._seconds(result.duration_ticks)}秒，"
+                f"战斗开始后{self._seconds(result.duration_ticks)}秒，"
                 f"{winner_name}完成击倒，战胜{loser_name}。"
             )
         return lines[: self.MAX_LINES]
@@ -106,7 +106,6 @@ class BattleReportBuilder:
         self,
         event: BattleEvent,
         names: dict[int, str],
-        emoji: str,
     ) -> str:
         actor = names.get(event.actor_pk, "进攻方")
         target = names.get(event.target_pk, "防守方")
@@ -128,7 +127,7 @@ class BattleReportBuilder:
             )
             damage_label = f"（{labels}）"
         return (
-            f"{emoji} 战斗开始后{self._seconds(event.tick)}秒，"
+            f"战斗开始后{self._seconds(event.tick)}秒，"
             f"{actor}{action}，造成{event.value}{damage_label}伤害，"
             f"目标剩余{event.remaining_hp}生命。"
         )

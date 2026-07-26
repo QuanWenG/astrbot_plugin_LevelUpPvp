@@ -3,13 +3,28 @@ import inspect
 import re
 from collections.abc import AsyncGenerator
 
-from PIL import Image, ImageDraw
-
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
-from astrbot.api.message_components import At, Node, Plain
+from astrbot.api.message_components import At, Image as MessageImage, Node, Plain
 from astrbot.core.utils.io import save_temp_img
-from astrbot.core.utils.t2i.local_strategy import FontManager
+
+if "." in (__package__ or ""):
+    from ..services.battle_image_renderer import (
+        RENDERER_REVISION,
+        render_battle_report,
+    )
+else:
+    from services.battle_image_renderer import (
+        RENDERER_REVISION,
+        render_battle_report,
+    )
+
+EXPECTED_RENDERER_REVISION = "astrbot-card-v2"
+if RENDERER_REVISION != EXPECTED_RENDERER_REVISION:
+    raise RuntimeError(
+        "LevelUpPvp battle renderer version mismatch: "
+        f"expected {EXPECTED_RENDERER_REVISION}, got {RENDERER_REVISION}"
+    )
 
 try:
     from ..models.equipment import SLOT_LABELS
@@ -208,7 +223,7 @@ class LevelUpPvpCommandHandler:
                 material = material_for(item.material)
                 resolved_weight = actual_weight(item.weight, item.material)
                 lines.append(
-                    f"#{item.id} {QUALITY_LABELS.get(item.quality, item.quality)} {item.name} "
+                    f"No.{item.id} {QUALITY_LABELS.get(item.quality, item.quality)} {item.name} "
                     f"Lv.{item.item_level} {material.name} "
                     f"重量{item.weight:g}×{material.weight_multiplier:g}={resolved_weight:.3f}{mark}"
                 )
@@ -233,7 +248,6 @@ class LevelUpPvpCommandHandler:
             lines.append(f"战斗方式：{self._weapon_mode_label(build.weapon_mode)}")
             lines.append(f"护甲路线：{self._armor_style_label(build.armor_style)} 重量{build.total_weight:.2f}/{build.carry_capacity:.1f}{'（超负重）' if build.overloaded else ''}")
             lines.append(f"命中修正：物理 {build.physical_accuracy_multiplier:.0%} / 法术 {build.spell_accuracy_multiplier:.0%}")
-            lines.append(self._format_advanced_stats(user, build))
             yield event.plain_result("\n".join(lines))
         except Exception as exc: yield event.plain_result(f"查看装备失败：{exc}")
 
@@ -598,14 +612,8 @@ class LevelUpPvpCommandHandler:
                     context=self.context,
                     event=event,
                 )
-                if ticket.position == 1:
-                    yield event.plain_result("\u6311\u6218\u5df2\u8fdb\u5165\u5904\u7406\u961f\u5217\uff0c\u6b63\u5728\u751f\u6210\u6218\u62a5\u2026\u2026")
-                else:
-                    yield event.plain_result(
-                        f"\u6311\u6218\u5df2\u8fdb\u5165\u5904\u7406\u961f\u5217\uff0c\u5f53\u524d\u6392\u4f4d {ticket.position}\uff0c\u8bf7\u7a0d\u5019\u2026\u2026"
-                    )
                 result = await ticket.result()
-            yield await self._battle_result(event, self._format_battle_result(result))
+            yield await self._battle_result(event, result)
         except Exception as exc:
             logger.exception("LevelUpPvp battle failed")
             yield event.plain_result(f"挑战失败：{exc}")
@@ -1004,46 +1012,57 @@ class LevelUpPvpCommandHandler:
             lines.append(self._format_level_ups(result.level_ups))
         if result.level_downs:
             lines.append(self._format_level_downs(result.level_downs))
-        if result.skill_growths:
+        skill_levelups = [item for item in (result.skill_growths or []) if item.to_level > item.from_level]
+        if skill_levelups:
             growth = " / ".join(
-                f"{attacker_name if item.user_pk == result.attacker.id else defender_name}·{item.skill_name}+{item.exp_gain}EXP"
-                + (f"→Lv.{item.to_level}" if item.to_level > item.from_level else "")
-                for item in result.skill_growths[:10]
+                f"{attacker_name if item.user_pk == result.attacker.id else defender_name}·{item.skill_name} Lv.{item.from_level}→{item.to_level}"
+                for item in skill_levelups[:10]
             )
-            lines.append("技能成长：" + growth)
-        if result.spell_growths:
-            lines.append("法术成长：")
+            lines.append("技能升级：" + growth)
+        spell_levelups = [item for item in (result.spell_growths or []) if item.to_level > item.from_level]
+        if spell_levelups:
+            lines.append("法术升级：")
             lines.extend(
-                f"- {item.spell_name} +{item.exp_gain} EXP"
-                + (f"，Lv.{item.from_level}→{item.to_level}" if item.to_level > item.from_level else "")
-                for item in result.spell_growths[:10]
+                f"- {item.spell_name} Lv.{item.from_level}→{item.to_level}"
+                for item in spell_levelups[:10]
             )
-        if result.attribute_growths:
+        attr_levelups = [item for item in (result.attribute_growths or []) if item.to_value > item.from_value]
+        if attr_levelups:
             growth = " / ".join(
                 f"{attacker_name if item.user_pk == result.attacker.id else defender_name}·"
-                f"{ATTRIBUTE_LABELS[item.attribute_id]}+{item.exp_gain}EXP"
-                + (
-                    f"→{item.to_value}"
-                    if item.to_value > item.from_value else ""
-                )
-                for item in result.attribute_growths[:8]
+                f"{ATTRIBUTE_LABELS[item.attribute_id]} {item.from_value}→{item.to_value}"
+                for item in attr_levelups[:8]
             )
-            lines.append("属性成长：" + growth)
+            lines.append("属性提升：" + growth)
         lines.append("结果：" + ("攻击方获胜" if winner_is_attacker else "防守方获胜"))
         return "\n".join(lines)
 
-    async def _battle_result(self, event: AstrMessageEvent, text: str):
-        """发送纯文字战报；OneBot 使用折叠消息避免刷屏。"""
+    async def _battle_result(self, event: AstrMessageEvent, result):
+        """生成图片战报并发送，渲染失败时回退为纯文字。"""
         platform_name = event.get_platform_name() or ""
 
-        if platform_name == "aiocqhttp":
-            node = Node(
-                uin=event.get_self_id() or "0",
-                name="LevelUpPvp 战报",
-                content=[Plain(text)],
-            )
-            return event.chain_result([node])
-        return event.plain_result(text)
+        try:
+            report_image = render_battle_report(result)
+            file_url = save_temp_img(report_image)
+            if platform_name == "aiocqhttp":
+                node = Node(
+                    uin=event.get_self_id() or "0",
+                    name="LevelUpPvp 战报",
+                    content=[MessageImage(file=file_url)],
+                )
+                return event.chain_result([node])
+            return event.image_result(file_url)
+        except Exception as exc:
+            logger.exception("LevelUpPvp battle report image render failed")
+            text = self._format_battle_result(result)
+            if platform_name == "aiocqhttp":
+                node = Node(
+                    uin=event.get_self_id() or "0",
+                    name="LevelUpPvp 战报",
+                    content=[Plain(text)],
+                )
+                return event.chain_result([node])
+            return event.plain_result(text)
 
     def _display_name(self, user: User) -> str:
         name = user.nickname or user.user_id
