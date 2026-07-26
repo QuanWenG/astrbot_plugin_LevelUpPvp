@@ -150,7 +150,42 @@ class SideviewBattleServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("LevelUpPvp 战报", chain[0].name)
         self.assertEqual("temp.png", chain[0].content[0].file)
 
-    async def test_image_render_failure_falls_back_to_plain_text(self):
+    async def test_battle_renderer_failure_uses_generic_text_image(self):
+        class Event:
+            def get_platform_name(self):
+                return "qq_official"
+
+            def plain_result(self, text):
+                return ("plain", text)
+
+            def image_result(self, url):
+                return ("image", url)
+
+        result = await self.service.battle(
+            UserIdentity("test", "group", "attacker", "攻击方"),
+            UserIdentity("test", "group", "defender", "防守方"),
+            "稳扎稳打",
+        )
+        handler = LevelUpPvpCommandHandler(
+            context=None, user_service=None, checkin_service=None,
+            stat_service=None, battle_service=None,
+        )
+
+        with unittest.mock.patch(
+            "handles.command_handler.render_battle_report",
+            side_effect=RuntimeError("render failed"),
+        ), unittest.mock.patch(
+            "handles.command_handler.render_text_card",
+            return_value=object(),
+        ), unittest.mock.patch(
+            "handles.command_handler.save_temp_img",
+            return_value="generic.png",
+        ):
+            result_value = await handler._battle_result(Event(), result)
+
+        self.assertEqual(("image", "generic.png"), result_value)
+
+    async def test_all_image_rendering_failures_fall_back_to_plain_text(self):
         class Event:
             def get_platform_name(self):
                 return "qq_official"
@@ -170,7 +205,10 @@ class SideviewBattleServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with unittest.mock.patch(
             "handles.command_handler.render_battle_report",
-            side_effect=RuntimeError("render failed"),
+            side_effect=RuntimeError("battle render failed"),
+        ), unittest.mock.patch(
+            "handles.command_handler.render_text_card",
+            side_effect=RuntimeError("generic render failed"),
         ):
             result_value = await handler._battle_result(Event(), result)
 

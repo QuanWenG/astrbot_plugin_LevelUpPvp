@@ -118,7 +118,7 @@ class SideviewCombatEngineTests(unittest.TestCase):
     def test_image_renderer_keeps_composite_emoji_as_one_text_unit(self):
         from services.battle_image_renderer import RENDERER_REVISION, _text_units
 
-        self.assertEqual("astrbot-card-v2", RENDERER_REVISION)
+        self.assertEqual("astrbot-card-v3-light", RENDERER_REVISION)
         self.assertEqual(
             ["甲", "❤️‍🔥", "乙", "⚔️"],
             _text_units("甲❤️‍🔥乙⚔️"),

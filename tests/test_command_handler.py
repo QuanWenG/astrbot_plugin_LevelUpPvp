@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 def _install_dependency_stubs() -> None:
@@ -74,12 +75,14 @@ class FakeEvent:
         group_id="group-1",
         sender_id="user-1",
         self_id="bot-1",
+        platform="test",
         message="",
         messages=None,
     ):
         self.group_id = group_id
         self.sender_id = sender_id
         self.self_id = self_id
+        self.platform = platform
         self.message = message
         self.messages = messages or []
 
@@ -102,7 +105,7 @@ class FakeEvent:
         return "test"
 
     def get_platform_name(self):
-        return "test"
+        return self.platform
 
     def get_session_id(self):
         return self.group_id
@@ -112,6 +115,12 @@ class FakeEvent:
 
     def plain_result(self, text):
         return text
+
+    def image_result(self, url):
+        return ("image", url)
+
+    def chain_result(self, chain):
+        return chain
 
 
 class FakeCheckinService:
@@ -238,3 +247,77 @@ class AutoCheckinHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("今日签到经验：20", replies[0])
         self.assertIn("连续签到：1 天", replies[0])
         self.assertIn("等级：Lv.1 经验：20/100", replies[0])
+
+
+class LongTextReplyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=None,
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+        )
+
+    async def test_five_lines_and_239_characters_stay_plain(self):
+        event = FakeEvent()
+
+        five_lines = "\n".join(["短"] * 5)
+        result = await self.handler.reply_text(event, five_lines)
+        self.assertEqual(five_lines, result)
+
+        text_239 = "文" * 239
+        result = await self.handler.reply_text(event, text_239)
+        self.assertEqual(text_239, result)
+
+    async def test_six_lines_or_240_characters_render_as_image(self):
+        event = FakeEvent()
+        rendered = object()
+        with mock.patch(
+            "handles.command_handler.render_text_card",
+            return_value=rendered,
+        ) as render, mock.patch(
+            "handles.command_handler.save_temp_img",
+            return_value="reply.png",
+        ):
+            six_lines = "\n".join(["内容"] * 6)
+            result = await self.handler.reply_text(event, six_lines, "测试")
+            self.assertEqual(("image", "reply.png"), result)
+            render.assert_called_once_with(six_lines, title="测试")
+
+        with mock.patch(
+            "handles.command_handler.render_text_card",
+            return_value=rendered,
+        ), mock.patch(
+            "handles.command_handler.save_temp_img",
+            return_value="reply.png",
+        ):
+            result = await self.handler.reply_text(event, "文" * 240)
+            self.assertEqual(("image", "reply.png"), result)
+
+    async def test_aiocqhttp_uses_one_forward_image_node(self):
+        event = FakeEvent(platform="aiocqhttp")
+        with mock.patch(
+            "handles.command_handler.render_text_card",
+            return_value=object(),
+        ), mock.patch(
+            "handles.command_handler.save_temp_img",
+            return_value="reply.png",
+        ):
+            result = await self.handler.reply_text(
+                event, "\n".join(["内容"] * 6), "LevelUpPvp 面板"
+            )
+
+        self.assertEqual(1, len(result))
+        self.assertEqual("LevelUpPvp 面板", result[0].name)
+        self.assertEqual("reply.png", result[0].content[0].file)
+
+    async def test_render_failure_falls_back_to_exact_original_text(self):
+        event = FakeEvent()
+        original = "第一行\n" + "很长的正文" * 60
+        with mock.patch(
+            "handles.command_handler.render_text_card",
+            side_effect=RuntimeError("render failed"),
+        ):
+            result = await self.handler.reply_text(event, original)
+        self.assertEqual(original, result)

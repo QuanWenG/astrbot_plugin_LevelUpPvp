@@ -1,166 +1,44 @@
-"""Render a compact battle report with an AstrBot-inspired card layout."""
+"""Render a compact battle report with the shared LevelUpPvp light theme."""
 
-import os
-
-try:
-    from astrbot.core.utils.t2i.local_strategy import FontManager
-except ImportError:
-    FontManager = None
-
-
-WIDTH = 760
-PAGE_PADDING = 28
-CARD_PADDING = 20
-SECTION_GAP = 16
-RENDERER_REVISION = "astrbot-card-v2"
-SUPPORTED_EMOJIS = ("❤️‍🔥", "⚔️", "🛡️", "⏱️", "🏃", "💥", "✨", "🏆")
-
-COLORS = {
-    "page_top": (27, 27, 31),
-    "page_bottom": (22, 22, 24),
-    "card": (32, 33, 39),
-    "card_alt": (29, 30, 36),
-    "border": (60, 63, 68),
-    "divider": (46, 46, 50),
-    "text": (223, 223, 214),
-    "text_2": (152, 152, 159),
-    "text_3": (106, 106, 113),
-    "brand": (168, 177, 255),
-    "brand_strong": (92, 115, 231),
-    "brand_soft": (45, 48, 76),
-    "attacker": (99, 179, 237),
-    "defender": (245, 166, 100),
-    "winner": (250, 204, 92),
-    "hp": (66, 184, 131),
-    "mp": (88, 142, 255),
-    "sp": (232, 183, 72),
-    "bar_bg": (48, 49, 57),
-    "positive": (74, 201, 141),
-    "negative": (239, 112, 112),
-}
+if "." in (__package__ or ""):
+    from .image_renderer import (
+        CARD_PADDING,
+        COLORS,
+        PAGE_PADDING,
+        SECTION_GAP,
+        WIDTH,
+        _draw_page_header,
+        _draw_text,
+        _fit_text,
+        _line_height,
+        _load_emoji_font,
+        _load_font,
+        _rounded_card,
+        _text_units,
+        _text_width,
+        _wrap_text,
+    )
+else:
+    from services.image_renderer import (
+        CARD_PADDING,
+        COLORS,
+        PAGE_PADDING,
+        SECTION_GAP,
+        WIDTH,
+        _draw_page_header,
+        _draw_text,
+        _fit_text,
+        _line_height,
+        _load_emoji_font,
+        _load_font,
+        _rounded_card,
+        _text_units,
+        _text_width,
+        _wrap_text,
+    )
 
 
-def _load_font(size: int, bold: bool = False):
-    from PIL import ImageFont
-
-    candidates = [
-        "C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/simhei.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
-        if bold
-        else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-        "/System/Library/Fonts/PingFang.ttc",
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except (OSError, ValueError):
-                pass
-    if FontManager is not None:
-        try:
-            font = FontManager.get_font(size)
-            if font is not None:
-                return font
-        except Exception:
-            pass
-    return ImageFont.load_default()
-
-
-def _load_emoji_font(size: int):
-    from PIL import ImageFont
-
-    candidates = [
-        "C:/Windows/Fonts/seguiemj.ttf",
-        "/System/Library/Fonts/Apple Color Emoji.ttc",
-        "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
-        "/usr/share/fonts/noto/NotoEmoji-Regular.ttf",
-        "NotoEmoji-Regular.ttf",
-        "Symbola.ttf",
-    ]
-    for path in candidates:
-        try:
-            return ImageFont.truetype(path, size)
-        except (OSError, ValueError):
-            continue
-    return None
-
-
-def _text_units(text: str) -> list[str]:
-    """Keep supported multi-codepoint emoji sequences intact."""
-    units = []
-    index = 0
-    while index < len(text):
-        emoji = next(
-            (item for item in SUPPORTED_EMOJIS if text.startswith(item, index)),
-            None,
-        )
-        if emoji:
-            units.append(emoji)
-            index += len(emoji)
-        else:
-            units.append(text[index])
-            index += 1
-    return units
-
-
-def _text_width(draw, text: str, font, emoji_font=None) -> int:
-    width = 0
-    for unit in _text_units(str(text)):
-        unit_font = emoji_font if emoji_font and unit in SUPPORTED_EMOJIS else font
-        bbox = draw.textbbox((0, 0), unit, font=unit_font)
-        width += bbox[2] - bbox[0]
-    return width
-
-
-def _line_height(font) -> int:
-    bbox = font.getbbox("测Ag")
-    return max(1, bbox[3] - bbox[1])
-
-
-def _draw_text(draw, position, text: str, font, fill, emoji_font=None) -> None:
-    x, y = position
-    for unit in _text_units(str(text)):
-        is_emoji = emoji_font is not None and unit in SUPPORTED_EMOJIS
-        unit_font = emoji_font if is_emoji else font
-        kwargs = {"font": unit_font, "fill": fill}
-        if is_emoji:
-            kwargs["embedded_color"] = True
-        try:
-            draw.text((x, y), unit, **kwargs)
-        except (OSError, ValueError):
-            kwargs.pop("embedded_color", None)
-            kwargs["font"] = font
-            draw.text((x, y), unit, **kwargs)
-            unit_font = font
-        bbox = draw.textbbox((0, 0), unit, font=unit_font)
-        x += bbox[2] - bbox[0]
-
-
-def _wrap_text(draw, text: str, font, max_width: int, emoji_font=None) -> list[str]:
-    lines = []
-    current = ""
-    for unit in _text_units(str(text)):
-        candidate = current + unit
-        if current and _text_width(draw, candidate, font, emoji_font) > max_width:
-            lines.append(current)
-            current = unit
-        else:
-            current = candidate
-    if current:
-        lines.append(current)
-    return lines or [""]
-
-
-def _fit_text(draw, text: str, font, max_width: int) -> str:
-    text = str(text)
-    if _text_width(draw, text, font) <= max_width:
-        return text
-    suffix = "…"
-    while text and _text_width(draw, text + suffix, font) > max_width:
-        text = text[:-1]
-    return text + suffix
+RENDERER_REVISION = "astrbot-card-v3-light"
 
 
 def _display_name(user) -> str:
@@ -168,30 +46,6 @@ def _display_name(user) -> str:
     if name == user.user_id and len(name) > 8:
         return f"{name[:3]}...{name[-2:]}"
     return name
-
-
-def _rounded_card(draw, box, fill=None) -> None:
-    draw.rounded_rectangle(
-        box,
-        radius=12,
-        fill=fill or COLORS["card"],
-        outline=COLORS["border"],
-        width=1,
-    )
-
-
-def _draw_gradient(image) -> None:
-    from PIL import ImageDraw
-
-    draw = ImageDraw.Draw(image)
-    height = image.height
-    for y in range(height):
-        ratio = y / max(1, height - 1)
-        color = tuple(
-            round(top + (bottom - top) * ratio)
-            for top, bottom in zip(COLORS["page_top"], COLORS["page_bottom"])
-        )
-        draw.line((0, y, image.width, y), fill=color)
 
 
 def _draw_bar(
@@ -332,35 +186,13 @@ def render_battle_report(result, max_log_lines: int = 8):
         + PAGE_PADDING
     )
 
-    image = Image.new("RGB", (WIDTH, total_height), COLORS["page_top"])
-    _draw_gradient(image)
+    image = Image.new("RGB", (WIDTH, total_height), COLORS["page"])
     draw = ImageDraw.Draw(image)
-
-    draw.rectangle((0, 0, WIDTH, nav_height), fill=(24, 24, 27))
-    draw.line(
-        (0, nav_height - 1, WIDTH, nav_height - 1),
-        fill=COLORS["divider"],
-        width=1,
-    )
-    draw.rounded_rectangle(
-        (PAGE_PADDING, 18, PAGE_PADDING + 32, 50),
-        radius=8,
-        fill=COLORS["brand_strong"],
-    )
-    draw.text((PAGE_PADDING + 10, 22), "L", font=font_nav, fill=(255, 255, 255))
-    draw.text(
-        (PAGE_PADDING + 44, 23),
-        "LevelUpPvp",
-        font=font_nav,
-        fill=COLORS["text"],
-    )
-    nav_label = "战斗结算 · V2"
-    nav_label_width = _text_width(draw, nav_label, font_small)
-    draw.text(
-        (WIDTH - PAGE_PADDING - nav_label_width, 25),
-        nav_label,
-        font=font_small,
-        fill=COLORS["text_2"],
+    _draw_page_header(
+        draw,
+        title="LevelUpPvp",
+        label="战斗结算 · V3",
+        height=nav_height,
     )
 
     y = nav_height + PAGE_PADDING

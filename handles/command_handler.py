@@ -5,7 +5,7 @@ from collections.abc import AsyncGenerator
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
-from astrbot.api.message_components import At, Image as MessageImage, Node, Plain
+from astrbot.api.message_components import At, Image as MessageImage, Node
 from astrbot.core.utils.io import save_temp_img
 
 if "." in (__package__ or ""):
@@ -13,13 +13,17 @@ if "." in (__package__ or ""):
         RENDERER_REVISION,
         render_battle_report,
     )
+    from ..services.image_renderer import render_text_card
 else:
     from services.battle_image_renderer import (
         RENDERER_REVISION,
         render_battle_report,
     )
+    from services.image_renderer import render_text_card
 
-EXPECTED_RENDERER_REVISION = "astrbot-card-v2"
+EXPECTED_RENDERER_REVISION = "astrbot-card-v3-light"
+LONG_TEXT_LINE_THRESHOLD = 6
+LONG_TEXT_CHAR_THRESHOLD = 240
 if RENDERER_REVISION != EXPECTED_RENDERER_REVISION:
     raise RuntimeError(
         "LevelUpPvp battle renderer version mismatch: "
@@ -100,17 +104,56 @@ class LevelUpPvpCommandHandler:
         self.attribute_service = attribute_service
         self.spell_service = spell_service
 
+    @staticmethod
+    def _is_long_text(text: str) -> bool:
+        normalized = str(text).strip()
+        return (
+            len(normalized.splitlines()) >= LONG_TEXT_LINE_THRESHOLD
+            or len(normalized) >= LONG_TEXT_CHAR_THRESHOLD
+        )
+
+    def _image_result(self, event: AstrMessageEvent, file_url: str, title: str):
+        if (event.get_platform_name() or "") == "aiocqhttp":
+            node = Node(
+                uin=event.get_self_id() or "0",
+                name=title,
+                content=[MessageImage(file=file_url)],
+            )
+            return event.chain_result([node])
+        return event.image_result(file_url)
+
+    async def reply_text(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        title: str = "LevelUpPvp",
+    ):
+        """Return short text directly and render long text as one image."""
+        text = str(text)
+        if not self._is_long_text(text):
+            return event.plain_result(text)
+        try:
+            image = render_text_card(text, title=title)
+            return self._image_result(event, save_temp_img(image), title)
+        except Exception:
+            logger.exception("LevelUpPvp text reply image render failed")
+            return event.plain_result(text)
+
     async def sign(self, event: AstrMessageEvent) -> AsyncGenerator:
         try:
             result = await self.checkin_service.checkin(self._identity_from_event(event))
             if result.already_checked:
-                yield event.plain_result(self._format_existing_checkin(result))
+                yield await self.reply_text(
+                    event, self._format_existing_checkin(result), "LevelUpPvp 签到"
+                )
                 return
 
-            yield event.plain_result(self._format_checkin_success(result))
+            yield await self.reply_text(
+                event, self._format_checkin_success(result), "LevelUpPvp 签到"
+            )
         except Exception as exc:
             logger.exception("LevelUpPvp sign failed")
-            yield event.plain_result(f"签到失败：{exc}")
+            yield await self.reply_text(event, f"签到失败：{exc}")
 
     async def auto_checkin(self, event: AstrMessageEvent) -> AsyncGenerator:
         """群内当天首条消息自动签到；失败时不影响原消息传播。"""
@@ -120,7 +163,9 @@ class LevelUpPvpCommandHandler:
             result = await self.checkin_service.checkin(self._identity_from_event(event))
             if result.already_checked:
                 return
-            yield event.plain_result(self._format_checkin_success(result))
+            yield await self.reply_text(
+                event, self._format_checkin_success(result), "LevelUpPvp 签到"
+            )
         except Exception:
             logger.exception("LevelUpPvp automatic check-in failed")
 
@@ -147,7 +192,7 @@ class LevelUpPvpCommandHandler:
     async def profile(self, event: AstrMessageEvent) -> AsyncGenerator:
         registration_error = await self._registration_error(event)
         if registration_error:
-            yield event.plain_result(registration_error)
+            yield await self.reply_text(event, registration_error)
             return
         try:
             identity = self._target_identity_from_event(event) or self._identity_from_event(
@@ -168,12 +213,14 @@ class LevelUpPvpCommandHandler:
                 )
                 if self.attribute_service and self.attribute_service.db_path:
                     progress = await self.attribute_service.get_progress(user.id)
-            yield event.plain_result(
-                self._format_profile(user, build, derived, progress)
+            yield await self.reply_text(
+                event,
+                self._format_profile(user, build, derived, progress),
+                "LevelUpPvp 面板",
             )
         except Exception as exc:
             logger.exception("LevelUpPvp profile failed")
-            yield event.plain_result(f"查看面板失败：{exc}")
+            yield await self.reply_text(event, f"查看面板失败：{exc}")
 
     async def add_point(
         self,
@@ -183,10 +230,10 @@ class LevelUpPvpCommandHandler:
     ) -> AsyncGenerator:
         registration_error = await self._registration_error(event)
         if registration_error:
-            yield event.plain_result(registration_error)
+            yield await self.reply_text(event, registration_error)
             return
         if not stat_name:
-            yield event.plain_result("用法：/加点 力量 2")
+            yield await self.reply_text(event, "用法：/加点 力量 2")
             return
         try:
             result = await self.stat_service.allocate(
@@ -196,7 +243,8 @@ class LevelUpPvpCommandHandler:
             )
             label = config.STAT_LABELS[result.stat_name]
             rolls = " + ".join(str(item) for item in result.rolls)
-            yield event.plain_result(
+            yield await self.reply_text(
+                event,
                 "\n".join(
                     [
                         f"加点成功：{label} +{result.total_gain}",
@@ -205,10 +253,11 @@ class LevelUpPvpCommandHandler:
                         f"剩余属性点：{result.user.stat_points}",
                         self._format_stats(result.user),
                     ]
-                )
+                ),
+                "LevelUpPvp 加点",
             )
         except Exception as exc:
-            yield event.plain_result(str(exc))
+            yield await self.reply_text(event, str(exc))
 
     async def inventory(self, event, page: int = 1):
         try:
@@ -228,14 +277,17 @@ class LevelUpPvpCommandHandler:
                     f"重量{item.weight:g}×{material.weight_multiplier:g}={resolved_weight:.3f}{mark}"
                 )
             if len(lines) == 1: lines.append("这一页没有装备。")
-            yield event.plain_result("\n".join(lines))
-        except Exception as exc: yield event.plain_result(f"查看背包失败：{exc}")
+            yield await self.reply_text(
+                event, "\n".join(lines), "LevelUpPvp 背包"
+            )
+        except Exception as exc:
+            yield await self.reply_text(event, f"查看背包失败：{exc}")
 
     async def equipment(self, event):
         try:
             registration_error = await self._registration_error(event)
             if registration_error:
-                yield event.plain_result(registration_error)
+                yield await self.reply_text(event, registration_error)
                 return
             identity = self._target_identity_from_event(event) or self._identity_from_event(event)
             user = await self.user_service.get_or_create_user(identity)
@@ -248,8 +300,11 @@ class LevelUpPvpCommandHandler:
             lines.append(f"战斗方式：{self._weapon_mode_label(build.weapon_mode)}")
             lines.append(f"护甲路线：{self._armor_style_label(build.armor_style)} 重量{build.total_weight:.2f}/{build.carry_capacity:.1f}{'（超负重）' if build.overloaded else ''}")
             lines.append(f"命中修正：物理 {build.physical_accuracy_multiplier:.0%} / 法术 {build.spell_accuracy_multiplier:.0%}")
-            yield event.plain_result("\n".join(lines))
-        except Exception as exc: yield event.plain_result(f"查看装备失败：{exc}")
+            yield await self.reply_text(
+                event, "\n".join(lines), "LevelUpPvp 装备"
+            )
+        except Exception as exc:
+            yield await self.reply_text(event, f"查看装备失败：{exc}")
 
     async def equipment_detail(self, event, equipment_id: int):
         try:
@@ -257,28 +312,35 @@ class LevelUpPvpCommandHandler:
             material = material_for(item.material)
             resolved_weight = actual_weight(item.weight, item.material)
             lines = [f"#{item.id} {item.name}", f"品质：{QUALITY_LABELS.get(item.quality, item.quality)} / {item.star_type}", f"等级：{item.item_level} 材质：{material.name} 状态：{item.blessing_state}", f"重量：基础{item.weight:g} × {material.weight_multiplier:g} = {resolved_weight:.3f} 强化：+{item.enhancement_level}", f"附魔容量：{item.used_capacity}/{item.enchant_capacity}", f"基础：{item.base_stats or '无'}", f"固有词条：{self._format_affixes(item.inherent_affixes)}", f"随机词条：{self._format_affixes(item.random_affixes)}", f"融合词条：{self._format_affixes(item.fusion_affixes)}"]
-            yield event.plain_result("\n".join(lines))
-        except Exception as exc: yield event.plain_result(f"查看装备详情失败：{exc}")
+            yield await self.reply_text(
+                event, "\n".join(lines), "LevelUpPvp 装备详情"
+            )
+        except Exception as exc:
+            yield await self.reply_text(event, f"查看装备详情失败：{exc}")
 
     async def equip_item(self, event, equipment_id: int, slot: str = ""):
         try:
             user = await self._own_user(event); normalized = self._slot_id(slot) if slot else ""
             item, slots = await self.equipment_service.equip(user.id, int(equipment_id), normalized)
-            yield event.plain_result(f"已穿戴 {item.name}：{'、'.join(SLOT_LABELS[s] for s in slots)}")
-        except Exception as exc: yield event.plain_result(f"穿戴失败：{exc}")
+            yield await self.reply_text(
+                event, f"已穿戴 {item.name}：{'、'.join(SLOT_LABELS[s] for s in slots)}"
+            )
+        except Exception as exc:
+            yield await self.reply_text(event, f"穿戴失败：{exc}")
 
     async def unequip_item(self, event, slot: str):
         try:
             user = await self._own_user(event); normalized = self._slot_id(slot) if slot else ""
             await self.equipment_service.unequip(user.id, normalized)
-            yield event.plain_result(f"已卸下{SLOT_LABELS[normalized]}装备。")
-        except Exception as exc: yield event.plain_result(f"卸下失败：{exc}")
+            yield await self.reply_text(event, f"已卸下{SLOT_LABELS[normalized]}装备。")
+        except Exception as exc:
+            yield await self.reply_text(event, f"卸下失败：{exc}")
 
     async def skills(self, event):
         try:
             registration_error = await self._registration_error(event)
             if registration_error:
-                yield event.plain_result(registration_error)
+                yield await self.reply_text(event, registration_error)
                 return
             identity = self._target_identity_from_event(event) or self._identity_from_event(event)
             user = await self.user_service.get_or_create_user(identity)
@@ -344,9 +406,11 @@ class LevelUpPvpCommandHandler:
                     for i, s in enumerate(slots)
                 )
             )
-            yield event.plain_result("\n".join(lines))
+            yield await self.reply_text(
+                event, "\n".join(lines), "LevelUpPvp 技能"
+            )
         except Exception as exc:
-            yield event.plain_result(f"查看技能失败：{exc}")
+            yield await self.reply_text(event, f"查看技能失败：{exc}")
     async def spellbooks(self, event, page: int = 1):
         try:
             user = await self._own_user(event)
@@ -363,9 +427,11 @@ class LevelUpPvpCommandHandler:
                     f"#{book.id} {definition.name} ×{book.quantity}"
                     f"（难度{definition.reading_difficulty}，主属性：{attribute}）"
                 )
-            yield event.plain_result("\n".join(lines))
+            yield await self.reply_text(
+                event, "\n".join(lines), "LevelUpPvp 魔法书"
+            )
         except Exception as exc:
-            yield event.plain_result(f"查看魔法书失败：{exc}")
+            yield await self.reply_text(event, f"查看魔法书失败：{exc}")
 
     async def read_spellbook(self, event, book_id: int):
         try:
@@ -377,19 +443,20 @@ class LevelUpPvpCommandHandler:
                 definition = SPELL_DEFINITIONS[result.spell.spell_id]
                 detail = f"，{definition.name} Lv.{result.spell.level} 潜力{result.spell.potential}%"
             attribute = ATTRIBUTE_LABELS.get(result.reading_attribute, result.reading_attribute)
-            yield event.plain_result(
+            yield await self.reply_text(
+                event,
                 f"{outcome}（阅读能力{result.reading_power:.0f}，"
                 f"难度{result.reading_difficulty}，主属性：{attribute}，"
                 f"成功率{result.chance:.1%}，已消耗1本）{detail}"
             )
         except Exception as exc:
-            yield event.plain_result(f"阅读失败：{exc}")
+            yield await self.reply_text(event, f"阅读失败：{exc}")
 
     async def spells(self, event):
         try:
             registration_error = await self._registration_error(event)
             if registration_error:
-                yield event.plain_result(registration_error); return
+                yield await self.reply_text(event, registration_error); return
             identity = self._target_identity_from_event(event) or self._identity_from_event(event)
             user = await self.user_service.get_or_create_user(identity)
             spells = await self.spell_service.get_spells(user.id)
@@ -399,15 +466,17 @@ class LevelUpPvpCommandHandler:
             for spell in sorted(spells.values(), key=lambda value: SPELL_DEFINITIONS[value.spell_id].name):
                 definition = SPELL_DEFINITIONS[spell.spell_id]
                 lines.append(f"{definition.name} Lv.{spell.level} EXP {spell.exp}/{spell_exp_required(spell.level)} 潜力{spell.potential}%")
-            yield event.plain_result("\n".join(lines))
+            yield await self.reply_text(
+                event, "\n".join(lines), "LevelUpPvp 法术"
+            )
         except Exception as exc:
-            yield event.plain_result(f"查看法术失败：{exc}")
+            yield await self.reply_text(event, f"查看法术失败：{exc}")
 
     async def techniques(self, event):
         try:
             registration_error = await self._registration_error(event)
             if registration_error:
-                yield event.plain_result(registration_error); return
+                yield await self.reply_text(event, registration_error); return
             identity = self._target_identity_from_event(event) or self._identity_from_event(event)
             user = await self.user_service.get_or_create_user(identity)
             skills, _ = await self.skill_service.get_skills(user)
@@ -419,26 +488,38 @@ class LevelUpPvpCommandHandler:
                 (unlocked if ability_is_unlocked(definition, skills, {}) else locked).append(text)
             lines = [f"{self._display_name(user)} 的战技", "【已解锁】" + ("、".join(unlocked) if unlocked else "无")]
             if locked: lines.append("【未解锁】" + "、".join(locked))
-            yield event.plain_result("\n".join(lines))
+            yield await self.reply_text(
+                event, "\n".join(lines), "LevelUpPvp 战技"
+            )
         except Exception as exc:
-            yield event.plain_result(f"查看战技失败：{exc}")
+            yield await self.reply_text(event, f"查看战技失败：{exc}")
     async def learn_skill(self, event, name: str):
         try:
             user = await self._own_user(event); skill = await self.skill_service.learn(user, name)
-            yield event.plain_result(f"已学习技能：{SKILL_DEFINITIONS[skill.skill_id].name} Lv.1")
-        except Exception as exc: yield event.plain_result(f"学习失败：{exc}")
+            yield await self.reply_text(
+                event, f"已学习技能：{SKILL_DEFINITIONS[skill.skill_id].name} Lv.1"
+            )
+        except Exception as exc:
+            yield await self.reply_text(event, f"学习失败：{exc}")
 
     async def train_skill(self, event, name: str, points: int):
         try:
             user = await self._own_user(event); skill = await self.skill_service.train_potential(user, name, int(points))
-            yield event.plain_result(f"训练完成：{SKILL_DEFINITIONS[skill.skill_id].name} 潜力提升至{skill.potential}%")
-        except Exception as exc: yield event.plain_result(f"训练失败：{exc}")
+            yield await self.reply_text(
+                event,
+                f"训练完成：{SKILL_DEFINITIONS[skill.skill_id].name} 潜力提升至{skill.potential}%",
+            )
+        except Exception as exc:
+            yield await self.reply_text(event, f"训练失败：{exc}")
 
     async def set_skill_slot(self, event, slot: int, name: str):
         try:
             user = await self._own_user(event); await self.skill_service.set_active_slot(user, int(slot), name)
-            yield event.plain_result(f"技能栏{slot}已{'清空' if name == '清空' else '设置为' + name}。")
-        except Exception as exc: yield event.plain_result(f"技能栏设置失败：{exc}")
+            yield await self.reply_text(
+                event, f"技能栏{slot}已{'清空' if name == '清空' else '设置为' + name}。"
+            )
+        except Exception as exc:
+            yield await self.reply_text(event, f"技能栏设置失败：{exc}")
 
     async def _own_user(self, event):
         error = await self._registration_error(event)
@@ -497,23 +578,25 @@ class LevelUpPvpCommandHandler:
     async def ranking(self, event: AstrMessageEvent) -> AsyncGenerator:
         registration_error = await self._registration_error(event)
         if registration_error:
-            yield event.plain_result(registration_error)
+            yield await self.reply_text(event, registration_error)
             return
         try:
             target_identity = self._target_identity_from_event(event)
             if target_identity:
                 result = await self.user_service.get_user_rank(target_identity)
                 if not result:
-                    yield event.plain_result("该用户暂无排行数据。")
+                    yield await self.reply_text(event, "该用户暂无排行数据。")
                     return
                 rank, user = result
-                yield event.plain_result(
+                yield await self.reply_text(
+                    event,
                     "\n".join(
                         [
                             "排名 用户名 等级 当前经验/升级所需经验",
                             self._format_ranking_line(rank, user),
                         ]
-                    )
+                    ),
+                    "LevelUpPvp 排行",
                 )
                 return
 
@@ -524,16 +607,18 @@ class LevelUpPvpCommandHandler:
                 10,
             )
             if not ranked_users:
-                yield event.plain_result("当前群暂无排行数据。")
+                yield await self.reply_text(event, "当前群暂无排行数据。")
                 return
             lines = ["等级排行 TOP10", "排名 用户名 等级 当前经验/升级所需经验"]
             lines.extend(
                 self._format_ranking_line(rank, user) for rank, user in ranked_users
             )
-            yield event.plain_result("\n".join(lines))
+            yield await self.reply_text(
+                event, "\n".join(lines), "LevelUpPvp 排行"
+            )
         except Exception as exc:
             logger.exception("LevelUpPvp ranking failed")
-            yield event.plain_result(f"查看排行失败：{exc}")
+            yield await self.reply_text(event, f"查看排行失败：{exc}")
 
     async def register_nickname(
         self,
@@ -541,17 +626,17 @@ class LevelUpPvpCommandHandler:
         nickname: str = "",
     ) -> AsyncGenerator:
         if not nickname:
-            yield event.plain_result("用法：/登记 昵称")
+            yield await self.reply_text(event, "用法：/登记 昵称")
             return
         try:
             user = await self.user_service.register_nickname(
                 self._identity_from_event(event),
                 nickname,
             )
-            yield event.plain_result(f"登记成功：{self._display_name(user)}")
+            yield await self.reply_text(event, f"登记成功：{self._display_name(user)}")
         except Exception as exc:
             logger.exception("LevelUpPvp nickname registration failed")
-            yield event.plain_result(f"登记失败：{exc}")
+            yield await self.reply_text(event, f"登记失败：{exc}")
 
     async def modify_registered_nickname(
         self,
@@ -559,11 +644,11 @@ class LevelUpPvpCommandHandler:
         nickname: str = "",
     ) -> AsyncGenerator:
         if not await self._is_astrbot_admin(event):
-            yield event.plain_result(ADMIN_REQUIRED_MESSAGE)
+            yield await self.reply_text(event, ADMIN_REQUIRED_MESSAGE)
             return
         registration_error = await self._registration_error(event)
         if registration_error:
-            yield event.plain_result(registration_error)
+            yield await self.reply_text(event, registration_error)
             return
 
         target_identity = self._target_identity_from_event(
@@ -571,27 +656,31 @@ class LevelUpPvpCommandHandler:
         ) or self._target_identity_from_text(event, nickname)
         nickname = self._extract_modified_nickname(event, target_identity, nickname)
         if not target_identity or not nickname:
-            yield event.plain_result("用法：/修改登记 @用户 昵称")
+            yield await self.reply_text(event, "用法：/修改登记 @用户 昵称")
             return
         try:
             user = await self.user_service.register_nickname(target_identity, nickname)
-            yield event.plain_result(f"修改登记成功：{self._display_name(user)}")
+            yield await self.reply_text(
+                event, f"修改登记成功：{self._display_name(user)}"
+            )
         except Exception as exc:
             logger.exception("LevelUpPvp admin nickname registration failed")
-            yield event.plain_result(f"修改登记失败：{exc}")
+            yield await self.reply_text(event, f"修改登记失败：{exc}")
 
     async def challenge(self, event: AstrMessageEvent) -> AsyncGenerator:
         registration_error = await self._registration_error(event)
         if registration_error:
-            yield event.plain_result(registration_error)
+            yield await self.reply_text(event, registration_error)
             return
         try:
             target_identity = self._target_identity_from_event(event)
             if not target_identity:
-                yield event.plain_result("请 At 一个要挑战的用户。用法：/挑战 @用户 策略描述")
+                yield await self.reply_text(
+                    event, "请 At 一个要挑战的用户。用法：/挑战 @用户 策略描述"
+                )
                 return
             if target_identity.user_id == event.get_self_id():
-                yield event.plain_result("不能挑战机器人。")
+                yield await self.reply_text(event, "不能挑战机器人。")
                 return
 
             parsed_strategy = self._extract_strategy(event, target_identity, "")
@@ -616,7 +705,7 @@ class LevelUpPvpCommandHandler:
             yield await self._battle_result(event, result)
         except Exception as exc:
             logger.exception("LevelUpPvp battle failed")
-            yield event.plain_result(f"挑战失败：{exc}")
+            yield await self.reply_text(event, f"挑战失败：{exc}")
 
     def is_alias_challenge_event(self, event: AstrMessageEvent) -> bool:
         message = (event.get_message_str() or "").strip()
@@ -1038,31 +1127,18 @@ class LevelUpPvpCommandHandler:
         return "\n".join(lines)
 
     async def _battle_result(self, event: AstrMessageEvent, result):
-        """生成图片战报并发送，渲染失败时回退为纯文字。"""
-        platform_name = event.get_platform_name() or ""
-
+        """生成专用战报；失败时依次回退到通用图片和纯文字。"""
         try:
             report_image = render_battle_report(result)
             file_url = save_temp_img(report_image)
-            if platform_name == "aiocqhttp":
-                node = Node(
-                    uin=event.get_self_id() or "0",
-                    name="LevelUpPvp 战报",
-                    content=[MessageImage(file=file_url)],
-                )
-                return event.chain_result([node])
-            return event.image_result(file_url)
-        except Exception as exc:
+            return self._image_result(event, file_url, "LevelUpPvp 战报")
+        except Exception:
             logger.exception("LevelUpPvp battle report image render failed")
-            text = self._format_battle_result(result)
-            if platform_name == "aiocqhttp":
-                node = Node(
-                    uin=event.get_self_id() or "0",
-                    name="LevelUpPvp 战报",
-                    content=[Plain(text)],
-                )
-                return event.chain_result([node])
-            return event.plain_result(text)
+            return await self.reply_text(
+                event,
+                self._format_battle_result(result),
+                "LevelUpPvp 战报",
+            )
 
     def _display_name(self, user: User) -> str:
         name = user.nickname or user.user_id
