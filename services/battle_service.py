@@ -186,14 +186,16 @@ class BattleService:
                 requested_loser_exp_loss,
             )
             loser_exp_loss = abs(loser_exp.exp_delta)
-            winner_exp_gain = self._winner_exp_gain_from_loss(winner, loser_exp_loss)
-            if winner_exp_gain == 0 and requested_loser_exp_loss > 0:
-                consolation = max(1, min(requested_loser_exp_loss,
-                    round(config.exp_required_for_next_level(winner.level) * 0.02)))
-                winner_exp = await self.user_service.add_exp_in_db(db, winner, consolation)
-                winner_exp_gain = abs(winner_exp.exp_delta)
-            else:
-                winner_exp = await self.user_service.add_exp_in_db(db, winner, winner_exp_gain)
+            winner_exp_gain = self._winner_exp_gain_from_loss(
+                winner,
+                loser,
+                loser_exp_loss,
+            )
+            winner_exp = await self.user_service.add_exp_in_db(
+                db,
+                winner,
+                winner_exp_gain,
+            )
             await self.user_service.increment_battle_stats_in_db(db, winner.id, loser.id)
 
             updated_attacker = await self.user_service.get_user_by_pk_in_db(db, attacker.id)
@@ -564,22 +566,39 @@ class BattleService:
         return [opening, swing, finish]
 
     def _roll_loser_exp_loss(self, winner: User, loser: User) -> int:
+        level_diff = loser.level - winner.level
+        level_diff_step = (
+            config.BATTLE_EXP_TRANSFER_LOWER_LEVEL_RATE_STEP
+            if level_diff < 0
+            else config.BATTLE_EXP_TRANSFER_LEVEL_DIFF_RATE_STEP
+        )
         rate = config.clamp(
             config.BATTLE_EXP_TRANSFER_BASE_RATE
-            + (loser.level - winner.level)
-            * config.BATTLE_EXP_TRANSFER_LEVEL_DIFF_RATE_STEP
+            + level_diff * level_diff_step
             + random.uniform(*config.BATTLE_EXP_TRANSFER_RANDOM_RATE_RANGE),
             *config.BATTLE_EXP_TRANSFER_RATE_RANGE,
         )
         required = config.exp_required_for_next_level(loser.level)
         return max(1, round(required * rate))
 
-    def _winner_exp_gain_from_loss(self, winner: User, loser_exp_loss: int) -> int:
+    def _winner_exp_gain_from_loss(
+        self,
+        winner: User,
+        loser: User,
+        loser_exp_loss: int,
+    ) -> int:
         level_cap = round(
             config.exp_required_for_next_level(winner.level)
             * config.BATTLE_WIN_EXP_LEVEL_CAP_RATE
         )
-        return min(max(0, loser_exp_loss), level_cap)
+        reward_floor = max(
+            config.BATTLE_WIN_EXP_ABSOLUTE_FLOOR,
+            round(
+                config.exp_required_for_next_level(loser.level)
+                * config.BATTLE_WIN_EXP_LOSER_LEVEL_FLOOR_RATE
+            ),
+        )
+        return min(max(0, loser_exp_loss, reward_floor), level_cap)
 
     def _display_name(self, user: User) -> str:
         name = user.nickname or user.user_id

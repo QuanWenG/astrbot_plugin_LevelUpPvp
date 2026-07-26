@@ -28,6 +28,7 @@ class EquipmentTemplate:
     base_stats: dict[str, float] = field(default_factory=dict)
     inherent_affixes: tuple[dict, ...] = ()
     weight_range_exception: bool = False
+    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,7 @@ class EquipmentItem:
     random_affixes: tuple[dict, ...] = ()
     fusion_affixes: tuple[dict, ...] = ()
     bound: bool = True
+    description: str = ""
 
     def __post_init__(self) -> None:
         if not 0 <= self.item_level <= 100:

@@ -121,22 +121,74 @@ class BattleExpFormulaTests(unittest.TestCase):
 
         with patch("services.battle_service.random.uniform", return_value=0):
             loss = self.service._roll_loser_exp_loss(winner, loser)
-        gain = self.service._winner_exp_gain_from_loss(winner, loss)
+        gain = self.service._winner_exp_gain_from_loss(winner, loser, loss)
 
         self.assertEqual(loss, round(required * 0.24))
         self.assertEqual(gain, loss)
 
-    def test_high_level_beating_low_level_has_no_farmable_reward(self):
+    def test_high_level_beating_low_level_uses_mixed_reward_floor(self):
         high = _user(level=20)
         low = _user(user_id="low", level=10)
 
         with patch("services.battle_service.random.uniform", return_value=-0.04):
             loss = self.service._roll_loser_exp_loss(high, low)
-        gain = self.service._winner_exp_gain_from_loss(high, loss)
+        gain = self.service._winner_exp_gain_from_loss(high, low, loss)
 
         self.assertEqual(loss, round(config.exp_required_for_next_level(10) * 0.02))
-        self.assertEqual(gain, loss)
-        self.assertLess(gain, config.exp_required_for_next_level(20) * 0.01)
+        self.assertEqual(
+            gain,
+            round(config.exp_required_for_next_level(10) * 0.05),
+        )
+        self.assertGreater(gain, loss)
+
+    def test_level_twenty_beating_level_eleven_has_useful_floor(self):
+        high = _user(level=20)
+        low = _user(user_id="low", level=11)
+        required = config.exp_required_for_next_level(11)
+
+        with patch("services.battle_service.random.uniform", return_value=-0.04):
+            worst_loss = self.service._roll_loser_exp_loss(high, low)
+        worst_gain = self.service._winner_exp_gain_from_loss(
+            high,
+            low,
+            worst_loss,
+        )
+        with patch("services.battle_service.random.uniform", return_value=0):
+            normal_loss = self.service._roll_loser_exp_loss(high, low)
+        normal_gain = self.service._winner_exp_gain_from_loss(
+            high,
+            low,
+            normal_loss,
+        )
+
+        self.assertEqual(worst_loss, round(required * 0.02))
+        self.assertEqual(worst_gain, round(required * 0.05))
+        self.assertEqual(normal_loss, round(required * 0.06))
+        self.assertEqual(normal_gain, normal_loss)
+
+    def test_five_level_gap_uses_two_percent_step_without_clamping(self):
+        high = _user(level=20)
+        low = _user(user_id="low", level=15)
+        required = config.exp_required_for_next_level(15)
+
+        with patch("services.battle_service.random.uniform", return_value=-0.04):
+            minimum = self.service._roll_loser_exp_loss(high, low)
+        with patch("services.battle_service.random.uniform", return_value=0.06):
+            maximum = self.service._roll_loser_exp_loss(high, low)
+
+        self.assertEqual(minimum, round(required * 0.10))
+        self.assertEqual(maximum, round(required * 0.20))
+
+    def test_level_one_opponent_gives_at_least_five_exp(self):
+        high = _user(level=20)
+        low = _user(user_id="low", level=1)
+
+        with patch("services.battle_service.random.uniform", return_value=-0.04):
+            loss = self.service._roll_loser_exp_loss(high, low)
+        gain = self.service._winner_exp_gain_from_loss(high, low, loss)
+
+        self.assertEqual(loss, 2)
+        self.assertEqual(gain, 5)
 
     def test_low_level_beating_high_level_can_fill_one_level(self):
         low = _user(level=10)
@@ -144,18 +196,30 @@ class BattleExpFormulaTests(unittest.TestCase):
 
         with patch("services.battle_service.random.uniform", return_value=0):
             loss = self.service._roll_loser_exp_loss(low, high)
-        gain = self.service._winner_exp_gain_from_loss(low, loss)
+        gain = self.service._winner_exp_gain_from_loss(low, high, loss)
 
         self.assertEqual(loss, round(config.exp_required_for_next_level(20) * 0.84))
         self.assertEqual(gain, config.exp_required_for_next_level(10))
 
-    def test_winner_never_receives_more_than_loser_actually_lost(self):
+    def test_winner_floor_and_level_cap_are_enforced(self):
         winner = _user(level=15)
+        loser = _user(user_id="loser", level=15)
 
-        self.assertEqual(self.service._winner_exp_gain_from_loss(winner, 0), 0)
-        self.assertEqual(self.service._winner_exp_gain_from_loss(winner, 80), 80)
+        floor = round(config.exp_required_for_next_level(15) * 0.05)
         self.assertEqual(
-            self.service._winner_exp_gain_from_loss(winner, 999999),
+            self.service._winner_exp_gain_from_loss(winner, loser, 0),
+            floor,
+        )
+        self.assertEqual(
+            self.service._winner_exp_gain_from_loss(winner, loser, 80),
+            80,
+        )
+        self.assertEqual(
+            self.service._winner_exp_gain_from_loss(
+                winner,
+                loser,
+                999999,
+            ),
             config.exp_required_for_next_level(15),
         )
 

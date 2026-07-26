@@ -223,6 +223,7 @@ async def init_db(db_path: str) -> None:
                 used_capacity INTEGER NOT NULL DEFAULT 0, base_stats_json TEXT NOT NULL DEFAULT '{}',
                 inherent_affixes_json TEXT NOT NULL DEFAULT '[]', random_affixes_json TEXT NOT NULL DEFAULT '[]',
                 fusion_affixes_json TEXT NOT NULL DEFAULT '[]', bound INTEGER NOT NULL DEFAULT 1,
+                description TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL, FOREIGN KEY(owner_pk) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS equipment_loadout (
@@ -327,6 +328,8 @@ async def init_db(db_path: str) -> None:
                 ON stat_point_logs(user_pk);
             CREATE INDEX IF NOT EXISTS idx_nickname_mappings_lookup
                 ON nickname_mappings(platform, group_id, user_id);
+            CREATE INDEX IF NOT EXISTS idx_equipment_owner_template
+                ON equipment_items(owner_pk, template_id);
             CREATE INDEX IF NOT EXISTS idx_advanced_attribute_logs_user
                 ON advanced_attribute_logs(user_pk, created_at);
             CREATE INDEX IF NOT EXISTS idx_attribute_growth_user
@@ -371,6 +374,12 @@ async def init_db(db_path: str) -> None:
         await _ensure_column(db, "users", "advanced_luck", "INTEGER NOT NULL DEFAULT 100")
         await _ensure_column(db, "users", "skill_points", "INTEGER NOT NULL DEFAULT 0")
         await _ensure_column(db, "users", "willpower", "INTEGER NOT NULL DEFAULT 1")
+        await _ensure_column(
+            db,
+            "equipment_items",
+            "description",
+            "TEXT NOT NULL DEFAULT ''",
+        )
         await _ensure_column(db, "level_up_logs", "skill_points_gain", "INTEGER NOT NULL DEFAULT 0")
         await _ensure_column(db, "level_freezes", "frozen_skill_points", "INTEGER NOT NULL DEFAULT 0")
         await db.execute(

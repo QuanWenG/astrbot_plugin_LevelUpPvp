@@ -1,30 +1,46 @@
 import json
+import secrets
+from dataclasses import dataclass
 
 try:
     from ..models.equipment import EQUIPMENT_SLOTS, EquipmentItem
     from .db import connect_db
-    from .equipment_catalog import STARTER_TEMPLATES, starter_item
+    from .equipment_catalog import (
+        DEFAULT_EQUIPMENT_CATALOG,
+        EquipmentCatalog,
+        EquipmentFactory,
+    )
     from .user_service import utc_now_text
 except ImportError:
     from models.equipment import EQUIPMENT_SLOTS, EquipmentItem
     from services.db import connect_db
-    from services.equipment_catalog import STARTER_TEMPLATES, starter_item
+    from services.equipment_catalog import (
+        DEFAULT_EQUIPMENT_CATALOG,
+        EquipmentCatalog,
+        EquipmentFactory,
+    )
     from services.user_service import utc_now_text
 
 
-DEFAULT_EQUIPPED_TEMPLATES = {
-    "main_hand": "training_longsword", "off_hand": "training_shield",
-    "head": "training_cap", "neck": "training_amulet",
-    "back": "training_cape", "body": "training_clothes",
-    "wrist": "training_gloves", "left_finger": "training_ring_left",
-    "right_finger": "training_ring_right", "waist": "training_belt",
-    "feet": "training_boots",
-}
+@dataclass(frozen=True)
+class EquipmentGrantResult:
+    catalog_id: int
+    equipment_name: str
+    granted: int
+    skipped: int
 
 
 class EquipmentService:
-    def __init__(self, db_path: str):
+    def __init__(
+        self,
+        db_path: str,
+        catalog: EquipmentCatalog | None = None,
+        seed_source=None,
+    ):
         self.db_path = db_path
+        self.catalog = catalog or DEFAULT_EQUIPMENT_CATALOG
+        self.factory = EquipmentFactory()
+        self._seed_source = seed_source or (lambda: secrets.randbits(63))
 
     async def ensure_starter_in_db(self, db, user_pk: int) -> None:
         cursor = await db.execute(
@@ -34,33 +50,32 @@ class EquipmentService:
         granted = await cursor.fetchone()
         await cursor.close()
         if not granted:
-            created: dict[str, int] = {}
-            for template in STARTER_TEMPLATES:
-                item = starter_item(user_pk, template)
-                cursor = await db.execute(
-                    """
-                    INSERT INTO equipment_items (
-                        owner_pk, template_id, name, item_type, equip_slot, hand_mode,
-                        weapon_type, armor_type, item_level, quality, star_type,
-                        material, blessing_state, enhancement_level, weight,
-                        enchant_capacity, used_capacity, base_stats_json,
-                        inherent_affixes_json, random_affixes_json,
-                        fusion_affixes_json, bound, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    self._insert_values(item),
-                )
-                await cursor.close()
-                cursor = await db.execute("SELECT last_insert_rowid() AS id")
-                row = await cursor.fetchone()
-                await cursor.close()
-                created[template.template_id] = int(row["id"])
-            for slot, template_id in DEFAULT_EQUIPPED_TEMPLATES.items():
-                await db.execute(
-                    "INSERT OR REPLACE INTO equipment_loadout "
-                    "(user_pk, slot, equipment_id) VALUES (?, ?, ?)",
-                    (user_pk, slot, created[template_id]),
-                )
+            cursor = await db.execute(
+                "SELECT id, template_id FROM equipment_items WHERE owner_pk = ?",
+                (user_pk,),
+            )
+            created = {
+                row["template_id"]: int(row["id"])
+                for row in await cursor.fetchall()
+            }
+            await cursor.close()
+            for entry in self.catalog.snapshot.starter_entries:
+                template_id = entry.template.template_id
+                if template_id not in created:
+                    item = self.factory.create_from_catalog(
+                        user_pk,
+                        entry,
+                        seed=self._seed_source(),
+                    )
+                    created[template_id] = await self._insert_item_in_db(
+                        db, item
+                    )
+                for slot in entry.starter_equip_slots:
+                    await db.execute(
+                        "INSERT OR REPLACE INTO equipment_loadout "
+                        "(user_pk, slot, equipment_id) VALUES (?, ?, ?)",
+                        (user_pk, slot, created[template_id]),
+                    )
             await db.execute(
                 "INSERT INTO feature_grants (user_pk, grant_key, created_at) "
                 "VALUES (?, ?, ?)",
@@ -88,9 +103,10 @@ class EquipmentService:
         }
         await cursor.close()
         template_by_id = {
-            template.template_id: template for template in STARTER_TEMPLATES
+            entry.template.template_id: entry
+            for entry in self.catalog.snapshot.starter_entries
         }
-        for template_id, template in template_by_id.items():
+        for template_id, entry in template_by_id.items():
             if template_id in existing:
                 await db.execute(
                     "UPDATE equipment_items SET weight = ? "
@@ -98,34 +114,23 @@ class EquipmentService:
                     "AND item_level = 0 AND quality = 'common' "
                     "AND star_type = 'none' AND enhancement_level = 0 "
                     "AND enchant_capacity = 0 AND used_capacity = 0",
-                    (template.weight, user_pk, template_id),
+                    (entry.template.weight, user_pk, template_id),
                 )
                 continue
             if template_id not in {"training_cape", "training_gloves"}:
                 continue
-            item = starter_item(user_pk, template)
-            cursor = await db.execute(
-                """
-                INSERT INTO equipment_items (
-                    owner_pk, template_id, name, item_type, equip_slot, hand_mode,
-                    weapon_type, armor_type, item_level, quality, star_type,
-                    material, blessing_state, enhancement_level, weight,
-                    enchant_capacity, used_capacity, base_stats_json,
-                    inherent_affixes_json, random_affixes_json,
-                    fusion_affixes_json, bound, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                self._insert_values(item),
+            item = self.factory.create_from_catalog(
+                user_pk,
+                entry,
+                seed=self._seed_source(),
             )
-            await cursor.close()
-            cursor = await db.execute("SELECT last_insert_rowid() AS id")
-            row = await cursor.fetchone()
-            await cursor.close()
-            existing[template_id] = int(row["id"])
+            existing[template_id] = await self._insert_item_in_db(db, item)
         for slot, template_id in (
             ("back", "training_cape"),
             ("wrist", "training_gloves"),
         ):
+            if template_id not in existing:
+                continue
             await db.execute(
                 "INSERT OR IGNORE INTO equipment_loadout "
                 "(user_pk, slot, equipment_id) VALUES (?, ?, ?)",
@@ -136,6 +141,67 @@ class EquipmentService:
             "VALUES (?, ?, ?)",
             (user_pk, grant_key, utc_now_text()),
         )
+
+    async def grant_catalog_item(
+        self,
+        user_pks: list[int] | tuple[int, ...],
+        catalog_id: int,
+    ) -> EquipmentGrantResult:
+        entry = self.catalog.get(catalog_id)
+        unique_user_pks = tuple(dict.fromkeys(int(pk) for pk in user_pks))
+        granted = 0
+        skipped = 0
+        async with await connect_db(self.db_path) as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                for user_pk in unique_user_pks:
+                    cursor = await db.execute(
+                        "SELECT 1 FROM equipment_items "
+                        "WHERE owner_pk = ? AND template_id = ? LIMIT 1",
+                        (user_pk, entry.template.template_id),
+                    )
+                    exists = await cursor.fetchone()
+                    await cursor.close()
+                    if exists:
+                        skipped += 1
+                        continue
+                    item = self.factory.create_from_catalog(
+                        user_pk,
+                        entry,
+                        seed=self._seed_source(),
+                    )
+                    await self._insert_item_in_db(db, item)
+                    granted += 1
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        return EquipmentGrantResult(
+            catalog_id=entry.catalog_id,
+            equipment_name=entry.template.name,
+            granted=granted,
+            skipped=skipped,
+        )
+
+    async def _insert_item_in_db(self, db, item: EquipmentItem) -> int:
+        cursor = await db.execute(
+            """
+            INSERT INTO equipment_items (
+                owner_pk, template_id, name, item_type, equip_slot, hand_mode,
+                weapon_type, armor_type, item_level, quality, star_type,
+                material, blessing_state, enhancement_level, weight,
+                enchant_capacity, used_capacity, base_stats_json,
+                inherent_affixes_json, random_affixes_json,
+                fusion_affixes_json, bound, description, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            self._insert_values(item),
+        )
+        await cursor.close()
+        cursor = await db.execute("SELECT last_insert_rowid() AS id")
+        row = await cursor.fetchone()
+        await cursor.close()
+        return int(row["id"])
     async def list_items(self, user_pk: int) -> list[EquipmentItem]:
         async with await connect_db(self.db_path) as db:
             await self.ensure_starter_in_db(db, user_pk)
@@ -264,7 +330,7 @@ class EquipmentService:
             json.dumps(item.inherent_affixes, ensure_ascii=False),
             json.dumps(item.random_affixes, ensure_ascii=False),
             json.dumps(item.fusion_affixes, ensure_ascii=False),
-            1 if item.bound else 0, utc_now_text(),
+            1 if item.bound else 0, item.description, utc_now_text(),
         )
 
     def _row_to_item(self, row) -> EquipmentItem:
@@ -278,4 +344,5 @@ class EquipmentService:
             tuple(json.loads(row["inherent_affixes_json"] or "[]")),
             tuple(json.loads(row["random_affixes_json"] or "[]")),
             tuple(json.loads(row["fusion_affixes_json"] or "[]")), bool(row["bound"]),
+            row["description"] or "",
         )

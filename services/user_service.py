@@ -77,6 +77,31 @@ class UserService:
     async def get_user_by_pk(self, user_pk: int) -> User | None:
         async with await connect_db(self.db_path) as db:
             return await self.get_user_by_pk_in_db(db, user_pk)
+
+    async def list_user_pks(
+        self,
+        *,
+        platform: str | None = None,
+        group_id: str | None = None,
+    ) -> list[int]:
+        clauses = []
+        params = []
+        if platform is not None:
+            clauses.append("platform = ?")
+            params.append(platform)
+        if group_id is not None:
+            clauses.append("group_id = ?")
+            params.append(group_id or "")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        async with await connect_db(self.db_path) as db:
+            cursor = await db.execute(
+                f"SELECT id FROM users{where} ORDER BY id",
+                tuple(params),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+        return [int(row["id"]) for row in rows]
+
     async def get_or_create_user(self, identity: UserIdentity) -> User:
         async with await connect_db(self.db_path) as db:
             user, _ = await self.get_or_create_user_in_db(db, identity)

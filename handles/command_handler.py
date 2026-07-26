@@ -34,7 +34,11 @@ try:
     from ..models.equipment import SLOT_LABELS
     from ..models.user import LevelDownEvent, LevelUpEvent, User, UserIdentity
     from ..services.attribute_service import (
-        ATTRIBUTE_LABELS, DAMAGE_TYPE_LABELS, attribute_exp_required, skill_level_cap,
+        ADVANCED_ATTRIBUTE_LABELS,
+        ATTRIBUTE_LABELS,
+        DAMAGE_TYPE_LABELS,
+        attribute_exp_required,
+        skill_level_cap,
     )
     from ..services.equipment_catalog import QUALITY_LABELS
     from ..services.material_catalog import actual_weight, material_for
@@ -48,7 +52,11 @@ except ImportError:
     from models.equipment import SLOT_LABELS
     from models.user import LevelDownEvent, LevelUpEvent, User, UserIdentity
     from services.attribute_service import (
-        ATTRIBUTE_LABELS, DAMAGE_TYPE_LABELS, attribute_exp_required, skill_level_cap,
+        ADVANCED_ATTRIBUTE_LABELS,
+        ATTRIBUTE_LABELS,
+        DAMAGE_TYPE_LABELS,
+        attribute_exp_required,
+        skill_level_cap,
     )
     from services.equipment_catalog import QUALITY_LABELS
     from services.material_catalog import actual_weight, material_for
@@ -65,7 +73,7 @@ CHALLENGE_WAKE_WORDS = [
     "艾斯比",
     "啥比"
 ]
-MENTION_COMMAND_NAMES = ("魔法书", "阅读", "法术", "战技", "修改登记", "装备详情", "训练技能", "技能栏", "签到", "面板", "加点", "排行", "登记", "挑战", "背包", "装备", "穿戴", "卸下", "技能", "学习")
+MENTION_COMMAND_NAMES = ("重载装备表", "魔法书", "阅读", "法术", "战技", "修改登记", "装备详情", "训练技能", "技能栏", "签到", "面板", "加点", "排行", "登记", "挑战", "背包", "装备", "穿戴", "卸下", "技能", "学习", "给予")
 MENTION_COMMAND_PATTERN = re.compile(
     rf"^/?({'|'.join(MENTION_COMMAND_NAMES)})(?:\s|$)"
 )
@@ -332,12 +340,101 @@ class LevelUpPvpCommandHandler:
         except Exception as exc:
             yield await self.reply_text(event, f"查看装备失败：{exc}")
 
+    async def grant_equipment(self, event, args: str):
+        if not await self._is_astrbot_admin(event):
+            yield await self.reply_text(event, ADMIN_REQUIRED_MESSAGE)
+            return
+        try:
+            args = " ".join(str(args or "").split())
+            catalog_args = MENTION_MARKUP_PATTERN.sub(" ", args)
+            catalog_args = re.sub(r"\[At:[^\]]+\]", " ", catalog_args)
+            catalog_args = re.sub(r"@\S+", " ", catalog_args)
+            id_matches = re.findall(r"(?<!\d)(\d+)(?!\d)", catalog_args)
+            if len(id_matches) != 1:
+                raise ValueError(
+                    "用法：/给予 @用户 装备表ID；"
+                    "/给予 本群 装备表ID；/给予 全服 装备表ID 确认"
+                )
+            catalog_id = int(id_matches[0])
+            entry = self.equipment_service.catalog.get(catalog_id)
+            platform = (
+                event.get_platform_id()
+                or event.get_platform_name()
+                or "unknown"
+            )
+            group_id = event.get_group_id() or ""
+            if "全服" in args:
+                user_pks = await self.user_service.list_user_pks()
+                if "确认" not in args.split():
+                    yield await self.reply_text(
+                        event,
+                        f"装备表 ID {catalog_id}：{entry.template.name}\n"
+                        f"预计接收人数：{len(user_pks)}\n"
+                        f"未执行。请发送：/给予 全服 {catalog_id} 确认",
+                    )
+                    return
+            elif "本群" in args:
+                user_pks = await self.user_service.list_user_pks(
+                    platform=platform,
+                    group_id=group_id,
+                )
+            else:
+                target = self._grant_target_identity(event)
+                if target is None:
+                    raise ValueError("单人发放用法：/给予 @用户 装备表ID")
+                user = await self.user_service.get_or_create_user(target)
+                user_pks = [user.id]
+            result = await self.equipment_service.grant_catalog_item(
+                user_pks,
+                catalog_id,
+            )
+            yield await self.reply_text(
+                event,
+                f"发放完成：装备表 ID {result.catalog_id} "
+                f"{result.equipment_name}\n"
+                f"成功：{result.granted} 人\n"
+                f"已有跳过：{result.skipped} 人",
+            )
+        except Exception as exc:
+            yield await self.reply_text(event, f"发放失败：{exc}")
+
+    async def reload_equipment_catalog(self, event):
+        if not await self._is_astrbot_admin(event):
+            yield await self.reply_text(event, ADMIN_REQUIRED_MESSAGE)
+            return
+        try:
+            snapshot = self.equipment_service.catalog.reload()
+            yield await self.reply_text(
+                event,
+                f"装备表重载成功：schema v{snapshot.schema_version}，"
+                f"共 {len(snapshot.entries)} 件装备。",
+            )
+        except Exception as exc:
+            yield await self.reply_text(
+                event,
+                f"装备表重载失败，已继续使用旧目录：{exc}",
+            )
+
     async def equipment_detail(self, event, equipment_id: int):
         try:
             user = await self._own_user(event); item = await self.equipment_service.item_detail(user.id, int(equipment_id))
             material = material_for(item.material)
             resolved_weight = actual_weight(item.weight, item.material)
-            lines = [f"#{item.id} {item.name}", f"品质：{QUALITY_LABELS.get(item.quality, item.quality)} / {item.star_type}", f"等级：{item.item_level} 材质：{material.name} 状态：{item.blessing_state}", f"重量：基础{item.weight:g} × {material.weight_multiplier:g} = {resolved_weight:.3f} 强化：+{item.enhancement_level}", f"附魔容量：{item.used_capacity}/{item.enchant_capacity}", f"基础：{item.base_stats or '无'}", f"固有词条：{self._format_affixes(item.inherent_affixes)}", f"随机词条：{self._format_affixes(item.random_affixes)}", f"融合词条：{self._format_affixes(item.fusion_affixes)}"]
+            lines = [f"#{item.id} {item.name}"]
+            if item.description:
+                lines.append(f"介绍：{item.description}")
+            lines.extend(
+                [
+                    f"品质：{QUALITY_LABELS.get(item.quality, item.quality)} / {item.star_type}",
+                    f"等级：{item.item_level} 材质：{material.name} 状态：{item.blessing_state}",
+                    f"重量：基础{item.weight:g} × {material.weight_multiplier:g} = {resolved_weight:.3f} 强化：+{item.enhancement_level}",
+                    f"附魔容量：{item.used_capacity}/{item.enchant_capacity}",
+                    f"基础：{item.base_stats or '无'}",
+                    f"固有词条：{self._format_affixes(item.inherent_affixes)}",
+                    f"随机词条：{self._format_affixes(item.random_affixes)}",
+                    f"融合词条：{self._format_affixes(item.fusion_affixes)}",
+                ]
+            )
             yield await self.reply_text(
                 event, "\n".join(lines), "LevelUpPvp 装备详情"
             )
@@ -584,6 +681,10 @@ class LevelUpPvpCommandHandler:
             if kind == "stat_flat":
                 label = ATTRIBUTE_LABELS.get(
                     str(item.get("stat", "")), "主属性"
+                )
+            elif kind == "advanced_stat":
+                label = ADVANCED_ATTRIBUTE_LABELS.get(
+                    str(item.get("stat", "")), "高级属性"
                 )
             elif kind.startswith("resistance_"):
                 label = DAMAGE_TYPE_LABELS.get(
@@ -851,6 +952,53 @@ class LevelUpPvpCommandHandler:
                     user_id=target_id,
                     nickname=target_id,
                 )
+        return None
+
+    def _grant_target_identity(
+        self,
+        event: AstrMessageEvent,
+    ) -> UserIdentity | None:
+        """Resolve an admin grant target, including QQ Official's aliased At ID."""
+        sender_id = str(event.get_sender_id() or "")
+        platform = event.get_platform_id() or event.get_platform_name() or "unknown"
+        group_id = event.get_group_id() or ""
+        text = event.get_message_str() or ""
+        command_index = text.find("给予")
+        for match in MENTION_MARKUP_PATTERN.finditer(text):
+            target_id = (match.group("legacy_id") or match.group("qqbot_id")).strip()
+            if (
+                match.start() > command_index
+                and target_id
+                not in {"", "all", "qq_official", "unknown_selfid"}
+            ):
+                return UserIdentity(platform, group_id, target_id, target_id)
+        for comp in event.get_messages():
+            if not isinstance(comp, At):
+                continue
+            target_id = str(comp.qq)
+            if target_id in {
+                "",
+                "all",
+                "qq_official",
+                "unknown_selfid",
+                sender_id,
+            }:
+                continue
+            if (
+                target_id == str(event.get_self_id() or "")
+                and (
+                    (event.get_platform_name() or "") != "qq_official"
+                    or bool(comp.name)
+                    or re.match(r"^\s*/给予(?:\s|$)", text) is None
+                )
+            ):
+                continue
+            return UserIdentity(
+                platform=platform,
+                group_id=group_id,
+                user_id=target_id,
+                nickname=comp.name or target_id,
+            )
         return None
 
     def _target_identity_from_text(

@@ -568,6 +568,252 @@ class AstrBotMentionCompatibilityTests(unittest.TestCase):
         self.assertIsNotNone(target)
         self.assertEqual("target-openid", target.user_id)
 
+    def test_qqofficial_markup_supports_bot_mentioned_grant_command(self):
+        event = FakeEvent(
+            platform="qq_official",
+            message=(
+                '<qqbot-at-user id="qq_official" /> 给予 '
+                '<qqbot-at-user id="target-openid" /> 1001'
+            ),
+            messages=[At("qq_official", "机器人")],
+            self_id="qq_official",
+        )
+
+        self.assertEqual(
+            ("给予", "1001"),
+            self.handler.parse_mentioned_command(event),
+        )
+        target = self.handler._grant_target_identity(event)
+        self.assertEqual("target-openid", target.user_id)
+
+
+class EquipmentGrantCommandTests(unittest.IsolatedAsyncioTestCase):
+    def _handler(self, *, user_service=None, equipment_service=None):
+        return LevelUpPvpCommandHandler(
+            context=None,
+            user_service=user_service or types.SimpleNamespace(),
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+            equipment_service=equipment_service or types.SimpleNamespace(),
+        )
+
+    async def test_non_admin_is_rejected_by_handler_recheck(self):
+        equipment_service = types.SimpleNamespace(
+            grant_catalog_item=mock.AsyncMock()
+        )
+        handler = self._handler(equipment_service=equipment_service)
+        event = FakeEvent()
+        event.is_admin = lambda: False
+
+        replies = [
+            reply async for reply in handler.grant_equipment(event, "本群 1001")
+        ]
+
+        self.assertEqual(["只有 AstrBot 管理员可以使用该指令。"], replies)
+        equipment_service.grant_catalog_item.assert_not_awaited()
+
+    async def test_full_server_without_confirmation_only_previews(self):
+        entry = types.SimpleNamespace(
+            catalog_id=1001,
+            template=types.SimpleNamespace(name="训练长剑"),
+        )
+        user_service = types.SimpleNamespace(
+            list_user_pks=mock.AsyncMock(return_value=[1, 2, 3])
+        )
+        equipment_service = types.SimpleNamespace(
+            catalog=types.SimpleNamespace(get=lambda catalog_id: entry),
+            grant_catalog_item=mock.AsyncMock(),
+        )
+        handler = self._handler(
+            user_service=user_service,
+            equipment_service=equipment_service,
+        )
+        event = FakeEvent()
+        event.is_admin = lambda: True
+
+        replies = [
+            reply async for reply in handler.grant_equipment(event, "全服 1001")
+        ]
+
+        self.assertIn("预计接收人数：3", replies[0])
+        self.assertIn("/给予 全服 1001 确认", replies[0])
+        equipment_service.grant_catalog_item.assert_not_awaited()
+
+    async def test_qqofficial_aliased_at_is_used_as_single_target(self):
+        target_id = "B2DDC6FFD2F562C68CC02CAD749EF622"
+        user = types.SimpleNamespace(id=42)
+        entry = types.SimpleNamespace(
+            catalog_id=1001,
+            template=types.SimpleNamespace(name="训练长剑"),
+        )
+        grant_result = types.SimpleNamespace(
+            catalog_id=1001,
+            equipment_name="训练长剑",
+            granted=1,
+            skipped=0,
+        )
+        user_service = types.SimpleNamespace(
+            get_or_create_user=mock.AsyncMock(return_value=user)
+        )
+        equipment_service = types.SimpleNamespace(
+            catalog=types.SimpleNamespace(get=lambda catalog_id: entry),
+            grant_catalog_item=mock.AsyncMock(return_value=grant_result),
+        )
+        handler = self._handler(
+            user_service=user_service,
+            equipment_service=equipment_service,
+        )
+        event = FakeEvent(
+            platform="qq_official",
+            sender_id="sender-openid",
+            self_id=target_id,
+            message="/给予 1001",
+            messages=[At(target_id, "")],
+        )
+        event.is_admin = lambda: True
+
+        replies = [
+            reply async for reply in handler.grant_equipment(event, "1001")
+        ]
+
+        identity = user_service.get_or_create_user.await_args.args[0]
+        self.assertEqual(identity.user_id, target_id)
+        equipment_service.grant_catalog_item.assert_awaited_once_with([42], 1001)
+        self.assertIn("成功：1 人", replies[0])
+
+    async def test_admin_can_explicitly_at_self_for_single_grant(self):
+        sender_id = "BC729CFA021694764C24EF8C285DD78B"
+        user = types.SimpleNamespace(id=42)
+        entry = types.SimpleNamespace(
+            catalog_id=2001,
+            template=types.SimpleNamespace(name="珍贵的龟龟项链"),
+        )
+        result = types.SimpleNamespace(
+            catalog_id=2001,
+            equipment_name="珍贵的龟龟项链",
+            granted=1,
+            skipped=0,
+        )
+        user_service = types.SimpleNamespace(
+            get_or_create_user=mock.AsyncMock(return_value=user)
+        )
+        equipment_service = types.SimpleNamespace(
+            catalog=types.SimpleNamespace(get=lambda catalog_id: entry),
+            grant_catalog_item=mock.AsyncMock(return_value=result),
+        )
+        handler = self._handler(
+            user_service=user_service,
+            equipment_service=equipment_service,
+        )
+        event = FakeEvent(
+            platform="qq_official",
+            sender_id=sender_id,
+            self_id="qq_official",
+            message=f"/给予 <@{sender_id}> 2001",
+            messages=[At(sender_id, "")],
+        )
+        event.is_admin = lambda: True
+
+        replies = [
+            reply
+            async for reply in handler.grant_equipment(
+                event,
+                f"<@{sender_id}> 2001",
+            )
+        ]
+
+        identity = user_service.get_or_create_user.await_args.args[0]
+        self.assertEqual(identity.user_id, sender_id)
+        equipment_service.grant_catalog_item.assert_awaited_once_with([42], 2001)
+        self.assertIn("成功：1 人", replies[0])
+
+    async def test_full_server_confirmation_grants_to_every_role(self):
+        entry = types.SimpleNamespace(
+            catalog_id=1001,
+            template=types.SimpleNamespace(name="训练长剑"),
+        )
+        result = types.SimpleNamespace(
+            catalog_id=1001,
+            equipment_name="训练长剑",
+            granted=2,
+            skipped=1,
+        )
+        user_service = types.SimpleNamespace(
+            list_user_pks=mock.AsyncMock(return_value=[1, 2, 3])
+        )
+        equipment_service = types.SimpleNamespace(
+            catalog=types.SimpleNamespace(get=lambda catalog_id: entry),
+            grant_catalog_item=mock.AsyncMock(return_value=result),
+        )
+        handler = self._handler(
+            user_service=user_service,
+            equipment_service=equipment_service,
+        )
+        event = FakeEvent()
+        event.is_admin = lambda: True
+
+        replies = [
+            reply
+            async for reply in handler.grant_equipment(
+                event,
+                "全服 1001 确认",
+            )
+        ]
+
+        equipment_service.grant_catalog_item.assert_awaited_once_with(
+            [1, 2, 3],
+            1001,
+        )
+        self.assertIn("成功：2 人", replies[0])
+        self.assertIn("已有跳过：1 人", replies[0])
+
+    async def test_equipment_detail_displays_persisted_description(self):
+        item = types.SimpleNamespace(
+            id=88,
+            name="珍贵的龟龟项链",
+            description="某个笨蛋丢失了大家最宝贵的东西",
+            quality="legendary",
+            star_type="black_star",
+            item_level=1,
+            material="emerald",
+            blessing_state="normal",
+            weight=0.1,
+            enhancement_level=0,
+            used_capacity=0,
+            enchant_capacity=0,
+            base_stats={},
+            inherent_affixes=(
+                {"type": "advanced_stat", "stat": "life_growth", "value": 10},
+                {"type": "advanced_stat", "stat": "mana_growth", "value": 10},
+                {"type": "advanced_stat", "stat": "speed", "value": 5},
+                {"type": "advanced_stat", "stat": "luck", "value": 5},
+            ),
+            random_affixes=(),
+            fusion_affixes=(),
+        )
+        equipment_service = types.SimpleNamespace(
+            item_detail=mock.AsyncMock(return_value=item)
+        )
+        handler = self._handler(equipment_service=equipment_service)
+        handler._own_user = mock.AsyncMock(return_value=types.SimpleNamespace(id=1))
+        handler.reply_text = mock.AsyncMock(
+            side_effect=lambda event, text, *args: text
+        )
+
+        replies = [
+            reply async for reply in handler.equipment_detail(FakeEvent(), 88)
+        ]
+
+        self.assertIn(
+            "介绍：某个笨蛋丢失了大家最宝贵的东西",
+            replies[0],
+        )
+        self.assertIn(
+            "固有词条：生命成长+10、魔法成长+10、速度+5、幸运+5",
+            replies[0],
+        )
+
 
 class QQOfficialChallengeDispatchTests(unittest.IsolatedAsyncioTestCase):
     async def test_misreported_self_id_reaches_battle_service(self):

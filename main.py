@@ -42,7 +42,7 @@ PLUGIN_NAME = "astrbot_plugin_LevelUpPvp"
 LEGACY_DB_PATH = os.path.join(PLUGIN_DIR, "data", "db_level_up_pvp.db")
 
 
-@register(PLUGIN_NAME, "QuanWenG", "群聊自动签到，升级就开打", "1.6.7")
+@register(PLUGIN_NAME, "QuanWenG", "群聊自动签到，升级就开打", "1.7.2")
 class MyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -169,6 +169,22 @@ class MyPlugin(Star):
         ):
             yield result
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("给予")
+    async def grant_equipment(self, event: AstrMessageEvent, args: GreedyStr):
+        """向单人、本群或全服发放装备表中的一件装备。"""
+        await self._ensure_database_ready()
+        async for result in self.command_handler.grant_equipment(event, args):
+            yield result
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("重载装备表")
+    async def reload_equipment_catalog(self, event: AstrMessageEvent):
+        """校验并原子重载装备目录。"""
+        await self._ensure_database_ready()
+        async for result in self.command_handler.reload_equipment_catalog(event):
+            yield result
+
     @filter.command("背包")
     async def inventory(self, event: AstrMessageEvent, page: int = 1):
         await self._ensure_database_ready()
@@ -275,6 +291,12 @@ class MyPlugin(Star):
                     event,
                     args,
                 ):
+                    yield result
+            elif command == "给予":
+                async for result in self.command_handler.grant_equipment(event, args):
+                    yield result
+            elif command == "重载装备表":
+                async for result in self.command_handler.reload_equipment_catalog(event):
                     yield result
             elif command == "背包":
                 page = int(args) if args.strip().isdigit() else 1
