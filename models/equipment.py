@@ -29,6 +29,7 @@ class EquipmentTemplate:
     inherent_affixes: tuple[dict, ...] = ()
     weight_range_exception: bool = False
     description: str = ""
+    source_effects: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,7 @@ class EquipmentItem:
     fusion_affixes: tuple[dict, ...] = ()
     bound: bool = True
     description: str = ""
+    source_effects: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not 0 <= self.item_level <= 100:
@@ -75,6 +77,17 @@ class EquipmentItem:
         return 3 if self.star_type == "black_star" else 2 if self.star_type == "white_star" else 0
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class EquipmentProc:
+    source_template_id: str
+    proc_type: str
+    target: str
+    chance: float
+    ability_id: str = ""
+    source_power: int = 0
+    params: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -112,6 +125,7 @@ class EquipmentBuild:
     item_weights: dict[int, float] = field(default_factory=dict)
     physical_accuracy_multiplier: float = 1.0
     spell_accuracy_multiplier: float = 1.0
+    equipment_procs: tuple[EquipmentProc, ...] = ()
 
     @property
     def is_ranged(self) -> bool:

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import random
 import time
@@ -13,6 +14,7 @@ try:
     from .equipment_service import EquipmentService
     from .combat_ai import profile_for_strategy
     from .combat_engine import SideviewCombatEngine
+    from .combat_state_service import CombatStateService
     from .db import connect_db
     from .llm_service import LLMService
     from .skill_service import SkillService
@@ -29,6 +31,7 @@ except ImportError:
     from services.equipment_service import EquipmentService
     from services.combat_ai import profile_for_strategy
     from services.combat_engine import SideviewCombatEngine
+    from services.combat_state_service import CombatStateService
     from services.db import connect_db
     from services.llm_service import LLMService
     from services.skill_service import SkillService
@@ -67,6 +70,9 @@ class BattleService:
         spell_service=None,
     ):
         self.db_path = db_path
+        self._identity_locks: dict[
+            tuple[str, str, str], asyncio.Lock
+        ] = {}
         self.user_service = user_service
         self.llm_service = llm_service
         self.equipment_service = equipment_service or EquipmentService(db_path)
@@ -80,9 +86,44 @@ class BattleService:
             self.spell_service,
         )
         self.combat_engine = SideviewCombatEngine()
+        self.combat_state_service = CombatStateService(
+            db_path, self.combat_engine
+        )
         self.report_builder = BattleReportBuilder()
 
     async def battle(
+        self,
+        attacker_identity: UserIdentity,
+        defender_identity: UserIdentity,
+        strategy: str,
+        context=None,
+        event=None,
+    ) -> BattleResult:
+        keys = sorted(
+            {
+                self._identity_lock_key(attacker_identity),
+                self._identity_lock_key(defender_identity),
+            }
+        )
+        locks = [
+            self._identity_locks.setdefault(key, asyncio.Lock())
+            for key in keys
+        ]
+        for lock in locks:
+            await lock.acquire()
+        try:
+            return await self._battle_locked(
+                attacker_identity,
+                defender_identity,
+                strategy,
+                context,
+                event,
+            )
+        finally:
+            for lock in reversed(locks):
+                lock.release()
+
+    async def _battle_locked(
         self,
         attacker_identity: UserIdentity,
         defender_identity: UserIdentity,
@@ -118,6 +159,17 @@ class BattleService:
             await self._check_challenge_limit(db, attacker.id, defender.id)
             attacker_snapshot = await self.build_service.snapshot_in_db(db, attacker, attacker_strategy)
             defender_snapshot = await self.build_service.snapshot_in_db(db, defender, defender_strategy)
+            state_now_ts = int(time.time())
+            attacker_initial_state = (
+                await self.combat_state_service.load_in_db(
+                    db, attacker_snapshot, state_now_ts
+                )
+            )
+            defender_initial_state = (
+                await self.combat_state_service.load_in_db(
+                    db, defender_snapshot, state_now_ts
+                )
+            )
             await db.commit()
 
         custom_strategy_profiles = {}
@@ -158,6 +210,8 @@ class BattleService:
                 custom_strategy_profiles.get(defender_strategy),
             ),
             random_seed,
+            attacker_initial_state,
+            defender_initial_state,
         )
         local_battle_log = self.report_builder.build(simulation)
         legacy_roll_value = random.Random(random_seed ^ 0x5DEECE66D).random()
@@ -208,6 +262,18 @@ class BattleService:
             )
 
             now_ts = int(time.time())
+            await self.combat_state_service.save_in_db(
+                db,
+                attacker.id,
+                simulation.attacker_final_state,
+                now_ts,
+            )
+            await self.combat_state_service.save_in_db(
+                db,
+                defender.id,
+                simulation.defender_final_state,
+                now_ts,
+            )
             await db.execute(
                 """
                 INSERT INTO battles (
@@ -347,6 +413,34 @@ class BattleService:
             attribute_growths=attribute_growths,
             spell_growths=spell_growths,
         )
+
+    @staticmethod
+    def _identity_lock_key(
+        identity: UserIdentity,
+    ) -> tuple[str, str, str]:
+        return (
+            str(identity.platform),
+            str(identity.group_id),
+            str(identity.user_id),
+        )
+
+    async def combat_state_view(self, user: User):
+        """Return a read-only, recovered preview for the profile panel."""
+        now_ts = int(time.time())
+        async with await connect_db(self.db_path) as db:
+            current_user = await self.user_service.get_user_by_pk_in_db(
+                db, user.id
+            )
+            snapshot = await self.build_service.snapshot_in_db(
+                db, current_user, ""
+            )
+            state = await self.combat_state_service.load_in_db(
+                db,
+                snapshot,
+                now_ts,
+                consume_defeat=False,
+            )
+        return self.combat_state_service.view(snapshot, state, now_ts)
 
     def _fighter_snapshot(self, user: User, strategy: str) -> FighterSnapshot:
         return FighterSnapshot(

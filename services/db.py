@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 
@@ -11,6 +12,30 @@ PRIMARY_ATTRIBUTE_REBALANCE_MIGRATION = "2026-07-primary-attributes-v2"
 PRIMARY_ATTRIBUTE_REBALANCE_BACKUP_SUFFIX = ".pre-primary-attributes-v2.bak"
 ELONA_BALANCE_MIGRATION = "2026-07-elona-balance-v1"
 ELONA_BALANCE_BACKUP_SUFFIX = ".pre-elona-balance-v1.bak"
+CLASSIC_BLACK_STAR_LEVEL_MIGRATION = "2026-07-classic-black-stars-level-40-v1"
+CLASSIC_BLACK_STAR_EFFECTS_MIGRATION = "2026-07-classic-black-stars-effects-v2"
+CLASSIC_BLACK_STAR_TEMPLATE_IDS = (
+    "black_star_ether_dagger",
+    "black_star_lucky_dagger",
+    "black_star_claymore",
+    "black_star_diabolos",
+    "black_star_zantetsu",
+    "black_star_ragnarok",
+    "black_star_rankis",
+    "black_star_holy_lance",
+    "black_star_axe_of_destruction",
+    "black_star_void_scythe",
+    "black_star_kumiromi_scythe",
+    "black_star_hammer_of_earth",
+    "black_star_elemental_staff",
+    "black_star_bow_of_vindale",
+    "black_star_wind_bow",
+    "black_star_winchester_premium",
+    "black_star_rail_gun",
+    "black_star_sage_helm",
+    "black_star_aurora_ring_black_star",
+    "black_star_seven_league_boots_black_star",
+)
 
 
 class _AsyncSQLiteCursor:
@@ -162,6 +187,31 @@ async def init_db(db_path: str) -> None:
                 FOREIGN KEY(countered_battle_id) REFERENCES battles(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS combat_states (
+                user_pk INTEGER PRIMARY KEY,
+                hp_ratio REAL NOT NULL DEFAULT 1,
+                mana_ratio REAL NOT NULL DEFAULT 1,
+                stamina_ratio REAL NOT NULL DEFAULT 1,
+                hp_regen_buffer REAL NOT NULL DEFAULT 0,
+                mp_regen_buffer REAL NOT NULL DEFAULT 0,
+                sp_regen_buffer REAL NOT NULL DEFAULT 0,
+                recovery_turn_phase INTEGER NOT NULL DEFAULT 0,
+                statuses_json TEXT NOT NULL DEFAULT '[]',
+                skill_cooldowns_json TEXT NOT NULL DEFAULT '{}',
+                attack_cooldown INTEGER NOT NULL DEFAULT 0,
+                recovery_ticks INTEGER NOT NULL DEFAULT 0,
+                hitstun_ticks INTEGER NOT NULL DEFAULT 0,
+                counter_cooldown INTEGER NOT NULL DEFAULT 0,
+                stance_id TEXT,
+                frozen_mana_ratio REAL NOT NULL DEFAULT 0,
+                frozen_mana_capacity_ratio REAL NOT NULL DEFAULT 0,
+                lethal_survival_used INTEGER NOT NULL DEFAULT 0,
+                defeated INTEGER NOT NULL DEFAULT 0,
+                updated_at_ts INTEGER NOT NULL DEFAULT 0,
+                version INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS level_up_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_pk INTEGER NOT NULL,
@@ -224,6 +274,7 @@ async def init_db(db_path: str) -> None:
                 inherent_affixes_json TEXT NOT NULL DEFAULT '[]', random_affixes_json TEXT NOT NULL DEFAULT '[]',
                 fusion_affixes_json TEXT NOT NULL DEFAULT '[]', bound INTEGER NOT NULL DEFAULT 1,
                 description TEXT NOT NULL DEFAULT '',
+                source_effects_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL, FOREIGN KEY(owner_pk) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS equipment_loadout (
@@ -312,6 +363,19 @@ async def init_db(db_path: str) -> None:
                 FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(battle_id) REFERENCES battles(id) ON DELETE SET NULL
             );
+            CREATE TABLE IF NOT EXISTS external_activity_rewards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_pk INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                reward_key TEXT NOT NULL,
+                component TEXT NOT NULL CHECK(component IN ('attempt', 'correct')),
+                level_exp_gain INTEGER NOT NULL DEFAULT 0,
+                perception_exp_gain INTEGER NOT NULL DEFAULT 0,
+                magic_exp_gain INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_pk, source, reward_key, component),
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
             CREATE INDEX IF NOT EXISTS idx_checkins_user_date
                 ON checkins(user_pk, checkin_date);
             CREATE INDEX IF NOT EXISTS idx_battles_attacker
@@ -334,6 +398,8 @@ async def init_db(db_path: str) -> None:
                 ON advanced_attribute_logs(user_pk, created_at);
             CREATE INDEX IF NOT EXISTS idx_attribute_growth_user
                 ON attribute_growth_logs(user_pk, battle_id);
+            CREATE INDEX IF NOT EXISTS idx_external_activity_reward_lookup
+                ON external_activity_rewards(user_pk, source, reward_key);
             CREATE INDEX IF NOT EXISTS idx_skill_growth_user
                 ON skill_growth_logs(user_pk, battle_id);
             CREATE INDEX IF NOT EXISTS idx_spellbooks_owner
@@ -373,12 +439,24 @@ async def init_db(db_path: str) -> None:
         await _ensure_column(db, "users", "advanced_speed", "INTEGER NOT NULL DEFAULT 100")
         await _ensure_column(db, "users", "advanced_luck", "INTEGER NOT NULL DEFAULT 100")
         await _ensure_column(db, "users", "skill_points", "INTEGER NOT NULL DEFAULT 0")
+        await _ensure_column(
+            db,
+            "combat_states",
+            "recovery_turn_phase",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
         await _ensure_column(db, "users", "willpower", "INTEGER NOT NULL DEFAULT 1")
         await _ensure_column(
             db,
             "equipment_items",
             "description",
             "TEXT NOT NULL DEFAULT ''",
+        )
+        await _ensure_column(
+            db,
+            "equipment_items",
+            "source_effects_json",
+            "TEXT NOT NULL DEFAULT '[]'",
         )
         await _ensure_column(db, "level_up_logs", "skill_points_gain", "INTEGER NOT NULL DEFAULT 0")
         await _ensure_column(db, "level_freezes", "frozen_skill_points", "INTEGER NOT NULL DEFAULT 0")
@@ -391,6 +469,8 @@ async def init_db(db_path: str) -> None:
         await db.commit()
         await _apply_primary_attribute_rebalance(db, db_path)
         await _apply_elona_balance_reset(db, db_path)
+        await _apply_classic_black_star_level_migration(db)
+        await _apply_classic_black_star_effects_migration(db)
 
 
 async def _ensure_column(db, table_name: str, column_name: str, definition: str) -> None:
@@ -559,6 +639,96 @@ async def _apply_elona_balance_reset(db, db_path: str) -> None:
             VALUES (?, datetime('now'))
             """,
             (ELONA_BALANCE_MIGRATION,),
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+
+async def _apply_classic_black_star_level_migration(db) -> None:
+    cursor = await db.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_id = ?",
+        (CLASSIC_BLACK_STAR_LEVEL_MIGRATION,),
+    )
+    already_applied = await cursor.fetchone()
+    await cursor.close()
+    if already_applied:
+        return
+
+    placeholders = ", ".join("?" for _ in CLASSIC_BLACK_STAR_TEMPLATE_IDS)
+    await db.execute("BEGIN")
+    try:
+        await db.execute(
+            f"""
+            UPDATE equipment_items
+            SET item_level = 40
+            WHERE template_id IN ({placeholders})
+            """,
+            CLASSIC_BLACK_STAR_TEMPLATE_IDS,
+        )
+        await db.execute(
+            """
+            INSERT INTO schema_migrations (migration_id, applied_at)
+            VALUES (?, datetime('now'))
+            """,
+            (CLASSIC_BLACK_STAR_LEVEL_MIGRATION,),
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+
+async def _apply_classic_black_star_effects_migration(db) -> None:
+    cursor = await db.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_id = ?",
+        (CLASSIC_BLACK_STAR_EFFECTS_MIGRATION,),
+    )
+    already_applied = await cursor.fetchone()
+    await cursor.close()
+    if already_applied:
+        return
+
+    try:
+        from .equipment_catalog import DEFAULT_EQUIPMENT_CATALOG
+    except ImportError:
+        from services.equipment_catalog import DEFAULT_EQUIPMENT_CATALOG
+
+    entries = tuple(
+        DEFAULT_EQUIPMENT_CATALOG.snapshot.by_template_id[template_id]
+        for template_id in CLASSIC_BLACK_STAR_TEMPLATE_IDS
+    )
+    await db.execute("BEGIN")
+    try:
+        for entry in entries:
+            template = entry.template
+            await db.execute(
+                """
+                UPDATE equipment_items
+                SET name = ?, item_level = 40, weight = ?,
+                    base_stats_json = ?, inherent_affixes_json = ?,
+                    description = ?, source_effects_json = ?
+                WHERE template_id = ?
+                """,
+                (
+                    template.name,
+                    template.weight,
+                    json.dumps(template.base_stats, ensure_ascii=False),
+                    json.dumps(
+                        template.inherent_affixes, ensure_ascii=False
+                    ),
+                    template.description,
+                    json.dumps(template.source_effects, ensure_ascii=False),
+                    template.template_id,
+                ),
+            )
+        await db.execute(
+            """
+            INSERT INTO schema_migrations (migration_id, applied_at)
+            VALUES (?, datetime('now'))
+            """,
+            (CLASSIC_BLACK_STAR_EFFECTS_MIGRATION,),
         )
         await db.commit()
     except Exception:

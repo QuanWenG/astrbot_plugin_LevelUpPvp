@@ -37,8 +37,36 @@ class EquipmentCatalogTests(unittest.TestCase):
 
     def test_all_training_items_and_turtle_necklace_are_data_driven(self):
         snapshot = self._load()
-        self.assertEqual(len(snapshot.entries), 19)
+        self.assertEqual(snapshot.schema_version, 2)
+        self.assertEqual(len(snapshot.entries), 151)
         self.assertEqual(len(snapshot.starter_entries), 18)
+        self.assertEqual(
+            sum(entry.mode == "generated" for entry in snapshot.entries),
+            112,
+        )
+        self.assertEqual(
+            sum(
+                entry.fixed.get("star_type") == "black_star"
+                for entry in snapshot.entries
+            ),
+            21,
+        )
+        self.assertEqual(
+            {entry.catalog_id for entry in snapshot.entries if 3001 <= entry.catalog_id <= 3112},
+            set(range(3001, 3113)),
+        )
+        self.assertEqual(
+            {entry.catalog_id for entry in snapshot.entries if 4001 <= entry.catalog_id <= 4020},
+            set(range(4001, 4021)),
+        )
+        self.assertEqual(
+            {
+                entry.fixed["item_level"]
+                for entry in snapshot.entries
+                if 4001 <= entry.catalog_id <= 4020
+            },
+            {40},
+        )
         longsword = snapshot.by_id[1001]
         item = EquipmentFactory().create_from_catalog(7, longsword, seed=99)
         self.assertEqual(item.template_id, "training_longsword")
@@ -129,6 +157,26 @@ class EquipmentCatalogTests(unittest.TestCase):
         )
         self.assertGreater(len({item.item_level for item in items}), 1)
 
+    def test_v2_generated_materials_are_weighted_and_reproducible(self):
+        snapshot = self._load()
+        entry = snapshot.by_id[3001]
+        factory = EquipmentFactory()
+        first = factory.create_from_catalog(1, entry, seed=12345)
+        replay = factory.create_from_catalog(1, entry, seed=12345)
+        materials = {item["material"] for item in entry.generation["materials"]}
+
+        self.assertEqual(first, replay)
+        self.assertIn(first.material, materials)
+        self.assertGreater(
+            len(
+                {
+                    factory.create_from_catalog(1, entry, seed=seed).material
+                    for seed in range(40)
+                }
+            ),
+            1,
+        )
+
     def test_invalid_catalog_fields_are_rejected(self):
         cases = {}
 
@@ -176,6 +224,24 @@ class EquipmentCatalogTests(unittest.TestCase):
         }
         cases["随机传奇"] = generated_legendary
 
+        generated_index = next(
+            index
+            for index, item in enumerate(self.raw["items"])
+            if item["id"] == 3001
+        )
+        for label, materials in {
+            "空材质池": [],
+            "未知生成材质": [{"material": "not-a-material", "weight": 1}],
+            "非法材质权重": [{"material": "iron", "weight": 0}],
+            "重复生成材质": [
+                {"material": "iron", "weight": 1},
+                {"material": "iron", "weight": 2},
+            ],
+        }.items():
+            invalid = copy.deepcopy(self.raw)
+            invalid["items"][generated_index]["generation"]["materials"] = materials
+            cases[label] = invalid
+
         for label, raw in cases.items():
             with self.subTest(label=label), self.assertRaises(ValueError):
                 self._load(raw)
@@ -188,7 +254,7 @@ class EquipmentCatalogTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             catalog.reload()
         self.assertIs(catalog.snapshot, previous)
-        self.assertEqual(len(catalog.snapshot.entries), 19)
+        self.assertEqual(len(catalog.snapshot.entries), 151)
 
 
 class EquipmentGrantServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -278,6 +344,7 @@ class EquipmentGrantServiceTests(unittest.IsolatedAsyncioTestCase):
             columns = {row["name"] for row in await cursor.fetchall()}
             await cursor.close()
         self.assertIn("description", columns)
+        self.assertIn("source_effects_json", columns)
 
     async def test_legacy_equipment_table_gains_description_column(self):
         handle, legacy_path = tempfile.mkstemp(suffix=".db")
@@ -322,6 +389,7 @@ class EquipmentGrantServiceTests(unittest.IsolatedAsyncioTestCase):
                 columns = {row["name"] for row in await cursor.fetchall()}
                 await cursor.close()
             self.assertIn("description", columns)
+            self.assertIn("source_effects_json", columns)
         finally:
             os.remove(legacy_path)
 

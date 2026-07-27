@@ -61,7 +61,7 @@ class SideviewCombatEngineTests(unittest.TestCase):
                 self.assertLessEqual(abs(positions[1] - positions[2]), self.engine.ATTACK_RANGE)
         self.assertGreaterEqual(positions[2] - positions[1], self.engine.MIN_DISTANCE)
 
-    def test_timeout_uses_hp_ratio_tiebreak(self):
+    def test_timeout_uses_remaining_hp_before_other_tiebreaks(self):
         always_guard = AIProfile(
             aggression=0.0,
             guard_tendency=1.0,
@@ -78,9 +78,9 @@ class SideviewCombatEngineTests(unittest.TestCase):
             19,
         )
         self.assertEqual(result.duration_ticks, self.engine.MAX_TICKS)
-        self.assertEqual(result.finish_reason, "timeout_hp_ratio")
-        # Equal remaining ratios fall through to equal damage, speed and seeded luck.
-        self.assertIn(result.winner_pk, {1, 2})
+        self.assertEqual(result.finish_reason, "timeout_remaining_hp")
+        # Both are undamaged, so the fighter with the larger absolute HP wins.
+        self.assertEqual(result.winner_pk, 1)
 
     def test_every_builtin_strategy_can_simulate(self):
         self.assertEqual(set(config.BATTLE_STRATEGY_NAMES), set(STRATEGY_PROFILES))

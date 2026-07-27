@@ -1,5 +1,7 @@
 import random
+import types
 import unittest
+from unittest import mock
 
 from models.combat import AIProfile, BattleState, FighterSnapshot, FighterState
 from services.combat_ai import STRATEGY_PROFILES, choose_action
@@ -120,6 +122,81 @@ class CombatRuleTests(unittest.TestCase):
         self.assertTrue(
             any(event.kind == "attack_interrupted" for event in state.events)
         )
+
+    def test_equipment_life_steal_recovers_from_applied_damage(self):
+        equipment = types.SimpleNamespace(
+            combat_effects={"life_steal": 0.20},
+            armor_style="light",
+            total_weight=1.0,
+            overloaded=False,
+            max_stamina=100,
+        )
+        attacker_snapshot = FighterSnapshot(
+            **{
+                **_fighter(1, hp=10).__dict__,
+                "equipment": equipment,
+            }
+        )
+        target_snapshot = _fighter(2, hp=10)
+        attacker = FighterState(attacker_snapshot, 100, 450)
+        target = FighterState(target_snapshot, 100, 500)
+        state = BattleState(1, attacker, target, [], 1)
+
+        self.engine._apply_damage(
+            state,
+            attacker,
+            target,
+            (25, False, False),
+        )
+
+        self.assertEqual(attacker.current_hp, 105)
+        self.assertEqual(target.current_hp, 75)
+        self.assertTrue(any(event.kind == "life_steal" for event in state.events))
+
+    def test_equipment_armor_penetration_reduces_effective_defense(self):
+        equipment = types.SimpleNamespace(
+            combat_effects={"armor_penetration": 0.50},
+            armor_style="light",
+            total_weight=1.0,
+            overloaded=False,
+            max_stamina=100,
+            attack_recovery=2,
+            attack_cooldown=6,
+            attack_range=100,
+            physical_accuracy_multiplier=1.0,
+            spell_accuracy_multiplier=1.0,
+            weapon_mode="one_hand",
+            weapon_type="longsword",
+        )
+        attacker_snapshot = FighterSnapshot(
+            **{
+                **_fighter(1, atk=10).__dict__,
+                "equipment": equipment,
+            }
+        )
+        target_snapshot = _fighter(2, defense=100)
+        attacker = FighterState(
+            attacker_snapshot,
+            attacker_snapshot.max_hp,
+            450,
+            attack_pending=True,
+        )
+        target = FighterState(target_snapshot, target_snapshot.max_hp, 500)
+        state = BattleState(1, attacker, target, [], 1)
+
+        with mock.patch(
+            "services.combat_engine.physical_damage_amount",
+            return_value=10,
+        ) as calculate:
+            self.engine._attack_damage(
+                state,
+                attacker,
+                target,
+                "resolve_attack",
+                random.Random(1),
+            )
+
+        self.assertEqual(calculate.call_args.kwargs["defense"], 50.0)
     def test_attack_release_lunges_back_into_range(self):
         attacker_snapshot = _fighter(1)
         defender_snapshot = _fighter(2)

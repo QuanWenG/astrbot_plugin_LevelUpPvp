@@ -40,7 +40,12 @@ try:
         attribute_exp_required,
         skill_level_cap,
     )
+    from ..services.equipment_affixes import (
+        effective_inherent_affixes,
+        inherent_affix_level_ratio,
+    )
     from ..services.equipment_catalog import QUALITY_LABELS
+    from ..services.equipment_proc_service import EQUIPMENT_PROC_NAMES
     from ..services.material_catalog import actual_weight, material_for
     from ..services.skill_catalog import SKILL_DEFINITIONS
     from ..services.ability_catalog import (
@@ -58,7 +63,12 @@ except ImportError:
         attribute_exp_required,
         skill_level_cap,
     )
+    from services.equipment_affixes import (
+        effective_inherent_affixes,
+        inherent_affix_level_ratio,
+    )
     from services.equipment_catalog import QUALITY_LABELS
+    from services.equipment_proc_service import EQUIPMENT_PROC_NAMES
     from services.material_catalog import actual_weight, material_for
     from services.skill_catalog import SKILL_DEFINITIONS
     from services.ability_catalog import (
@@ -73,7 +83,7 @@ CHALLENGE_WAKE_WORDS = [
     "艾斯比",
     "啥比"
 ]
-MENTION_COMMAND_NAMES = ("重载装备表", "魔法书", "阅读", "法术", "战技", "修改登记", "装备详情", "训练技能", "技能栏", "签到", "面板", "加点", "排行", "登记", "挑战", "背包", "装备", "穿戴", "卸下", "技能", "学习", "给予")
+MENTION_COMMAND_NAMES = ("重载装备表", "装备图鉴", "魔法书", "阅读", "法术", "战技", "修改登记", "装备详情", "训练技能", "技能栏", "签到", "面板", "加点", "排行", "登记", "挑战", "背包", "装备", "穿戴", "卸下", "技能", "学习", "给予")
 MENTION_COMMAND_PATTERN = re.compile(
     rf"^/?({'|'.join(MENTION_COMMAND_NAMES)})(?:\s|$)"
 )
@@ -237,6 +247,7 @@ class LevelUpPvpCommandHandler:
             build = None
             derived = None
             progress = None
+            combat_state = None
             if self.equipment_service and self.skill_service and self.build_service:
                 slots, items = await self.equipment_service.get_loadout(user.id)
                 skills, _ = await self.skill_service.get_skills(user)
@@ -248,9 +259,15 @@ class LevelUpPvpCommandHandler:
                 )
                 if self.attribute_service and self.attribute_service.db_path:
                     progress = await self.attribute_service.get_progress(user.id)
+                if self.battle_service:
+                    combat_state = (
+                        await self.battle_service.combat_state_view(user)
+                    )
             yield await self.reply_text(
                 event,
-                self._format_profile(user, build, derived, progress),
+                self._format_profile(
+                    user, build, derived, progress, combat_state
+                ),
                 "LevelUpPvp 面板",
             )
         except Exception as exc:
@@ -340,6 +357,77 @@ class LevelUpPvpCommandHandler:
         except Exception as exc:
             yield await self.reply_text(event, f"查看装备失败：{exc}")
 
+    async def equipment_catalog(self, event, args: str = ""):
+        try:
+            parts = str(args or "").split()
+            if len(parts) > 2:
+                raise ValueError("用法：/装备图鉴 [页] [全部|武器|盾牌|防具|饰品|黑星]")
+            page = 1
+            category = "全部"
+            if parts:
+                if parts[0].isdigit():
+                    page = int(parts[0])
+                    if len(parts) == 2:
+                        category = parts[1]
+                else:
+                    category = parts[0]
+                    if len(parts) == 2:
+                        if not parts[1].isdigit():
+                            raise ValueError(
+                                "用法：/装备图鉴 [页] [全部|武器|盾牌|防具|饰品|黑星]"
+                            )
+                        page = int(parts[1])
+            predicates = {
+                "全部": lambda entry: True,
+                "武器": lambda entry: entry.template.item_type == "weapon",
+                "盾牌": lambda entry: entry.template.item_type == "shield",
+                "防具": lambda entry: entry.template.item_type == "armor",
+                "饰品": lambda entry: entry.template.item_type == "accessory",
+                "黑星": lambda entry: (
+                    entry.mode == "fixed"
+                    and entry.fixed.get("star_type") == "black_star"
+                ),
+            }
+            if category not in predicates:
+                raise ValueError(
+                    "未知分类。可用：全部、武器、盾牌、防具、饰品、黑星"
+                )
+            entries = [
+                entry
+                for entry in self.equipment_service.catalog.snapshot.entries
+                if predicates[category](entry)
+            ]
+            size = 20
+            total_pages = max(1, (len(entries) + size - 1) // size)
+            if page < 1 or page > total_pages:
+                raise ValueError(
+                    f"页码应在 1–{total_pages} 之间（{category}共{len(entries)}件）"
+                )
+            start = (page - 1) * size
+            lines = [
+                f"装备图鉴·{category} 第{page}/{total_pages}页 "
+                f"（共{len(entries)}件）"
+            ]
+            for entry in entries[start:start + size]:
+                template = entry.template
+                star = (
+                    "黑星"
+                    if entry.mode == "fixed"
+                    and entry.fixed.get("star_type") == "black_star"
+                    else "普通"
+                )
+                lines.append(
+                    f"{entry.catalog_id} {template.name} "
+                    f"[{SLOT_LABELS[template.equip_slot]}] {star}"
+                )
+            yield await self.reply_text(
+                event,
+                "\n".join(lines),
+                "LevelUpPvp 装备图鉴",
+            )
+        except Exception as exc:
+            yield await self.reply_text(event, f"查看装备图鉴失败：{exc}")
+
     async def grant_equipment(self, event, args: str):
         if not await self._is_astrbot_admin(event):
             yield await self.reply_text(event, ADMIN_REQUIRED_MESSAGE)
@@ -420,6 +508,35 @@ class LevelUpPvpCommandHandler:
             user = await self._own_user(event); item = await self.equipment_service.item_detail(user.id, int(equipment_id))
             material = material_for(item.material)
             resolved_weight = actual_weight(item.weight, item.material)
+            effective_inherent = effective_inherent_affixes(
+                item.inherent_affixes,
+                user.level,
+                item.item_level,
+            )
+            inherent_ratio = inherent_affix_level_ratio(
+                user.level,
+                item.item_level,
+            )
+            inherent_numeric = tuple(
+                affix
+                for affix in item.inherent_affixes
+                if affix.get("type") != "trigger_ability"
+            )
+            effective_numeric = tuple(
+                affix
+                for affix in effective_inherent
+                if affix.get("type") != "trigger_ability"
+            )
+            inherent_procs = tuple(
+                affix
+                for affix in item.inherent_affixes
+                if affix.get("type") == "trigger_ability"
+            )
+            effective_procs = tuple(
+                affix
+                for affix in effective_inherent
+                if affix.get("type") == "trigger_ability"
+            )
             lines = [f"#{item.id} {item.name}"]
             if item.description:
                 lines.append(f"介绍：{item.description}")
@@ -430,11 +547,27 @@ class LevelUpPvpCommandHandler:
                     f"重量：基础{item.weight:g} × {material.weight_multiplier:g} = {resolved_weight:.3f} 强化：+{item.enhancement_level}",
                     f"附魔容量：{item.used_capacity}/{item.enchant_capacity}",
                     f"基础：{item.base_stats or '无'}",
-                    f"固有词条：{self._format_affixes(item.inherent_affixes)}",
+                    f"固有词条（原始）：{self._format_affixes(inherent_numeric)}",
+                    self._effective_inherent_affix_line(
+                        effective_numeric,
+                        user.level,
+                        item.item_level,
+                        inherent_ratio,
+                    ),
+                    "触发能力（原始）："
+                    + self._format_proc_affixes(inherent_procs),
+                    "触发能力（当前有效）："
+                    + self._format_proc_affixes(effective_procs),
                     f"随机词条：{self._format_affixes(item.random_affixes)}",
                     f"融合词条：{self._format_affixes(item.fusion_affixes)}",
                 ]
             )
+            source_effects = tuple(getattr(item, "source_effects", ()))
+            if source_effects:
+                lines.append(
+                    "资料效果（当前未结算）："
+                    + "、".join(source_effects)
+                )
             yield await self.reply_text(
                 event, "\n".join(lines), "LevelUpPvp 装备详情"
             )
@@ -670,6 +803,13 @@ class LevelUpPvpCommandHandler:
             "knockback_resistance": "击退抗性", "melee_followup": "追打",
             "ranged_followup": "追射", "element_resistance": "元素耐性",
             "status_immunity": "异常免疫", "spell_power": "法术增益",
+            "armor_penetration": "护甲穿透", "life_steal": "生命汲取",
+            "stamina_steal": "耐力汲取", "mana_steal": "魔力汲取",
+            "execute_chance": "斩首概率",
+            "status_resistance": "负面状态抗性",
+            "status_resistance_paralysis": "麻痹抗性",
+            "status_resistance_confusion": "混乱抗性",
+            "max_hp": "最大生命",
             "accuracy": "命中", "evasion": "回避",
             "critical_rate": "暴击率", "critical_damage": "暴击伤害",
             "physical_reduction": "物理减伤",
@@ -696,8 +836,39 @@ class LevelUpPvpCommandHandler:
                 ) + "伤害"
             else:
                 label = labels.get(kind, kind)
-            rendered.append(f"{label}+{item.get('value', 0)}")
+            value = item.get("value", 0)
+            if isinstance(value, float):
+                value = f"{value:.4f}".rstrip("0").rstrip(".")
+            rendered.append(f"{label}+{value}")
         return "、".join(rendered)
+
+    def _format_proc_affixes(self, affixes) -> str:
+        if not affixes:
+            return "无"
+        rendered = []
+        for affix in affixes:
+            ability_id = str(affix.get("ability_id", ""))
+            name = EQUIPMENT_PROC_NAMES.get(ability_id, ability_id)
+            chance = max(0.0, min(1.0, float(affix.get("value", 0))))
+            rendered.append(f"{name} {chance:.1%}")
+        return "、".join(rendered)
+
+    def _effective_inherent_affix_line(
+        self,
+        affixes,
+        character_level: int,
+        item_level: int,
+        ratio: float,
+    ) -> str:
+        if item_level > 0 and character_level < item_level:
+            percent = f"{ratio * 100:.1f}".rstrip("0").rstrip(".")
+            status = (
+                f"角色Lv.{character_level}/需求Lv.{item_level}，"
+                f"数值比例{percent}%"
+            )
+            return f"固有词条（当前有效，{status}）：{self._format_affixes(affixes)}"
+        return f"固有词条（当前有效）：{self._format_affixes(affixes)}"
+
     def _armor_style_label(self, style: str) -> str:
         return {"light": "轻甲", "medium": "中甲", "heavy": "重甲"}.get(style, style)
     def _weapon_mode_label(self, mode: str) -> str:
@@ -1118,7 +1289,12 @@ class LevelUpPvpCommandHandler:
         return " ".join(text.split())
 
     def _format_profile(
-        self, user: User, build=None, derived=None, progress=None
+        self,
+        user: User,
+        build=None,
+        derived=None,
+        progress=None,
+        combat_state=None,
     ) -> str:
         lines = [
             f"{self._display_name(user)} 的面板",
@@ -1139,9 +1315,62 @@ class LevelUpPvpCommandHandler:
                 f"法术 {build.spell_accuracy_multiplier:.0%}"
             )
         if derived:
-            lines.append(
-                f"资源：HP {derived.max_hp} / MP {derived.max_mp} / SP {derived.max_sp}"
-            )
+            if combat_state:
+                lines.append(
+                    "当前状态："
+                    f"HP {combat_state.current_hp}/{combat_state.max_hp}｜"
+                    f"MP {combat_state.current_mp}/{combat_state.max_mp}｜"
+                    f"SP {combat_state.current_stamina}/"
+                    f"{combat_state.max_stamina}"
+                )
+                lines.append(
+                    "自然恢复：每30秒 "
+                    f"HP +{combat_state.rates.hp:.2f}｜"
+                    f"MP +{combat_state.rates.mp:.2f}｜"
+                    f"SP +{combat_state.rates.stamina:.2f}"
+                    f"（下回合 {combat_state.next_recovery_seconds}秒）"
+                )
+                active_statuses = [
+                    f"{item.get('status_id', 'unknown')} "
+                    f"{int(item.get('remaining_ticks', 0))}回合"
+                    for item in combat_state.state.statuses
+                    if int(item.get("remaining_ticks", 0)) > 0
+                ]
+                if active_statuses:
+                    lines.append("状态：" + " / ".join(active_statuses))
+                cooldowns = [
+                    f"{skill_id} {ticks}回合"
+                    for skill_id, ticks
+                    in combat_state.state.skill_cooldowns.items()
+                    if ticks > 0
+                ]
+                if combat_state.state.attack_cooldown > 0:
+                    cooldowns.append(
+                        f"普通攻击 {combat_state.state.attack_cooldown}回合"
+                    )
+                if combat_state.state.counter_cooldown > 0:
+                    cooldowns.append(
+                        f"反击 {combat_state.state.counter_cooldown}回合"
+                    )
+                if combat_state.state.recovery_ticks > 0:
+                    cooldowns.append(
+                        f"后摇 {combat_state.state.recovery_ticks}回合"
+                    )
+                if combat_state.state.hitstun_ticks > 0:
+                    cooldowns.append(
+                        f"硬直 {combat_state.state.hitstun_ticks}回合"
+                    )
+                if combat_state.state.stance_id:
+                    cooldowns.append(
+                        f"架势 {combat_state.state.stance_id}"
+                    )
+                if cooldowns:
+                    lines.append("延续状态：" + " / ".join(cooldowns))
+            else:
+                lines.append(
+                    f"资源：HP {derived.max_hp} / MP {derived.max_mp} / "
+                    f"SP {derived.max_sp}"
+                )
             lines.append(
                 f"战斗：攻击 {derived.attack_power:.1f} / 命中 {derived.accuracy:.1f} / "
                 f"防御 {derived.defense:.1f} / 回避 {derived.evasion:.1f} / "

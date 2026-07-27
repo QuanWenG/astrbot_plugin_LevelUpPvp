@@ -2,11 +2,13 @@ import math
 import random
 
 try:
+    from ..models.ability import CombatStatus
     from ..models.combat import (
         AIProfile,
         ActionIntent,
         BattleEvent,
         BattleState,
+        FighterContinuationState,
         FighterSnapshot,
         FighterState,
         SimulationResult,
@@ -18,12 +20,15 @@ try:
     )
     from .ability_runtime import AbilityRuntime
     from .combat_ai import choose_action
+    from .equipment_proc_service import EquipmentProcResolver
 except ImportError:
+    from models.ability import CombatStatus
     from models.combat import (
         AIProfile,
         ActionIntent,
         BattleEvent,
         BattleState,
+        FighterContinuationState,
         FighterSnapshot,
         FighterState,
         SimulationResult,
@@ -35,6 +40,7 @@ except ImportError:
     )
     from services.ability_runtime import AbilityRuntime
     from services.combat_ai import choose_action
+    from services.equipment_proc_service import EquipmentProcResolver
 
 
 class SideviewCombatEngine:
@@ -57,6 +63,9 @@ class SideviewCombatEngine:
 
     def __init__(self):
         self.ability_runtime = AbilityRuntime()
+        self.equipment_proc_resolver = EquipmentProcResolver(
+            self.ability_runtime
+        )
 
     def simulate(
         self,
@@ -65,24 +74,21 @@ class SideviewCombatEngine:
         attacker_profile: AIProfile,
         defender_profile: AIProfile,
         random_seed: int,
+        attacker_initial_state: FighterContinuationState | None = None,
+        defender_initial_state: FighterContinuationState | None = None,
     ) -> SimulationResult:
         rng = random.Random(random_seed)
         state = BattleState(
             tick=0,
-            attacker=FighterState(
-                attacker, attacker.max_hp, self.ATTACKER_START,
-                stamina=attacker.max_sp, mana=attacker.max_mp,
+            attacker=self._fighter_from_initial(
+                attacker, self.ATTACKER_START, attacker_initial_state
             ),
-            defender=FighterState(
-                defender, defender.max_hp, self.DEFENDER_START,
-                stamina=defender.max_sp, mana=defender.max_mp,
+            defender=self._fighter_from_initial(
+                defender, self.DEFENDER_START, defender_initial_state
             ),
             events=[],
             random_seed=random_seed,
         )
-        self.ability_runtime.stat_resolver.initialize(state.attacker)
-        self.ability_runtime.stat_resolver.initialize(state.defender)
-
         for tick in range(1, self.MAX_TICKS + 1):
             state.tick = tick
             pre_status_attacker_hp = state.attacker.current_hp
@@ -150,6 +156,12 @@ class SideviewCombatEngine:
             self._apply_damage(state, state.defender, state.attacker, defender_damage)
             self._apply_ability_secondary(state, state.attacker, state.defender, attacker_damage, rng)
             self._apply_ability_secondary(state, state.defender, state.attacker, defender_damage, rng)
+            self._apply_equipment_procs(
+                state, state.attacker, state.defender, attacker_damage, rng
+            )
+            self._apply_equipment_procs(
+                state, state.defender, state.attacker, defender_damage, rng
+            )
             normalized = self._normalize_positions(state.attacker.position, state.defender.position)
             self._record_positions(state, normalized[0], normalized[1], "teleport_adjust")
             self._apply_damage(state, state.attacker, state.defender, attacker_followup, "followup")
@@ -186,7 +198,7 @@ class SideviewCombatEngine:
 
         winner = self._resolve_timeout(state, rng)
         loser = state.defender if winner is state.attacker else state.attacker
-        state.finish_reason = "timeout_hp_ratio"
+        state.finish_reason = "timeout_remaining_hp"
         state.events.append(
             BattleEvent(
                 state.tick,
@@ -196,6 +208,116 @@ class SideviewCombatEngine:
             )
         )
         return self._result(state, winner, loser)
+
+    def _fighter_from_initial(
+        self,
+        snapshot: FighterSnapshot,
+        position: int,
+        initial: FighterContinuationState | None,
+    ) -> FighterState:
+        fighter = FighterState(
+            snapshot,
+            snapshot.max_hp,
+            position,
+            stamina=snapshot.max_sp,
+            mana=snapshot.max_mp,
+        )
+        self.ability_runtime.stat_resolver.initialize(fighter)
+        if initial is None:
+            return fighter
+
+        fighter.statuses = {
+            str(data["status_id"]): CombatStatus(**data)
+            for data in initial.statuses
+            if data.get("status_id") and int(data.get("remaining_ticks", 0)) > 0
+        }
+        fighter.skill_cooldowns = {
+            str(key): max(0, int(value))
+            for key, value in initial.skill_cooldowns.items()
+            if int(value) > 0
+        }
+        fighter.attack_cooldown = max(0, int(initial.attack_cooldown))
+        fighter.recovery_ticks = max(0, int(initial.recovery_ticks))
+        fighter.hitstun_ticks = max(0, int(initial.hitstun_ticks))
+        fighter.counter_cooldown = max(0, int(initial.counter_cooldown))
+        fighter.stance_id = (
+            initial.stance_id
+            if initial.stance_id in fighter.statuses else None
+        )
+        fighter.lethal_survival_used = bool(initial.lethal_survival_used)
+        fighter.hp_regen_buffer = max(0.0, float(initial.hp_regen_buffer))
+        fighter.mp_regen_buffer = max(0.0, float(initial.mp_regen_buffer))
+        fighter.sp_regen_buffer = max(0.0, float(initial.sp_regen_buffer))
+        fighter.recovery_turn_phase = (
+            max(0, int(initial.recovery_turn_phase)) % 5
+        )
+        if fighter.statuses:
+            self.ability_runtime.stat_resolver.refresh(fighter)
+
+        fighter.current_hp = max(
+            0, min(fighter.max_hp, round(fighter.max_hp * initial.hp_ratio))
+        )
+        fighter.mana = min(
+            fighter.max_mp, round(fighter.max_mp * initial.mana_ratio)
+        )
+        fighter.stamina = max(
+            0, min(fighter.max_sp, round(fighter.max_sp * initial.stamina_ratio))
+        )
+        if fighter.stance_id:
+            fighter.frozen_mana_capacity = max(
+                0,
+                min(
+                    fighter.max_mp,
+                    round(
+                        fighter.max_mp
+                        * initial.frozen_mana_capacity_ratio
+                    ),
+                ),
+            )
+            fighter.frozen_mana = max(
+                0,
+                min(
+                    fighter.frozen_mana_capacity,
+                    round(fighter.max_mp * initial.frozen_mana_ratio),
+                ),
+            )
+            fighter.mana = min(
+                fighter.mana,
+                max(0, fighter.max_mp - fighter.frozen_mana_capacity),
+            )
+        return fighter
+
+    @staticmethod
+    def _continuation_state(
+        fighter: FighterState,
+    ) -> FighterContinuationState:
+        max_hp = max(1, fighter.max_hp)
+        max_mp = max(1, fighter.max_mp)
+        max_sp = max(1, fighter.max_sp)
+        return FighterContinuationState(
+            hp_ratio=fighter.current_hp / max_hp,
+            mana_ratio=fighter.mana / max_mp,
+            stamina_ratio=fighter.stamina / max_sp,
+            hp_regen_buffer=fighter.hp_regen_buffer,
+            mp_regen_buffer=fighter.mp_regen_buffer,
+            sp_regen_buffer=fighter.sp_regen_buffer,
+            recovery_turn_phase=fighter.recovery_turn_phase,
+            statuses=tuple(
+                status.to_dict() for status in fighter.statuses.values()
+            ),
+            skill_cooldowns=dict(fighter.skill_cooldowns),
+            attack_cooldown=fighter.attack_cooldown,
+            recovery_ticks=fighter.recovery_ticks,
+            hitstun_ticks=fighter.hitstun_ticks,
+            counter_cooldown=fighter.counter_cooldown,
+            stance_id=fighter.stance_id,
+            frozen_mana_ratio=fighter.frozen_mana / max_mp,
+            frozen_mana_capacity_ratio=(
+                fighter.frozen_mana_capacity / max_mp
+            ),
+            lethal_survival_used=fighter.lethal_survival_used,
+            defeated=not fighter.alive,
+        )
 
     def _prepare_tick(
         self, state: BattleState, fighter: FighterState
@@ -411,8 +533,9 @@ class SideviewCombatEngine:
             for key in ("slow", "gravity"):
                 if key in fighter.statuses:
                     multiplier *= max(0.30, 1 - fighter.statuses[key].magnitude)
-            if "haste" in fighter.statuses:
-                multiplier *= 1 + fighter.statuses["haste"].magnitude
+            for speed_status in ("haste", "lulwy_possession"):
+                if speed_status in fighter.statuses:
+                    multiplier *= 1 + fighter.statuses[speed_status].magnitude
             multiplier *= max(
                 0.30, 1 - self.ability_runtime.modifier(fighter, "slow")
             )
@@ -421,8 +544,9 @@ class SideviewCombatEngine:
         for key in ("slow", "gravity"):
             if key in fighter.statuses:
                 multiplier *= max(0.30, 1 - fighter.statuses[key].magnitude)
-        if "haste" in fighter.statuses:
-            multiplier *= 1 + fighter.statuses["haste"].magnitude
+        for speed_status in ("haste", "lulwy_possession"):
+            if speed_status in fighter.statuses:
+                multiplier *= 1 + fighter.statuses[speed_status].magnitude
         multiplier *= max(0.30, 1 - self.ability_runtime.modifier(fighter, "slow"))
         return max(10, min(80, round(35 * fighter.current_derived.action_speed / 100 * multiplier)))
 
@@ -629,6 +753,15 @@ class SideviewCombatEngine:
             target_defense = target.snapshot.stat("defense")
             attack_power = actor.snapshot.stat("atk") * 4.0
             offense_multiplier = 1.0
+        equipment_effects = (
+            actor.snapshot.equipment.combat_effects
+            if actor.snapshot.equipment else {}
+        )
+        penetration = min(
+            0.75,
+            max(0.0, float(equipment_effects.get("armor_penetration", 0))),
+        )
+        target_defense *= 1.0 - penetration
         effect_multiplier = 1 + self.ability_runtime.modifier(actor, "physical_damage") - self.ability_runtime.modifier(actor, "damage_penalty")
         variance = rng.uniform(0.90, 1.10)
         physical_reduction = (target.current_derived.physical_reduction if target.current_derived else 0.0) + self.ability_runtime.modifier(target, "physical_reduction")
@@ -675,6 +808,40 @@ class SideviewCombatEngine:
             self.ability_runtime.apply_secondary(
                 state, actor, target, definition, damage_result, rng
             )
+
+    def _apply_equipment_procs(
+        self, state, actor, target, damage_result, rng
+    ) -> None:
+        if not self._is_direct_weapon_hit(actor, damage_result):
+            return
+        self.equipment_proc_resolver.resolve(
+            state,
+            actor,
+            target,
+            damage_result,
+            rng,
+            self._apply_damage,
+        )
+
+    @staticmethod
+    def _is_direct_weapon_hit(actor, damage_result) -> bool:
+        if not damage_result or damage_result[0] <= 0:
+            return False
+        ability_id = damage_result[4] if len(damage_result) > 4 else None
+        if not ability_id:
+            return True
+        definition = (
+            actor.snapshot.skills.active_definitions.get(ability_id)
+            if actor.snapshot.skills else None
+        )
+        return bool(
+            definition
+            and definition.ability_type != "spell"
+            and any(
+                effect.effect_type == "physical_damage"
+                for effect in definition.effects
+            )
+        )
     def _followup_damage(self, state, actor, target, first_result, rng):
         if first_result is None or not actor.snapshot.equipment:
             return None
@@ -749,8 +916,9 @@ class SideviewCombatEngine:
             action_speed *= max(0.30, 1 - fighter.statuses["slow"].magnitude)
         if "gravity" in fighter.statuses:
             action_speed *= max(0.30, 1 - fighter.statuses["gravity"].magnitude)
-        if "haste" in fighter.statuses:
-            action_speed *= 1 + fighter.statuses["haste"].magnitude
+        for speed_status in ("haste", "lulwy_possession"):
+            if speed_status in fighter.statuses:
+                action_speed *= 1 + fighter.statuses[speed_status].magnitude
         action_speed *= max(
             0.30, 1 - self.ability_runtime.modifier(fighter, "slow")
         )
@@ -822,6 +990,7 @@ class SideviewCombatEngine:
         target: FighterState,
         damage_result: tuple[int, bool, bool, int, str | None] | None,
         event_kind: str = "damage",
+        allow_on_hit_effects: bool = True,
     ) -> None:
         if damage_result is None:
             return
@@ -863,6 +1032,30 @@ class SideviewCombatEngine:
                 ),
             )
         )
+        equipment_effects = (
+            actor.snapshot.equipment.combat_effects
+            if actor.snapshot.equipment else {}
+        )
+        life_steal = min(
+            0.50,
+            max(0.0, float(equipment_effects.get("life_steal", 0))),
+        ) if allow_on_hit_effects else 0.0
+        if life_steal and actor.current_hp > 0 and actor.current_hp < actor.max_hp:
+            recovered = min(
+                actor.max_hp - actor.current_hp,
+                max(1, round(damage * life_steal)),
+            )
+            actor.current_hp += recovered
+            state.events.append(
+                BattleEvent(
+                    state.tick,
+                    "life_steal",
+                    actor.snapshot.user_pk,
+                    actor.snapshot.user_pk,
+                    value=recovered,
+                    remaining_hp=actor.current_hp,
+                )
+            )
 
         if target.attack_pending and target.windup_ticks > 0:
             target.attack_pending = False
@@ -1005,10 +1198,10 @@ class SideviewCombatEngine:
         state: BattleState,
         rng: random.Random,
     ) -> FighterState:
-        if state.attacker.hp_ratio != state.defender.hp_ratio:
+        if state.attacker.current_hp != state.defender.current_hp:
             return (
                 state.attacker
-                if state.attacker.hp_ratio > state.defender.hp_ratio
+                if state.attacker.current_hp > state.defender.current_hp
                 else state.defender
             )
         return self._resolve_equal_score(state, rng)
@@ -1081,4 +1274,6 @@ class SideviewCombatEngine:
             defender_final_statuses=tuple(s.to_dict() for s in state.defender.statuses.values()),
             final_entities=tuple(e.to_dict() for e in state.entities),
             final_zones=tuple(z.to_dict() for z in state.zones),
+            attacker_final_state=self._continuation_state(state.attacker),
+            defender_final_state=self._continuation_state(state.defender),
         )

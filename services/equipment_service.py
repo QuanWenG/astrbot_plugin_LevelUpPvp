@@ -192,8 +192,9 @@ class EquipmentService:
                 material, blessing_state, enhancement_level, weight,
                 enchant_capacity, used_capacity, base_stats_json,
                 inherent_affixes_json, random_affixes_json,
-                fusion_affixes_json, bound, description, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                fusion_affixes_json, bound, description, source_effects_json,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._insert_values(item),
         )
@@ -330,7 +331,9 @@ class EquipmentService:
             json.dumps(item.inherent_affixes, ensure_ascii=False),
             json.dumps(item.random_affixes, ensure_ascii=False),
             json.dumps(item.fusion_affixes, ensure_ascii=False),
-            1 if item.bound else 0, item.description, utc_now_text(),
+            1 if item.bound else 0, item.description,
+            json.dumps(item.source_effects, ensure_ascii=False),
+            utc_now_text(),
         )
 
     def _row_to_item(self, row) -> EquipmentItem:
@@ -345,4 +348,5 @@ class EquipmentService:
             tuple(json.loads(row["random_affixes_json"] or "[]")),
             tuple(json.loads(row["fusion_affixes_json"] or "[]")), bool(row["bound"]),
             row["description"] or "",
+            tuple(json.loads(row["source_effects_json"] or "[]")),
         )

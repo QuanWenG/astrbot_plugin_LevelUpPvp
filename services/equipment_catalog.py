@@ -11,9 +11,11 @@ try:
         EquipmentItem,
         EquipmentTemplate,
     )
+    from .equipment_affixes import skill_level_affix_cap
     from .material_catalog import material_for, validate_base_weight
 except ImportError:
     from models.equipment import EQUIPMENT_SLOTS, EquipmentItem, EquipmentTemplate
+    from services.equipment_affixes import skill_level_affix_cap
     from services.material_catalog import material_for, validate_base_weight
 
 
@@ -148,6 +150,18 @@ class EquipmentFactory:
         "damage_nature",
         "damage_mind",
         "damage_hell",
+        "armor_penetration",
+        "life_steal",
+        "spell_power",
+        "status_immunity",
+        "max_hp",
+        "trigger_ability",
+        "status_resistance",
+        "status_resistance_paralysis",
+        "status_resistance_confusion",
+        "stamina_steal",
+        "mana_steal",
+        "execute_chance",
     )
 
     def create_from_catalog(
@@ -183,6 +197,7 @@ class EquipmentFactory:
                 tuple(fixed["fusion_affixes"]),
                 entry.bound,
                 entry.template.description,
+                entry.template.source_effects,
             )
 
         rng = random.Random(seed)
@@ -197,9 +212,19 @@ class EquipmentFactory:
             weights=[float(item["weight"]) for item in qualities],
             k=1,
         )[0]
+        materials = generation.get("materials", ())
+        material = (
+            rng.choices(
+                [item["material"] for item in materials],
+                weights=[float(item["weight"]) for item in materials],
+                k=1,
+            )[0]
+            if materials
+            else entry.template.material
+        )
         item = self.generate(
             owner_pk,
-            entry.template,
+            replace(entry.template, material=material),
             item_level,
             quality,
             rng.getrandbits(63),
@@ -240,7 +265,20 @@ class EquipmentFactory:
         generated_types = tuple(
             item
             for item in self.AFFIX_TYPES
-            if item not in {"advanced_stat", "element_resistance"}
+            if item not in {
+                "advanced_stat",
+                "element_resistance",
+                "spell_power",
+                "status_immunity",
+                "trigger_ability",
+                "status_resistance",
+                "status_resistance_paralysis",
+                "status_resistance_confusion",
+                "stamina_steal",
+                "mana_steal",
+                "execute_chance",
+                "max_hp",
+            }
         )
         for _ in range(affix_count):
             kind = rng.choice(generated_types)
@@ -273,12 +311,14 @@ class EquipmentFactory:
                             "tactics",
                         )
                     ),
-                    value=rng.randint(1, 3),
+                    value=rng.randint(1, skill_level_affix_cap(item_level)),
                 )
             elif kind.startswith("resistance_"):
                 affix["value"] = rng.randint(10, 50)
             elif kind in {"accuracy", "evasion"} or kind.startswith("damage_"):
                 affix["value"] = rng.randint(1, 5)
+            elif kind in {"armor_penetration", "life_steal"}:
+                affix["value"] = round(rng.uniform(0.02, 0.08), 3)
             else:
                 affix["value"] = round(rng.uniform(0.02, 0.10), 3)
             random_affixes.append(affix)
@@ -314,6 +354,7 @@ class EquipmentFactory:
             (),
             True,
             template.description,
+            template.source_effects,
         )
 
 
@@ -323,8 +364,9 @@ def load_equipment_catalog(path: str | Path) -> EquipmentCatalogSnapshot:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"无法加载装备表 {path}: {exc}") from exc
-    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
-        raise ValueError("装备表 schema_version 必须为 1")
+    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, 2}:
+        raise ValueError("装备表 schema_version 必须为 1 或 2")
+    schema_version = int(raw["schema_version"])
     raw_items = raw.get("items")
     if not isinstance(raw_items, list) or not raw_items:
         raise ValueError("装备表 items 必须是非空数组")
@@ -403,6 +445,18 @@ def load_equipment_catalog(path: str | Path) -> EquipmentCatalogSnapshot:
         description = raw_item.get("description", "")
         if not isinstance(description, str):
             raise ValueError(f"{label}.description 必须是字符串")
+        raw_source_effects = raw_item.get("source_effects", [])
+        if (
+            not isinstance(raw_source_effects, list)
+            or not all(
+                isinstance(effect, str) and effect.strip()
+                for effect in raw_source_effects
+            )
+        ):
+            raise ValueError(f"{label}.source_effects 必须是非空字符串数组")
+        source_effects = tuple(effect.strip() for effect in raw_source_effects)
+        if len(set(source_effects)) != len(source_effects):
+            raise ValueError(f"{label}.source_effects 不能重复")
         template = EquipmentTemplate(
             template_id=template_id,
             name=str(raw_item.get("name", "")).strip(),
@@ -419,6 +473,7 @@ def load_equipment_catalog(path: str | Path) -> EquipmentCatalogSnapshot:
                 raw_item.get("weight_range_exception", False)
             ),
             description=description.strip(),
+            source_effects=source_effects,
         )
         if not template.name:
             raise ValueError(f"{label}.name 不能为空")
@@ -464,7 +519,11 @@ def load_equipment_catalog(path: str | Path) -> EquipmentCatalogSnapshot:
         if mode == "fixed":
             fixed = _validate_fixed(raw_item.get("fixed"), template, label)
         else:
-            generation = _validate_generation(raw_item.get("generation"), label)
+            generation = _validate_generation(
+                raw_item.get("generation"),
+                label,
+                require_materials=schema_version >= 2,
+            )
 
         entries.append(
             EquipmentCatalogEntry(
@@ -481,7 +540,7 @@ def load_equipment_catalog(path: str | Path) -> EquipmentCatalogSnapshot:
 
     entries_tuple = tuple(entries)
     return EquipmentCatalogSnapshot(
-        schema_version=1,
+        schema_version=schema_version,
         entries=entries_tuple,
         by_id={entry.catalog_id: entry for entry in entries_tuple},
         by_template_id={
@@ -571,11 +630,17 @@ def _validate_fixed(raw_fixed, template, label: str) -> dict:
         fixed["fusion_affixes"],
         True,
         template.description,
+        template.source_effects,
     )
     return fixed
 
 
-def _validate_generation(raw_generation, label: str) -> dict:
+def _validate_generation(
+    raw_generation,
+    label: str,
+    *,
+    require_materials: bool = False,
+) -> dict:
     if not isinstance(raw_generation, dict):
         raise ValueError(f"{label}.generation 必须是对象")
     level_min = raw_generation.get("level_min")
@@ -612,10 +677,44 @@ def _validate_generation(raw_generation, label: str) -> dict:
             raise ValueError(f"{label}.generation 品质权重必须大于 0")
         seen.add(quality)
         validated.append({"quality": quality, "weight": float(weight)})
+    raw_materials = raw_generation.get("materials")
+    if raw_materials is None and not require_materials:
+        materials = ()
+    else:
+        if not isinstance(raw_materials, list) or not raw_materials:
+            raise ValueError(f"{label}.generation.materials 必须是非空数组")
+        materials_list = []
+        seen_materials = set()
+        for material_item in raw_materials:
+            if not isinstance(material_item, dict):
+                raise ValueError(
+                    f"{label}.generation.materials 项必须是对象"
+                )
+            material = str(material_item.get("material", ""))
+            weight = material_item.get("weight")
+            material_for(material)
+            if material in seen_materials:
+                raise ValueError(
+                    f"{label}.generation.materials 材质重复: {material}"
+                )
+            if (
+                not isinstance(weight, int | float)
+                or isinstance(weight, bool)
+                or weight <= 0
+            ):
+                raise ValueError(
+                    f"{label}.generation.materials 权重必须大于 0"
+                )
+            seen_materials.add(material)
+            materials_list.append(
+                {"material": material, "weight": float(weight)}
+            )
+        materials = tuple(materials_list)
     return {
         "level_min": level_min,
         "level_max": level_max,
         "qualities": tuple(validated),
+        "materials": materials,
     }
 
 
@@ -643,6 +742,22 @@ def _validate_affixes(raw_affixes, label: str) -> tuple[dict, ...]:
             raise ValueError(f"{label}[{index}] 缺少 stat")
         if kind == "skill_level" and not affix.get("skill_id"):
             raise ValueError(f"{label}[{index}] 缺少 skill_id")
+        if kind == "trigger_ability":
+            if not str(affix.get("ability_id", "")).strip():
+                raise ValueError(f"{label}[{index}] 缺少 ability_id")
+            target = str(affix.get("target", "enemy"))
+            if target not in {"self", "enemy"}:
+                raise ValueError(f"{label}[{index}].target 无效")
+            source_power = affix.get("source_power", 0)
+            if (
+                not isinstance(source_power, int)
+                or isinstance(source_power, bool)
+                or source_power < 0
+            ):
+                raise ValueError(f"{label}[{index}].source_power 无效")
+            params = affix.get("params", {})
+            if not isinstance(params, dict):
+                raise ValueError(f"{label}[{index}].params 必须是对象")
         validated.append(dict(affix))
     return tuple(validated)
 

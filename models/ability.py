@@ -127,6 +127,7 @@ class BattleZone:
     radius: int
     remaining_ticks: int
     effects: tuple[ActionEffect, ...] = ()
+    affects_owner: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)

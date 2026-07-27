@@ -613,6 +613,55 @@ class EquipmentGrantCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["只有 AstrBot 管理员可以使用该指令。"], replies)
         equipment_service.grant_catalog_item.assert_not_awaited()
 
+    async def test_equipment_catalog_is_paginated_and_filterable(self):
+        from services.equipment_catalog import DEFAULT_EQUIPMENT_CATALOG
+
+        equipment_service = types.SimpleNamespace(
+            catalog=DEFAULT_EQUIPMENT_CATALOG
+        )
+        handler = self._handler(equipment_service=equipment_service)
+        handler.reply_text = mock.AsyncMock(
+            side_effect=lambda event, text, *args: text
+        )
+
+        first_page = [
+            reply
+            async for reply in handler.equipment_catalog(FakeEvent(), "1 武器")
+        ][0]
+        black_stars = [
+            reply
+            async for reply in handler.equipment_catalog(FakeEvent(), "黑星")
+        ][0]
+
+        self.assertIn("装备图鉴·武器 第1/", first_page)
+        self.assertIn("3001 短剑 [主手] 普通", first_page)
+        self.assertIn("装备图鉴·黑星 第1/2页 （共21件）", black_stars)
+        self.assertIn("2001 珍贵的龟龟项链 [颈] 黑星", black_stars)
+
+    async def test_equipment_catalog_rejects_invalid_page_and_category(self):
+        from services.equipment_catalog import DEFAULT_EQUIPMENT_CATALOG
+
+        handler = self._handler(
+            equipment_service=types.SimpleNamespace(
+                catalog=DEFAULT_EQUIPMENT_CATALOG
+            )
+        )
+        handler.reply_text = mock.AsyncMock(
+            side_effect=lambda event, text, *args: text
+        )
+
+        invalid_page = [
+            reply
+            async for reply in handler.equipment_catalog(FakeEvent(), "999 武器")
+        ][0]
+        invalid_category = [
+            reply
+            async for reply in handler.equipment_catalog(FakeEvent(), "坐骑")
+        ][0]
+
+        self.assertIn("页码应在", invalid_page)
+        self.assertIn("未知分类", invalid_category)
+
     async def test_full_server_without_confirmation_only_previews(self):
         entry = types.SimpleNamespace(
             catalog_id=1001,
@@ -796,7 +845,9 @@ class EquipmentGrantCommandTests(unittest.IsolatedAsyncioTestCase):
             item_detail=mock.AsyncMock(return_value=item)
         )
         handler = self._handler(equipment_service=equipment_service)
-        handler._own_user = mock.AsyncMock(return_value=types.SimpleNamespace(id=1))
+        handler._own_user = mock.AsyncMock(
+            return_value=types.SimpleNamespace(id=1, level=1)
+        )
         handler.reply_text = mock.AsyncMock(
             side_effect=lambda event, text, *args: text
         )
@@ -810,9 +861,77 @@ class EquipmentGrantCommandTests(unittest.IsolatedAsyncioTestCase):
             replies[0],
         )
         self.assertIn(
-            "固有词条：生命成长+10、魔法成长+10、速度+5、幸运+5",
+            "固有词条（原始）：生命成长+10、魔法成长+10、速度+5、幸运+5",
             replies[0],
         )
+        self.assertIn(
+            "固有词条（当前有效）：生命成长+10、魔法成长+10、速度+5、幸运+5",
+            replies[0],
+        )
+
+    async def test_equipment_detail_displays_scaled_inherent_affixes(self):
+        item = types.SimpleNamespace(
+            id=89,
+            name="测试黑星",
+            description="",
+            quality="legendary",
+            star_type="black_star",
+            item_level=40,
+            material="iron",
+            blessing_state="normal",
+            weight=1.0,
+            enhancement_level=0,
+            used_capacity=0,
+            enchant_capacity=0,
+            base_stats={},
+            inherent_affixes=(
+                {
+                    "type": "skill_level",
+                    "skill_id": "longsword",
+                    "value": 5,
+                },
+                {"type": "stat_flat", "stat": "strength", "value": 8},
+                {"type": "block_rate", "value": 0.2},
+                {
+                    "type": "trigger_ability",
+                    "ability_id": "time_stop",
+                    "target": "enemy",
+                    "value": 0.1,
+                    "source_power": 200,
+                },
+            ),
+            random_affixes=(),
+            fusion_affixes=(),
+            source_effects=("识破隐形",),
+        )
+        equipment_service = types.SimpleNamespace(
+            item_detail=mock.AsyncMock(return_value=item)
+        )
+        handler = self._handler(equipment_service=equipment_service)
+        handler._own_user = mock.AsyncMock(
+            return_value=types.SimpleNamespace(id=1, level=20)
+        )
+        handler.reply_text = mock.AsyncMock(
+            side_effect=lambda event, text, *args: text
+        )
+
+        reply = [
+            value
+            async for value in handler.equipment_detail(FakeEvent(), 89)
+        ][0]
+
+        self.assertIn(
+            "固有词条（原始）：技能等级+5、力量+8、格挡+0.2",
+            reply,
+        )
+        self.assertIn(
+            "固有词条（当前有效，角色Lv.20/需求Lv.40，数值比例50%）"
+            "：技能等级+2、力量+4、格挡+0.1",
+            reply,
+        )
+        self.assertIn("触发能力（原始）：时间停止 10.0%", reply)
+        self.assertIn("触发能力（当前有效）：时间停止 5.0%", reply)
+        self.assertIn("资料效果（当前未结算）：识破隐形", reply)
 
 
 class QQOfficialChallengeDispatchTests(unittest.IsolatedAsyncioTestCase):

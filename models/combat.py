@@ -30,6 +30,9 @@ class FighterSnapshot:
     attributes: PrimaryAttributes | None = None
     advanced_attributes: AdvancedAttributes | None = None
     derived: DerivedStats | None = None
+    combatant_kind: str = "player"
+    source_template_id: str = ""
+    rank: str = "normal"
 
     def stat(self, name: str) -> int:
         if self.derived and hasattr(self.derived, name):
@@ -112,6 +115,37 @@ class ActionIntent:
     skill_id: str | None = None
 
 
+@dataclass(frozen=True)
+class FighterContinuationState:
+    """Character-owned combat state that can cross battle boundaries."""
+
+    hp_ratio: float = 1.0
+    mana_ratio: float = 1.0
+    stamina_ratio: float = 1.0
+    hp_regen_buffer: float = 0.0
+    mp_regen_buffer: float = 0.0
+    sp_regen_buffer: float = 0.0
+    recovery_turn_phase: int = 0
+    statuses: tuple[dict, ...] = ()
+    skill_cooldowns: dict[str, int] = field(default_factory=dict)
+    attack_cooldown: int = 0
+    recovery_ticks: int = 0
+    hitstun_ticks: int = 0
+    counter_cooldown: int = 0
+    stance_id: str | None = None
+    frozen_mana_ratio: float = 0.0
+    frozen_mana_capacity_ratio: float = 0.0
+    lethal_survival_used: bool = False
+    defeated: bool = False
+    updated_at_ts: int = 0
+    version: int = 0
+
+    def to_dict(self) -> dict:
+        payload = asdict(self)
+        payload["statuses"] = list(self.statuses)
+        return payload
+
+
 @dataclass
 class FighterState:
     snapshot: FighterSnapshot
@@ -132,6 +166,8 @@ class FighterState:
     attack_bonus_knockback: int = 0
     hp_regen_buffer: float = 0.0
     mp_regen_buffer: float = 0.0
+    sp_regen_buffer: float = 0.0
+    recovery_turn_phase: int = 0
     statuses: dict[str, CombatStatus] = field(default_factory=dict)
     stance_id: str | None = None
     frozen_mana: int = 0
@@ -264,6 +300,8 @@ class SimulationResult:
     defender_final_statuses: tuple[dict, ...] = ()
     final_entities: tuple[dict, ...] = ()
     final_zones: tuple[dict, ...] = ()
+    attacker_final_state: FighterContinuationState | None = None
+    defender_final_state: FighterContinuationState | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -289,5 +327,13 @@ class SimulationResult:
             "defender_final_statuses": list(self.defender_final_statuses),
             "final_entities": list(self.final_entities),
             "final_zones": list(self.final_zones),
+            "attacker_final_state": (
+                self.attacker_final_state.to_dict()
+                if self.attacker_final_state else None
+            ),
+            "defender_final_state": (
+                self.defender_final_state.to_dict()
+                if self.defender_final_state else None
+            ),
             "events": [event.to_dict() for event in self.events],
         }

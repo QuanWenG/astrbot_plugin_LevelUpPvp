@@ -88,10 +88,13 @@ class BattleReportBuilder:
             f"双方SP为{result.attacker_remaining_stamina}/{result.defender_remaining_stamina}，"
             f"MP为{result.attacker_remaining_mana}/{result.defender_remaining_mana}。"
         )
-        if result.finish_reason == "timeout_hp_ratio":
+        if result.finish_reason in {
+            "timeout_hp_ratio",
+            "timeout_remaining_hp",
+        }:
             lines.append(
                 f"战斗在{self._seconds(result.duration_ticks)}秒时达到上限，"
-                f"{winner_name}凭剩余生命比例与有效输出取得裁决胜利。"
+                f"{winner_name}凭剩余生命值与有效输出取得裁决胜利。"
             )
         elif result.finish_reason == "double_ko_tiebreak":
             lines.append(f"双方在同一时刻倒下，经规则裁决由{winner_name}击败{loser_name}。")

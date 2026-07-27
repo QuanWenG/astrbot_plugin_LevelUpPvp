@@ -7,33 +7,37 @@ from astrbot.core.star.filter.command import GreedyStr
 
 try:
     from .handles.command_handler import LevelUpPvpCommandHandler
+    from .models.user import UserIdentity
     from .services.attribute_service import AttributeService
     from .services.battle_service import BattleService
-    from .services.checkin_service import CheckinService
+    from .services.build_service import CombatBuildService
     from .services.challenge_queue import ChallengeQueueService
+    from .services.checkin_service import CheckinService
     from .services.db import init_db
     from .services.equipment_service import EquipmentService
+    from .services.external_activity_service import ExternalActivityService
     from .services.llm_service import LLMService
-    from .services.stat_service import StatService
-    from .services.storage import prepare_persistent_database
     from .services.skill_service import SkillService
     from .services.spell_service import SpellService
-    from .services.build_service import CombatBuildService
+    from .services.stat_service import StatService
+    from .services.storage import prepare_persistent_database
     from .services.user_service import UserService
 except ImportError:
     from handles.command_handler import LevelUpPvpCommandHandler
+    from models.user import UserIdentity
     from services.attribute_service import AttributeService
     from services.battle_service import BattleService
-    from services.checkin_service import CheckinService
+    from services.build_service import CombatBuildService
     from services.challenge_queue import ChallengeQueueService
+    from services.checkin_service import CheckinService
     from services.db import init_db
     from services.equipment_service import EquipmentService
+    from services.external_activity_service import ExternalActivityService
     from services.llm_service import LLMService
-    from services.stat_service import StatService
-    from services.storage import prepare_persistent_database
     from services.skill_service import SkillService
     from services.spell_service import SpellService
-    from services.build_service import CombatBuildService
+    from services.stat_service import StatService
+    from services.storage import prepare_persistent_database
     from services.user_service import UserService
 
 
@@ -56,6 +60,11 @@ class MyPlugin(Star):
         )
         user_service = UserService(self.db_path)
         attribute_service = AttributeService(self.db_path)
+        self.external_activity_service = ExternalActivityService(
+            self.db_path,
+            user_service,
+            attribute_service,
+        )
         checkin_service = CheckinService(
             self.db_path, user_service, attribute_service
         )
@@ -96,6 +105,48 @@ class MyPlugin(Star):
     async def _ensure_database_ready(self) -> None:
         """Block every event until schema creation and migrations finish."""
         await self._db_init_task
+
+    async def grant_external_activity(
+        self,
+        *,
+        platform: str,
+        group_id: str,
+        user_id: str,
+        nickname: str,
+        source: str,
+        reward_key: str,
+        valid_attempt: bool,
+        correct: bool,
+    ) -> dict:
+        """Grant an idempotent reward requested by another AstrBot plugin.
+
+        Args:
+            platform: AstrBot platform adapter identifier.
+            group_id: Group identifier, or an empty string in private chat.
+            user_id: Stable platform user identifier.
+            nickname: Current display name used when creating a new player.
+            source: Stable caller plugin identifier.
+            reward_key: Caller-scoped idempotency key.
+            valid_attempt: Whether to grant the attempt component.
+            correct: Whether to grant the correct-answer component.
+
+        Returns:
+            Concrete applied components and experience gains.
+        """
+        await self._ensure_database_ready()
+        identity = UserIdentity(
+            platform=str(platform),
+            group_id=str(group_id or ""),
+            user_id=str(user_id),
+            nickname=str(nickname or user_id),
+        )
+        return await self.external_activity_service.grant(
+            identity=identity,
+            source=source,
+            reward_key=reward_key,
+            valid_attempt=valid_attempt,
+            correct=correct,
+        )
 
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE,
@@ -194,6 +245,16 @@ class MyPlugin(Star):
     async def equipment(self, event: AstrMessageEvent):
         await self._ensure_database_ready()
         async for result in self.command_handler.equipment(event): yield result
+
+    @filter.command("装备图鉴")
+    async def equipment_catalog(
+        self,
+        event: AstrMessageEvent,
+        args: GreedyStr = "",
+    ):
+        await self._ensure_database_ready()
+        async for result in self.command_handler.equipment_catalog(event, args):
+            yield result
 
     @filter.command("装备详情")
     async def equipment_detail(self, event: AstrMessageEvent, equipment_id: int):
@@ -303,6 +364,8 @@ class MyPlugin(Star):
                 async for result in self.command_handler.inventory(event, page): yield result
             elif command == "装备":
                 async for result in self.command_handler.equipment(event): yield result
+            elif command == "装备图鉴":
+                async for result in self.command_handler.equipment_catalog(event, args): yield result
             elif command == "装备详情":
                 if args.strip().isdigit():
                     async for result in self.command_handler.equipment_detail(event, int(args.strip())): yield result

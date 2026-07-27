@@ -191,7 +191,13 @@ class AbilityRuntime:
 
         for zone in list(state.zones):
             for fighter in (state.attacker, state.defender):
-                if fighter.snapshot.user_pk == zone.owner_pk or abs(fighter.position - zone.position) > zone.radius:
+                if (
+                    (
+                        fighter.snapshot.user_pk == zone.owner_pk
+                        and not zone.affects_owner
+                    )
+                    or abs(fighter.position - zone.position) > zone.radius
+                ):
                     continue
                 for effect in zone.effects:
                     if effect.effect_type == "magic_damage" and state.tick % 5 == 0:
@@ -295,6 +301,22 @@ class AbilityRuntime:
             resistance_key = "mind" if status_id in {"confusion", "paralysis", "haze", "blind"} else "nature"
             resistance = target.current_derived.resistances.get(resistance_key, 0.0) if target.current_derived else 0.0
             status_resistance = sum(s.magnitude for s in target.statuses.values() if s.status_id == "status_resistance")
+            equipment_effects = (
+                target.snapshot.equipment.combat_effects
+                if target.snapshot.equipment else {}
+            )
+            equipment_status_resistance = min(
+                0.90,
+                max(
+                    0.0,
+                    float(equipment_effects.get("status_resistance", 0))
+                    + float(
+                        equipment_effects.get(
+                            f"status_resistance_{status_id}", 0
+                        )
+                    ),
+                ),
+            )
             source = (
                 state.attacker
                 if state.attacker.snapshot.user_pk == source_pk
@@ -302,7 +324,10 @@ class AbilityRuntime:
             )
             chance *= resistance_multiplier(
                 resistance, source.snapshot.level
-            ) * max(0.0, 1 - status_resistance)
+            ) * max(
+                0.0,
+                1 - status_resistance - equipment_status_resistance,
+            )
             if status_id == "bleed" and self.has(target, "tree_skin"):
                 chance *= max(
                     0.0,
@@ -352,6 +377,15 @@ class AbilityRuntime:
             derived = actor.current_derived
             target_derived = target.current_derived
             target_defense = (target_derived.defense if target_derived else target.snapshot.stat("defense")) * max(0.1, 1 + self.modifier(target, "defense"))
+            equipment_effects = (
+                actor.snapshot.equipment.combat_effects
+                if actor.snapshot.equipment else {}
+            )
+            penetration = min(
+                0.75,
+                max(0.0, float(equipment_effects.get("armor_penetration", 0))),
+            )
+            target_defense *= 1.0 - penetration
             multiplier = effect.value * (derived.physical_damage_multiplier if derived else 1.0)
             multiplier *= 1 + self.modifier(actor, "physical_damage") - self.modifier(actor, "damage_penalty")
             threshold = effect.params.get("bonus_above_hp")

@@ -3,6 +3,7 @@ from dataclasses import replace
 
 try:
     from ..models.attributes import PRIMARY_ATTRIBUTE_IDS
+    from ..models.equipment import EquipmentProc
     from ..models.combat import FighterSnapshot
     from ..models.equipment import EquipmentBuild
     from ..models.skill import SkillBuild
@@ -12,6 +13,7 @@ try:
         AttributeService,
         skill_level_cap,
     )
+    from .equipment_affixes import effective_inherent_affixes
     from .equipment_catalog import QUALITY_MULTIPLIERS
     from .material_catalog import (
         actual_weight, armor_style_for_weight, material_for,
@@ -21,6 +23,7 @@ try:
     from .passive_effects import resolve_passive_bonuses
 except ImportError:
     from models.attributes import PRIMARY_ATTRIBUTE_IDS
+    from models.equipment import EquipmentProc
     from models.combat import FighterSnapshot
     from models.equipment import EquipmentBuild
     from models.skill import SkillBuild
@@ -30,6 +33,7 @@ except ImportError:
         AttributeService,
         skill_level_cap,
     )
+    from services.equipment_affixes import effective_inherent_affixes
     from services.equipment_catalog import QUALITY_MULTIPLIERS
     from services.material_catalog import (
         actual_weight, armor_style_for_weight, material_for,
@@ -150,6 +154,7 @@ class CombatBuildService:
         advanced_values = defaultdict(float)
         skill_values = defaultdict(int)
         effects = defaultdict(float)
+        equipment_procs = []
         item_weights: dict[int, float] = {}
         total_weight = 0.0
         weapon_power = 0.0
@@ -225,7 +230,11 @@ class CombatBuildService:
                     effects[stat] += value
 
             for affix in (
-                item.inherent_affixes
+                effective_inherent_affixes(
+                    item.inherent_affixes,
+                    user.level,
+                    item.item_level,
+                )
                 + item.random_affixes
                 + item.fusion_affixes
             ):
@@ -240,6 +249,18 @@ class CombatBuildService:
                     advanced_values[str(affix.get("stat", "luck"))] += value
                 elif kind == "skill_level":
                     skill_values[str(affix.get("skill_id", ""))] += int(value)
+                elif kind == "trigger_ability":
+                    equipment_procs.append(
+                        EquipmentProc(
+                            source_template_id=item.template_id,
+                            proc_type=kind,
+                            target=str(affix.get("target", "enemy")),
+                            chance=max(0.0, min(1.0, value)),
+                            ability_id=str(affix.get("ability_id", "")),
+                            source_power=int(affix.get("source_power", 0)),
+                            params=dict(affix.get("params", {})),
+                        )
+                    )
                 elif kind == "element_resistance":
                     for damage_type in (
                         "magic", "fire", "cold", "lightning",
@@ -346,6 +367,7 @@ class CombatBuildService:
             item_weights=item_weights,
             physical_accuracy_multiplier=physical_accuracy,
             spell_accuracy_multiplier=spell_accuracy,
+            equipment_procs=tuple(equipment_procs),
         )
         effective_levels = {
             skill_id: min(
