@@ -69,8 +69,8 @@ class ExternalActivityServiceTests(unittest.IsolatedAsyncioTestCase):
         user = await self.users.get_or_create_user(self.identity)
         self.assertEqual(user.exp, 20)
         progress = await self.attributes.get_progress(user.id)
-        self.assertEqual(progress["perception"].exp, 20)
-        self.assertEqual(progress["magic"].exp, 20)
+        self.assertEqual(progress["perception"].exp, 2020)
+        self.assertEqual(progress["magic"].exp, 2020)
 
     async def test_first_correct_combines_two_attribute_components(self):
         result = await self.service.grant(

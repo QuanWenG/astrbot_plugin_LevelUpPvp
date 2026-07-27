@@ -47,7 +47,8 @@ try:
     from ..services.equipment_catalog import QUALITY_LABELS
     from ..services.equipment_proc_service import EQUIPMENT_PROC_NAMES
     from ..services.material_catalog import actual_weight, material_for
-    from ..services.skill_catalog import SKILL_DEFINITIONS
+    from ..services.progression_rules import progress_percent
+    from ..services.skill_catalog import SKILL_DEFINITIONS, skill_exp_required, skill_id_for
     from ..services.ability_catalog import (
         ACTIVE_ABILITY_DEFINITIONS, SPELL_DEFINITIONS, TECHNIQUE_DEFINITIONS,
         ability_is_unlocked, spell_exp_required,
@@ -70,7 +71,8 @@ except ImportError:
     from services.equipment_catalog import QUALITY_LABELS
     from services.equipment_proc_service import EQUIPMENT_PROC_NAMES
     from services.material_catalog import actual_weight, material_for
-    from services.skill_catalog import SKILL_DEFINITIONS
+    from services.progression_rules import progress_percent
+    from services.skill_catalog import SKILL_DEFINITIONS, skill_exp_required, skill_id_for
     from services.ability_catalog import (
         ACTIVE_ABILITY_DEFINITIONS, SPELL_DEFINITIONS, TECHNIQUE_DEFINITIONS,
         ability_is_unlocked, spell_exp_required,
@@ -574,21 +576,52 @@ class LevelUpPvpCommandHandler:
         except Exception as exc:
             yield await self.reply_text(event, f"查看装备详情失败：{exc}")
 
-    async def equip_item(self, event, equipment_id: int, slot: str = ""):
+    async def equip_item(self, event, args, slot: str = ""):
         try:
-            user = await self._own_user(event); normalized = self._slot_id(slot) if slot else ""
-            item, slots = await self.equipment_service.equip(user.id, int(equipment_id), normalized)
+            user = await self._own_user(event)
+            if isinstance(args, int):
+                assignments = (
+                    (args, self._slot_id(slot) if slot else ""),
+                )
+            else:
+                assignments = self._parse_equip_assignments(str(args or ""))
+            results = await self.equipment_service.equip_many(
+                user.id, assignments
+            )
+            lines = [
+                f"{item.name}：{'、'.join(SLOT_LABELS[value] for value in slots)}"
+                for item, slots in results
+            ]
             yield await self.reply_text(
-                event, f"已穿戴 {item.name}：{'、'.join(SLOT_LABELS[s] for s in slots)}"
+                event, "已穿戴：\n" + "\n".join(lines)
             )
         except Exception as exc:
             yield await self.reply_text(event, f"穿戴失败：{exc}")
 
-    async def unequip_item(self, event, slot: str):
+    async def unequip_item(self, event, args: str):
         try:
-            user = await self._own_user(event); normalized = self._slot_id(slot) if slot else ""
-            await self.equipment_service.unequip(user.id, normalized)
-            yield await self.reply_text(event, f"已卸下{SLOT_LABELS[normalized]}装备。")
+            user = await self._own_user(event)
+            values = str(args or "").split()
+            if not values:
+                raise ValueError("用法：/卸下 槽位 [槽位...]|全部")
+            if values == ["全部"]:
+                count = await self.equipment_service.unequip_all(user.id)
+                yield await self.reply_text(
+                    event, f"已卸下全部装备（{count}件）。"
+                )
+                return
+            if "全部" in values:
+                raise ValueError("“全部”不能与装备槽混用")
+            normalized = tuple(self._slot_id(value) for value in values)
+            if len(set(normalized)) != len(normalized):
+                raise ValueError("卸下列表中有重复装备槽")
+            count = await self.equipment_service.unequip_many(
+                user.id, normalized
+            )
+            labels = "、".join(SLOT_LABELS[value] for value in normalized)
+            yield await self.reply_text(
+                event, f"已卸下{labels}对应的装备（{count}件）。"
+            )
         except Exception as exc:
             yield await self.reply_text(event, f"卸下失败：{exc}")
 
@@ -615,11 +648,13 @@ class LevelUpPvpCommandHandler:
             for skill in learned:
                 definition = SKILL_DEFINITIONS[skill.skill_id]
                 level_cap = skill_level_cap(
-                    attributes, definition.governing_attributes
+                    attributes,
+                    definition.governing_attributes,
+                    skill.skill_id,
                 )
                 line = (
                     f"{definition.name} Lv.{skill.level}/{level_cap} "
-                    f"EXP {skill.exp}/{50 + skill.level * 15} "
+                    f"EXP {progress_percent(skill.exp, skill_exp_required(skill.level)):.1f}% "
                     f"潜力{skill.potential}%"
                 )
                 (passive_lines if definition.passive else active_lines).append(line)
@@ -721,7 +756,11 @@ class LevelUpPvpCommandHandler:
                 lines.append("尚未通过魔法书学会法术。")
             for spell in sorted(spells.values(), key=lambda value: SPELL_DEFINITIONS[value.spell_id].name):
                 definition = SPELL_DEFINITIONS[spell.spell_id]
-                lines.append(f"{definition.name} Lv.{spell.level} EXP {spell.exp}/{spell_exp_required(spell.level)} 潜力{spell.potential}%")
+                lines.append(
+                    f"{definition.name} Lv.{spell.level} "
+                    f"EXP {progress_percent(spell.exp, spell_exp_required(spell.level)):.1f}% "
+                    f"潜力{spell.potential}%"
+                )
             yield await self.reply_text(
                 event, "\n".join(lines), "LevelUpPvp 法术"
             )
@@ -751,31 +790,169 @@ class LevelUpPvpCommandHandler:
             yield await self.reply_text(event, f"查看战技失败：{exc}")
     async def learn_skill(self, event, name: str):
         try:
-            user = await self._own_user(event); skill = await self.skill_service.learn(user, name)
-            yield await self.reply_text(
-                event, f"已学习技能：{SKILL_DEFINITIONS[skill.skill_id].name} Lv.1"
+            user = await self._own_user(event)
+            names = self._expand_skill_names(name)
+            existing_skills, _ = await self.skill_service.get_skills(user)
+            known_ids = set(existing_skills)
+            pending = tuple(
+                skill_name for skill_name in names
+                if skill_id_for(skill_name) not in known_ids
             )
+            if not pending:
+                learned_names = "、".join(
+                    SKILL_DEFINITIONS[skill_id_for(n)].name for n in names
+                )
+                raise ValueError(f"{learned_names}已经学会")
+            skills = await self.skill_service.learn_many(user, pending)
+            labels = "、".join(
+                SKILL_DEFINITIONS[skill.skill_id].name for skill in skills
+            )
+            message = f"已学习技能：{labels}（均为 Lv.1）"
+            skipped = tuple(
+                skill_name for skill_name in names
+                if skill_id_for(skill_name) in known_ids
+            )
+            if skipped:
+                skipped_labels = "、".join(
+                    SKILL_DEFINITIONS[skill_id_for(n)].name for n in skipped
+                )
+                message += f"\n已跳过已学会技能：{skipped_labels}"
+            yield await self.reply_text(event, message)
         except Exception as exc:
             yield await self.reply_text(event, f"学习失败：{exc}")
 
-    async def train_skill(self, event, name: str, points: int):
+    async def train_skill(
+        self,
+        event,
+        args: str,
+        points: int | None = None,
+    ):
         try:
-            user = await self._own_user(event); skill = await self.skill_service.train_potential(user, name, int(points))
+            user = await self._own_user(event)
+            assignments = (
+                ((args, int(points)),)
+                if points is not None
+                else self._parse_train_assignments(args)
+            )
+            skills = await self.skill_service.train_many(user, assignments)
+            lines = [
+                f"{SKILL_DEFINITIONS[skill.skill_id].name}："
+                f"潜力提升至{skill.potential}%"
+                for skill in skills
+            ]
             yield await self.reply_text(
                 event,
-                f"训练完成：{SKILL_DEFINITIONS[skill.skill_id].name} 潜力提升至{skill.potential}%",
+                "训练完成：\n" + "\n".join(lines),
             )
         except Exception as exc:
             yield await self.reply_text(event, f"训练失败：{exc}")
 
-    async def set_skill_slot(self, event, slot: int, name: str):
+    async def set_skill_slot(
+        self,
+        event,
+        args,
+        name: str | None = None,
+    ):
         try:
-            user = await self._own_user(event); await self.skill_service.set_active_slot(user, int(slot), name)
+            user = await self._own_user(event)
+            assignments = (
+                ((int(args), name),)
+                if name is not None
+                else self._parse_skill_slot_assignments(str(args or ""))
+            )
+            await self.skill_service.set_active_slots(user, assignments)
+            lines = [
+                f"{slot}.{'空' if ability_name == '清空' else ability_name}"
+                for slot, ability_name in assignments
+            ]
             yield await self.reply_text(
-                event, f"技能栏{slot}已{'清空' if name == '清空' else '设置为' + name}。"
+                event, "技能栏已更新：" + " / ".join(lines)
             )
         except Exception as exc:
             yield await self.reply_text(event, f"技能栏设置失败：{exc}")
+
+    def _expand_skill_names(self, args: str) -> tuple[str, ...]:
+        tokens = str(args or "").split()
+        if not tokens:
+            raise ValueError("用法：/学习 技能名 [技能名...]|起始技能-结束技能")
+        ordered = list(SKILL_DEFINITIONS)
+        names = []
+        for token in tokens:
+            if "-" not in token:
+                names.append(token)
+                continue
+            start_name, end_name = token.split("-", 1)
+            start_id = self._skill_id(start_name)
+            end_id = self._skill_id(end_name)
+            start = ordered.index(start_id)
+            end = ordered.index(end_id)
+            if start > end:
+                raise ValueError("技能范围必须按/技能中的顺序填写")
+            names.extend(SKILL_DEFINITIONS[skill_id].name for skill_id in ordered[start:end + 1])
+        if len(set(names)) != len(names):
+            raise ValueError("学习列表中有重复技能")
+        return tuple(names)
+
+    @staticmethod
+    def _skill_id(name: str) -> str:
+        normalized = str(name or "").strip()
+        for skill_id, definition in SKILL_DEFINITIONS.items():
+            if normalized in {skill_id, definition.name}:
+                return skill_id
+        raise ValueError(f"未知技能：{normalized}")
+
+    @staticmethod
+    def _parse_train_assignments(
+        args: str,
+    ) -> tuple[tuple[str, int], ...]:
+        tokens = str(args or "").split()
+        if len(tokens) == 1:
+            return ((tokens[0], 1),)
+        if not tokens or len(tokens) % 2:
+            raise ValueError("用法：/训练技能 技能名 点数 [技能名 点数...]")
+        assignments = []
+        for index in range(0, len(tokens), 2):
+            if not tokens[index + 1].isdigit():
+                raise ValueError("训练点数必须是正整数")
+            points = int(tokens[index + 1])
+            if points < 1:
+                raise ValueError("训练点数必须是正整数")
+            assignments.append((tokens[index], points))
+        return tuple(assignments)
+
+    def _parse_equip_assignments(
+        self,
+        args: str,
+    ) -> tuple[tuple[int, str], ...]:
+        tokens = str(args or "").split()
+        if len(tokens) == 1 and tokens[0].isdigit():
+            return ((int(tokens[0]), ""),)
+        if not tokens or len(tokens) % 2:
+            raise ValueError("用法：/穿戴 装备ID 槽位 [装备ID 槽位...]")
+        assignments = []
+        for index in range(0, len(tokens), 2):
+            if not tokens[index].isdigit():
+                raise ValueError("装备ID必须是正整数")
+            assignments.append(
+                (int(tokens[index]), self._slot_id(tokens[index + 1]))
+            )
+        if len({item_id for item_id, _ in assignments}) != len(assignments):
+            raise ValueError("穿戴列表中有重复装备")
+        return tuple(assignments)
+
+    @staticmethod
+    def _parse_skill_slot_assignments(
+        args: str,
+    ) -> tuple[tuple[int, str], ...]:
+        tokens = str(args or "").split()
+        if not tokens or len(tokens) % 2:
+            raise ValueError("用法：/技能栏 位置 技能名 [位置 技能名...]")
+        assignments = []
+        for index in range(0, len(tokens), 2):
+            if not tokens[index].isdigit():
+                raise ValueError("技能栏位置必须是1到4")
+            assignments.append((int(tokens[index]), tokens[index + 1]))
+        return tuple(assignments)
 
     async def _own_user(self, event):
         error = await self._registration_error(event)
@@ -1386,8 +1563,8 @@ class LevelUpPvpCommandHandler:
             )
             lines.append(
                 "属性经验：" + " / ".join(
-                    f"{ATTRIBUTE_LABELS[key]} {progress[key].exp}/"
-                    f"{attribute_exp_required(user.stats()[key])}"
+                    f"{ATTRIBUTE_LABELS[key]} "
+                    f"{progress_percent(progress[key].exp, attribute_exp_required(user.stats()[key])):.1f}%"
                     for key in ATTRIBUTE_LABELS
                 )
             )

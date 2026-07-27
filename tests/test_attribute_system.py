@@ -3,11 +3,13 @@ import tempfile
 import sqlite3
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 from models.attributes import DAMAGE_TYPES, PrimaryAttributes
 from models.user import UserIdentity
 from services.attribute_service import (
     AttributeService,
+    attribute_exp_required,
     elemental_multiplier,
     skill_level_cap,
 )
@@ -16,10 +18,16 @@ from services.checkin_service import CheckinService
 from services.combat_ai import STRATEGY_PROFILES
 from services.combat_engine import SideviewCombatEngine
 from services.db import (
+    ELONA_PROGRESSION_BACKUP_SUFFIX,
+    ELONA_PROGRESSION_MIGRATION,
     PRIMARY_ATTRIBUTE_REBALANCE_MIGRATION,
     PRIMARY_ATTRIBUTE_REBALANCE_BACKUP_SUFFIX,
     connect_db,
     init_db,
+)
+from services.progression_rules import (
+    legacy_attribute_exp_required,
+    migrate_exp_preserving_progress,
 )
 from services.equipment_service import EquipmentService
 from services.skill_service import SkillService
@@ -146,7 +154,7 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.user.strength, 4)
         self.assertEqual(result.user.stat_points, 0)
 
-    async def test_primary_attribute_rebalance_migrates_once(self):
+    async def test_missing_historical_marker_never_resets_modern_progress(self):
         handle, migration_path = tempfile.mkstemp(suffix=".db")
         os.close(handle)
         backup_path = migration_path + PRIMARY_ATTRIBUTE_REBALANCE_BACKUP_SUFFIX
@@ -205,8 +213,11 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(migrated.level, 5)
             self.assertEqual(migrated.exp, 77)
             self.assertEqual(migrated.total_exp, 999)
-            self.assertEqual(migrated.stat_points, 4)
-            self.assertEqual(tuple(migrated.stats().values()), (1, 1, 1, 1, 1, 1))
+            self.assertEqual(migrated.stat_points, 8)
+            self.assertEqual(
+                tuple(migrated.stats().values()),
+                (18, 13, 14, 12, 15, 16),
+            )
             self.assertEqual(
                 (
                     migrated.life_growth,
@@ -214,21 +225,12 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
                     migrated.advanced_speed,
                     migrated.advanced_luck,
                 ),
-                (100, 100, 100, 100),
+                (125, 130, 140, 150),
             )
             self.assertEqual(migrated.skill_points, 6)
             self.assertEqual((migrated.wins, migrated.losses), (9, 4))
             self.assertEqual(len(await equipment.list_items(user.id)), len(items))
-            self.assertTrue(os.path.exists(backup_path))
-            backup = sqlite3.connect(backup_path)
-            try:
-                backed_up = backup.execute(
-                    "SELECT hp, atk, defense, speed, luck, willpower FROM users WHERE id = ?",
-                    (user.id,),
-                ).fetchone()
-            finally:
-                backup.close()
-            self.assertEqual(backed_up, (18, 12, 13, 14, 15, 16))
+            self.assertFalse(os.path.exists(backup_path))
 
             async with await connect_db(migration_path) as db:
                 progress = await AttributeService().progress_in_db(db, user.id)
@@ -249,10 +251,10 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await db.commit()
             self.assertTrue(
-                all(item.exp == 0 and item.potential == 100 for item in progress.values())
+                all(item.exp == 88 and item.potential == 250 for item in progress.values())
             )
-            self.assertEqual(frozen["frozen_stats_json"], "{}")
-            self.assertEqual(frozen["frozen_stat_points"], 1)
+            self.assertEqual(frozen["frozen_stats_json"], '{"strength": 4}')
+            self.assertEqual(frozen["frozen_stat_points"], 3)
             self.assertEqual(frozen["frozen_skill_points"], 2)
 
             await init_db(migration_path)
@@ -262,6 +264,128 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
                 os.remove(migration_path)
             if os.path.exists(backup_path):
                 os.remove(backup_path)
+
+    async def test_progression_migration_preserves_fraction_and_all_assets(self):
+        handle, migration_path = tempfile.mkstemp(suffix=".db")
+        os.close(handle)
+        backup_path = migration_path + ELONA_PROGRESSION_BACKUP_SUFFIX
+        try:
+            await init_db(migration_path)
+            users = UserService(migration_path)
+            user = await users.get_or_create_user(
+                UserIdentity("test", "group", "progression", "迁移玩家")
+            )
+            skills = SkillService(migration_path)
+            await skills.get_skills(user)
+            equipment = EquipmentService(migration_path)
+            items_before = await equipment.list_items(user.id)
+            async with await connect_db(migration_path) as db:
+                await AttributeService().ensure_progress_in_db(db, user.id)
+                await db.execute(
+                    """
+                    UPDATE user_attribute_progress
+                    SET exp = 60, potential = 0
+                    WHERE user_pk = ? AND attribute_id = 'strength'
+                    """,
+                    (user.id,),
+                )
+                await db.execute(
+                    """
+                    UPDATE user_skills
+                    SET level = 10, exp = 100, potential = 450
+                    WHERE user_pk = ? AND skill_id = 'longsword'
+                    """,
+                    (user.id,),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO user_spells
+                        (user_pk, spell_id, level, exp, potential)
+                    VALUES (?, 'magic_arrow', 10, 100, 75)
+                    """,
+                    (user.id,),
+                )
+                await db.execute(
+                    "DELETE FROM schema_migrations WHERE migration_id = ?",
+                    (ELONA_PROGRESSION_MIGRATION,),
+                )
+                await db.commit()
+
+            await init_db(migration_path)
+            self.assertTrue(os.path.exists(backup_path))
+            async with await connect_db(migration_path) as db:
+                progress = await AttributeService().progress_in_db(db, user.id)
+                migrated_skills = await skills.skills_in_db(db, user.id)
+                cursor = await db.execute(
+                    """
+                    SELECT level, exp, potential
+                    FROM user_spells
+                    WHERE user_pk = ? AND spell_id = 'magic_arrow'
+                    """,
+                    (user.id,),
+                )
+                spell = await cursor.fetchone()
+                await cursor.close()
+            expected_attribute = migrate_exp_preserving_progress(
+                60,
+                legacy_attribute_exp_required(1),
+                attribute_exp_required(1),
+            )
+            self.assertEqual(progress["strength"].exp, expected_attribute)
+            self.assertEqual(progress["strength"].potential, 1)
+            self.assertEqual(migrated_skills["longsword"].level, 10)
+            self.assertEqual(migrated_skills["longsword"].exp, 10000)
+            self.assertEqual(migrated_skills["longsword"].potential, 400)
+            self.assertEqual(tuple(spell), (10, 11750, 75))
+            self.assertEqual(
+                [item.id for item in await equipment.list_items(user.id)],
+                [item.id for item in items_before],
+            )
+
+            await init_db(migration_path)
+            async with await connect_db(migration_path) as db:
+                migrated_again = await skills.skills_in_db(db, user.id)
+            self.assertEqual(migrated_again["longsword"].exp, 10000)
+        finally:
+            if os.path.exists(migration_path):
+                os.remove(migration_path)
+            if os.path.exists(backup_path):
+                os.remove(backup_path)
+
+    async def test_progression_migration_aborts_before_writes_when_backup_fails(self):
+        async with await connect_db(self.db_path) as db:
+            await self.attributes.ensure_progress_in_db(db, self.user.id)
+            await db.execute(
+                """
+                UPDATE user_attribute_progress
+                SET exp = 123
+                WHERE user_pk = ? AND attribute_id = 'strength'
+                """,
+                (self.user.id,),
+            )
+            await db.execute(
+                "DELETE FROM schema_migrations WHERE migration_id = ?",
+                (ELONA_PROGRESSION_MIGRATION,),
+            )
+            await db.commit()
+
+        with patch(
+            "services.db._backup_database_with_suffix",
+            side_effect=RuntimeError("backup failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "backup failed"):
+                await init_db(self.db_path)
+
+        async with await connect_db(self.db_path) as db:
+            progress = await self.attributes.progress_in_db(db, self.user.id)
+            cursor = await db.execute(
+                "SELECT 1 FROM schema_migrations WHERE migration_id = ?",
+                (ELONA_PROGRESSION_MIGRATION,),
+            )
+            migration = await cursor.fetchone()
+            await cursor.close()
+        self.assertEqual(progress["strength"].exp, 123)
+        self.assertIsNone(migration)
 
     async def test_snapshot_contains_resources_and_independent_action_speed(self):
         first = await self._snapshot()
@@ -286,7 +410,7 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
     def test_skill_caps_use_governing_attribute_and_global_magic(self):
         base = PrimaryAttributes(10, 5, 5, 5, 5, 5)
         magical = replace(base, magic=25)
-        self.assertEqual(skill_level_cap(base, ("strength",)), 29)
+        self.assertEqual(skill_level_cap(base, ("strength",)), 36)
         self.assertEqual(
             skill_level_cap(base, ("constitution",), "healing"), 5
         )
@@ -342,20 +466,51 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
             await db.execute(
                 """
                 UPDATE user_attribute_progress
-                SET exp = 119, potential = 100
+                SET exp = ?, potential = 100
                 WHERE user_pk = ? AND attribute_id = 'strength'
                 """,
-                (self.user.id,),
+                (attribute_exp_required(1) - 2020, self.user.id),
             )
             growth = await self.attributes.apply_battle_growth_in_db(
                 db, self.user.id, {"longsword": 20}, None
             )
+            cursor = await db.execute(
+                """
+                SELECT rules_version
+                FROM attribute_growth_logs
+                WHERE user_pk = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (self.user.id,),
+            )
+            rules_version = (await cursor.fetchone())["rules_version"]
+            await cursor.close()
             await db.commit()
         strength = next(item for item in growth if item.attribute_id == "strength")
         self.assertEqual(strength.exp_gain, 20)
         self.assertEqual(strength.from_value, 1)
         self.assertEqual(strength.to_value, 2)
-        self.assertEqual(strength.potential_after, 50)
+        self.assertEqual(strength.potential_after, 96)
+        self.assertEqual(rules_version, "elona-scaled-v2")
+
+    async def test_one_percent_attribute_potential_still_accumulates(self):
+        await self.skills.get_skills(self.user)
+        async with await connect_db(self.db_path) as db:
+            await self.attributes.ensure_progress_in_db(db, self.user.id)
+            await db.execute(
+                """
+                UPDATE user_attribute_progress
+                SET exp = 0, potential = 1
+                WHERE user_pk = ? AND attribute_id = 'strength'
+                """,
+                (self.user.id,),
+            )
+            await self.attributes.apply_battle_growth_in_db(
+                db, self.user.id, {"longsword": 1}, None
+            )
+            progress = await self.attributes.progress_in_db(db, self.user.id)
+            await db.commit()
+        self.assertEqual(progress["strength"].exp, 1)
 
     async def test_successful_checkin_restores_each_attribute_potential_once(self):
         async with await connect_db(self.db_path) as db:

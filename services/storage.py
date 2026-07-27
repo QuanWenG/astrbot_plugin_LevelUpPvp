@@ -5,7 +5,8 @@ from pathlib import Path
 
 
 DATABASE_FILENAME = "db_level_up_pvp.db"
-LEGACY_BACKUP_SUFFIXES = (
+DATABASE_BACKUP_SUFFIXES = (
+    ".pre-elona-progression-v2.bak",
     ".pre-primary-attributes-v2.bak",
     ".pre-elona-balance-v1.bak",
 )
@@ -20,7 +21,7 @@ def prepare_persistent_database(
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / DATABASE_FILENAME
     legacy = Path(legacy_db_path)
-    source = _best_legacy_source(legacy)
+    source = _best_recovery_source(target, legacy)
 
     if _is_valid_database(target):
         target_score = _database_progress_score(target)
@@ -42,9 +43,10 @@ def prepare_persistent_database(
     return str(target)
 
 
-def _best_legacy_source(legacy: Path) -> Path | None:
+def _best_recovery_source(target: Path, legacy: Path) -> Path | None:
     candidates = [
-        *(Path(str(legacy) + suffix) for suffix in LEGACY_BACKUP_SUFFIXES),
+        *(Path(str(target) + suffix) for suffix in DATABASE_BACKUP_SUFFIXES),
+        *(Path(str(legacy) + suffix) for suffix in DATABASE_BACKUP_SUFFIXES),
         legacy,
     ]
     scored = [

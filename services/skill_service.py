@@ -9,6 +9,13 @@ try:
     )
     from .attribute_service import skill_level_cap, training_efficiency
     from .db import connect_db
+    from .progression_rules import (
+        RULESET_ID,
+        decay_skill_potential,
+        display_exp,
+        recover_potential,
+        scaled_exp_gain,
+    )
     from .skill_catalog import INITIAL_SKILLS, SKILL_DEFINITIONS, skill_exp_required, skill_id_for
     from .user_service import utc_now_text
 except ImportError:
@@ -20,6 +27,13 @@ except ImportError:
     )
     from services.attribute_service import skill_level_cap, training_efficiency
     from services.db import connect_db
+    from services.progression_rules import (
+        RULESET_ID,
+        decay_skill_potential,
+        display_exp,
+        recover_potential,
+        scaled_exp_gain,
+    )
     from services.skill_catalog import INITIAL_SKILLS, SKILL_DEFINITIONS, skill_exp_required, skill_id_for
     from services.user_service import utc_now_text
 
@@ -92,32 +106,69 @@ class SkillService:
             return result
 
     async def learn(self, user, name: str) -> UserSkill:
-        skill_id = skill_id_for(name)
-        if not skill_id:
+        return (await self.learn_many(user, (name,)))[0]
+
+    async def learn_many(
+        self,
+        user,
+        names: tuple[str, ...] | list[str],
+    ) -> list[UserSkill]:
+        skill_ids = [skill_id_for(name) for name in names]
+        if not skill_ids or any(not skill_id for skill_id in skill_ids):
             raise ValueError("未知技能")
+        if len(set(skill_ids)) != len(skill_ids):
+            raise ValueError("学习列表中有重复技能")
         async with await connect_db(self.db_path) as db:
-            await db.execute("BEGIN")
-            await self.ensure_initialized_in_db(db, user)
-            skills = await self.skills_in_db(db, user.id)
-            if skill_id in skills:
-                raise ValueError("该技能已经学会")
-            definition = SKILL_DEFINITIONS[skill_id]
-            missing = self.missing_prerequisites(definition, skills)
-            if missing:
-                progress = "、".join(
-                    f"{SKILL_DEFINITIONS[required_id].name} "
-                    f"{skills.get(required_id).level if required_id in skills else 0}/{required_level}"
-                    for required_id, required_level in missing
+            try:
+                await db.execute("BEGIN")
+                await self.ensure_initialized_in_db(db, user)
+                skills = await self.skills_in_db(db, user.id)
+                learned = []
+                for skill_id in skill_ids:
+                    if skill_id in skills:
+                        raise ValueError(
+                            f"{SKILL_DEFINITIONS[skill_id].name}已经学会"
+                        )
+                    definition = SKILL_DEFINITIONS[skill_id]
+                    missing = self.missing_prerequisites(definition, skills)
+                    if missing:
+                        progress = "、".join(
+                            f"{SKILL_DEFINITIONS[required_id].name} "
+                            f"{skills.get(required_id).level if required_id in skills else 0}/{required_level}"
+                            for required_id, required_level in missing
+                        )
+                        raise ValueError(
+                            f"{definition.name}前置技能不足：{progress}"
+                        )
+                    skill = UserSkill(skill_id, 1, 0, 100)
+                    skills[skill_id] = skill
+                    learned.append(skill)
+                cursor = await db.execute(
+                    "SELECT skill_points FROM users WHERE id = ?", (user.id,)
                 )
-                raise ValueError(f"前置技能不足：{progress}")
-            cursor = await db.execute("SELECT skill_points FROM users WHERE id = ?", (user.id,))
-            row = await cursor.fetchone(); await cursor.close()
-            if int(row["skill_points"]) < 1:
-                raise ValueError("技能点不足")
-            await db.execute("UPDATE users SET skill_points = skill_points - 1 WHERE id = ?", (user.id,))
-            await db.execute("INSERT INTO user_skills (user_pk, skill_id, level, exp, potential) VALUES (?, ?, 1, 0, 100)", (user.id, skill_id))
-            await db.commit()
-            return UserSkill(skill_id, 1, 0, 100)
+                row = await cursor.fetchone()
+                await cursor.close()
+                if int(row["skill_points"]) < len(learned):
+                    raise ValueError(
+                        f"技能点不足，需要{len(learned)}点"
+                    )
+                await db.execute(
+                    "UPDATE users SET skill_points = skill_points - ? "
+                    "WHERE id = ?",
+                    (len(learned), user.id),
+                )
+                for skill in learned:
+                    await db.execute(
+                        "INSERT INTO user_skills "
+                        "(user_pk, skill_id, level, exp, potential) "
+                        "VALUES (?, ?, 1, 0, 100)",
+                        (user.id, skill.skill_id),
+                    )
+                await db.commit()
+                return learned
+            except Exception:
+                await db.rollback()
+                raise
 
     @staticmethod
     def missing_prerequisites(definition, skills) -> tuple[tuple[str, int], ...]:
@@ -128,45 +179,98 @@ class SkillService:
             or skills[required_id].level < required_level
         )
     async def train_potential(self, user, name: str, points: int) -> UserSkill:
-        skill_id = skill_id_for(name)
-        if not skill_id or points < 1:
-            raise ValueError("用法：/训练技能 技能名 点数")
+        return (await self.train_many(user, ((name, points),)))[0]
+
+    async def train_many(
+        self,
+        user,
+        assignments: tuple[tuple[str, int], ...] | list[tuple[str, int]],
+    ) -> list[UserSkill]:
+        if not assignments:
+            raise ValueError("用法：/训练技能 技能名 点数 [...]")
+        skill_ids = [skill_id_for(name) for name, _ in assignments]
+        if (
+            any(not skill_id for skill_id in skill_ids)
+            or any(int(points) < 1 for _, points in assignments)
+        ):
+            raise ValueError("用法：/训练技能 技能名 点数 [...]")
+        if len(set(skill_ids)) != len(skill_ids):
+            raise ValueError("训练列表中有重复技能")
         async with await connect_db(self.db_path) as db:
-            await db.execute("BEGIN")
-            await self.ensure_initialized_in_db(db, user)
-            skills = await self.skills_in_db(db, user.id)
-            skill = skills.get(skill_id)
-            if not skill:
-                raise ValueError("请先学习该技能")
-            cursor = await db.execute("SELECT skill_points FROM users WHERE id = ?", (user.id,))
-            row = await cursor.fetchone(); await cursor.close()
-            if int(row["skill_points"]) < points:
-                raise ValueError("技能点不足")
-            potential = skill.potential
-            spent = 0
-            for _ in range(points):
-                if potential >= self.MAX_POTENTIAL:
-                    break
-                potential = min(self.MAX_POTENTIAL, potential + (50 if potential < 100 else 20 if potential < 250 else 5))
-                spent += 1
-            if not spent:
-                raise ValueError("技能潜力已经达到上限")
-            await db.execute("UPDATE users SET skill_points = skill_points - ? WHERE id = ?", (spent, user.id))
-            await db.execute("UPDATE user_skills SET potential = ? WHERE user_pk = ? AND skill_id = ?", (potential, user.id, skill_id))
-            await db.commit()
-            return UserSkill(skill_id, skill.level, skill.exp, potential)
+            try:
+                await db.execute("BEGIN")
+                await self.ensure_initialized_in_db(db, user)
+                skills = await self.skills_in_db(db, user.id)
+                results = []
+                total_spent = 0
+                for (name, requested), skill_id in zip(
+                    assignments, skill_ids
+                ):
+                    skill = skills.get(skill_id)
+                    if not skill:
+                        raise ValueError(f"请先学习{name}")
+                    potential = skill.potential
+                    spent = 0
+                    for _ in range(int(requested)):
+                        if potential >= self.MAX_POTENTIAL:
+                            break
+                        potential = recover_potential(potential)
+                        spent += 1
+                    if not spent:
+                        raise ValueError(
+                            f"{SKILL_DEFINITIONS[skill_id].name}"
+                            "潜力已经达到上限"
+                        )
+                    total_spent += spent
+                    results.append(
+                        UserSkill(
+                            skill_id, skill.level, skill.exp, potential
+                        )
+                    )
+                cursor = await db.execute(
+                    "SELECT skill_points FROM users WHERE id = ?", (user.id,)
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                if int(row["skill_points"]) < total_spent:
+                    raise ValueError(
+                        f"技能点不足，需要{total_spent}点"
+                    )
+                await db.execute(
+                    "UPDATE users SET skill_points = skill_points - ? "
+                    "WHERE id = ?",
+                    (total_spent, user.id),
+                )
+                for skill in results:
+                    await db.execute(
+                        "UPDATE user_skills SET potential = ? "
+                        "WHERE user_pk = ? AND skill_id = ?",
+                        (skill.potential, user.id, skill.skill_id),
+                    )
+                await db.commit()
+                return results
+            except Exception:
+                await db.rollback()
+                raise
 
     async def set_active_slot(self, user, slot: int, name: str) -> None:
-        if slot not in range(1, 5):
+        await self.set_active_slots(user, ((slot, name),))
+
+    async def set_active_slots(
+        self,
+        user,
+        assignments: tuple[tuple[int, str], ...] | list[tuple[int, str]],
+    ) -> None:
+        if not assignments:
+            raise ValueError("请指定技能栏配置")
+        if any(int(slot) not in range(1, 5) for slot, _ in assignments):
             raise ValueError("技能栏位置必须是1到4")
+        if len({int(slot) for slot, _ in assignments}) != len(assignments):
+            raise ValueError("技能栏位置不能重复")
         async with await connect_db(self.db_path) as db:
-            await self.ensure_initialized_in_db(db, user)
-            if name in {"", "清空"}:
-                await db.execute("DELETE FROM active_skill_slots WHERE user_pk = ? AND slot = ?", (user.id, slot))
-            else:
-                ability_id = ability_id_for(name)
-                if not ability_id:
-                    raise ValueError("未知主动能力")
+            try:
+                await db.execute("BEGIN")
+                await self.ensure_initialized_in_db(db, user)
                 skills = await self.skills_in_db(db, user.id)
                 cursor = await db.execute(
                     "SELECT spell_id, level, exp, potential FROM user_spells WHERE user_pk = ?",
@@ -181,17 +285,48 @@ class SkillService:
                     )
                     for row in rows
                 }
-                definition = ACTIVE_ABILITY_DEFINITIONS[ability_id]
-                if not ability_is_unlocked(definition, skills, spells):
-                    if definition.ability_type == "spell":
-                        raise ValueError("尚未通过魔法书学会该法术")
-                    raise ValueError(
-                        f"{definition.name}需要{definition.unlock_skill_id}"
-                        f"永久等级达到{definition.unlock_level}"
+                resolved = []
+                for slot, name in assignments:
+                    if name in {"", "清空"}:
+                        resolved.append((int(slot), ""))
+                        continue
+                    ability_id = ability_id_for(name)
+                    if not ability_id:
+                        raise ValueError(f"未知主动能力：{name}")
+                    definition = ACTIVE_ABILITY_DEFINITIONS[ability_id]
+                    if not ability_is_unlocked(definition, skills, spells):
+                        if definition.ability_type == "spell":
+                            raise ValueError(
+                                f"尚未通过魔法书学会{definition.name}"
+                            )
+                        raise ValueError(
+                            f"{definition.name}需要"
+                            f"{definition.unlock_skill_id}"
+                            f"永久等级达到{definition.unlock_level}"
+                        )
+                    resolved.append((int(slot), ability_id))
+                for slot, ability_id in resolved:
+                    await db.execute(
+                        "DELETE FROM active_skill_slots "
+                        "WHERE user_pk = ? AND slot = ?",
+                        (user.id, slot),
                     )
-                await db.execute("DELETE FROM active_skill_slots WHERE user_pk = ? AND skill_id = ?", (user.id, ability_id))
-                await db.execute("INSERT OR REPLACE INTO active_skill_slots (user_pk, slot, skill_id) VALUES (?, ?, ?)", (user.id, slot, ability_id))
-            await db.commit()
+                    if not ability_id:
+                        continue
+                    await db.execute(
+                        "DELETE FROM active_skill_slots "
+                        "WHERE user_pk = ? AND skill_id = ?",
+                        (user.id, ability_id),
+                    )
+                    await db.execute(
+                        "INSERT OR REPLACE INTO active_skill_slots "
+                        "(user_pk, slot, skill_id) VALUES (?, ?, ?)",
+                        (user.id, slot, ability_id),
+                    )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
 
     def usage_from_simulation(self, result) -> dict[int, dict[str, int]]:
         usage: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -272,13 +407,10 @@ class SkillService:
             )
             if skill.level >= min(self.MAX_LEVEL, level_cap):
                 continue
-            gain = max(
-                1,
-                round(
-                    min(self.RAW_XP_CAP, raw)
-                    * max(0.10, skill.potential / 100)
-                    * will_efficiency
-                ),
+            gain = scaled_exp_gain(
+                min(self.RAW_XP_CAP, raw),
+                skill.potential,
+                will_efficiency,
             )
             level, exp, potential = skill.level, skill.exp + gain, skill.potential
             old_level, old_potential = level, potential
@@ -288,8 +420,27 @@ class SkillService:
             ):
                 exp -= skill_exp_required(level)
                 level += 1
-                potential //= 2
+                potential = decay_skill_potential(potential)
             await db.execute("UPDATE user_skills SET level = ?, exp = ?, potential = ? WHERE user_pk = ? AND skill_id = ?", (level, exp, potential, user_pk, skill_id))
-            await db.execute("INSERT INTO skill_growth_logs (user_pk, battle_id, skill_id, exp_gain, from_level, to_level, potential_before, potential_after, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (user_pk, battle_id, skill_id, gain, old_level, level, old_potential, potential, utc_now_text()))
-            growths.append(SkillGrowth(user_pk, skill_id, SKILL_DEFINITIONS[skill_id].name, gain, old_level, level, potential))
+            await db.execute(
+                "INSERT INTO skill_growth_logs "
+                "(user_pk, battle_id, skill_id, exp_gain, from_level, "
+                "to_level, potential_before, potential_after, created_at, "
+                "rules_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_pk, battle_id, skill_id, gain, old_level, level,
+                    old_potential, potential, utc_now_text(), RULESET_ID,
+                ),
+            )
+            growths.append(
+                SkillGrowth(
+                    user_pk,
+                    skill_id,
+                    SKILL_DEFINITIONS[skill_id].name,
+                    display_exp(gain),
+                    old_level,
+                    level,
+                    potential,
+                )
+            )
         return growths

@@ -3,6 +3,31 @@ import os
 import sqlite3
 
 try:
+    from .progression_rules import (
+        LEGACY_RULESET_ID,
+        attribute_exp_required,
+        clamp_potential,
+        legacy_attribute_exp_required,
+        legacy_skill_exp_required,
+        legacy_spell_exp_required,
+        migrate_exp_preserving_progress,
+        skill_exp_required,
+        spell_exp_required,
+    )
+except ImportError:
+    from services.progression_rules import (
+        LEGACY_RULESET_ID,
+        attribute_exp_required,
+        clamp_potential,
+        legacy_attribute_exp_required,
+        legacy_skill_exp_required,
+        legacy_spell_exp_required,
+        migrate_exp_preserving_progress,
+        skill_exp_required,
+        spell_exp_required,
+    )
+
+try:
     import aiosqlite
 except ImportError:
     aiosqlite = None
@@ -14,6 +39,8 @@ ELONA_BALANCE_MIGRATION = "2026-07-elona-balance-v1"
 ELONA_BALANCE_BACKUP_SUFFIX = ".pre-elona-balance-v1.bak"
 CLASSIC_BLACK_STAR_LEVEL_MIGRATION = "2026-07-classic-black-stars-level-40-v1"
 CLASSIC_BLACK_STAR_EFFECTS_MIGRATION = "2026-07-classic-black-stars-effects-v2"
+ELONA_PROGRESSION_MIGRATION = "elona-progression-v2"
+ELONA_PROGRESSION_BACKUP_SUFFIX = ".pre-elona-progression-v2.bak"
 CLASSIC_BLACK_STAR_TEMPLATE_IDS = (
     "black_star_ether_dagger",
     "black_star_lucky_dagger",
@@ -295,7 +322,9 @@ async def init_db(db_path: str) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_pk INTEGER NOT NULL, battle_id INTEGER,
                 skill_id TEXT NOT NULL, exp_gain INTEGER NOT NULL, from_level INTEGER NOT NULL,
                 to_level INTEGER NOT NULL, potential_before INTEGER NOT NULL, potential_after INTEGER NOT NULL,
-                created_at TEXT NOT NULL, FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                rules_version TEXT NOT NULL DEFAULT 'elona-scaled-v2',
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(battle_id) REFERENCES battles(id) ON DELETE SET NULL
             );
             CREATE TABLE IF NOT EXISTS feature_grants (
@@ -337,6 +366,7 @@ async def init_db(db_path: str) -> None:
                 from_level INTEGER NOT NULL, to_level INTEGER NOT NULL,
                 potential_before INTEGER NOT NULL,
                 potential_after INTEGER NOT NULL, created_at TEXT NOT NULL,
+                rules_version TEXT NOT NULL DEFAULT 'elona-scaled-v2',
                 FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(battle_id) REFERENCES battles(id) ON DELETE SET NULL
             );
@@ -360,6 +390,7 @@ async def init_db(db_path: str) -> None:
                 from_value INTEGER NOT NULL, to_value INTEGER NOT NULL,
                 potential_before INTEGER NOT NULL, potential_after INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
+                rules_version TEXT NOT NULL DEFAULT 'elona-scaled-v2',
                 FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY(battle_id) REFERENCES battles(id) ON DELETE SET NULL
             );
@@ -471,6 +502,7 @@ async def init_db(db_path: str) -> None:
         await _apply_elona_balance_reset(db, db_path)
         await _apply_classic_black_star_level_migration(db)
         await _apply_classic_black_star_effects_migration(db)
+        await _apply_elona_progression_migration(db, db_path)
 
 
 async def _ensure_column(db, table_name: str, column_name: str, definition: str) -> None:
@@ -528,6 +560,22 @@ async def _apply_primary_attribute_rebalance(db, db_path: str) -> None:
     if already_applied:
         return
 
+    cursor = await db.execute(
+        "SELECT COUNT(*) AS count FROM user_attribute_progress"
+    )
+    modern_progress_count = int((await cursor.fetchone())["count"])
+    await cursor.close()
+    if modern_progress_count:
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at)
+            VALUES (?, datetime('now'))
+            """,
+            (PRIMARY_ATTRIBUTE_REBALANCE_MIGRATION,),
+        )
+        await db.commit()
+        return
+
     cursor = await db.execute("SELECT COUNT(*) AS count FROM users")
     user_count = int((await cursor.fetchone())["count"])
     await cursor.close()
@@ -580,6 +628,27 @@ async def _apply_elona_balance_reset(db, db_path: str) -> None:
     already_applied = await cursor.fetchone()
     await cursor.close()
     if already_applied:
+        return
+
+    cursor = await db.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM user_skills)
+          + (SELECT COUNT(*) FROM user_spells)
+          + (SELECT COUNT(*) FROM equipment_items) AS count
+        """
+    )
+    modern_progress_count = int((await cursor.fetchone())["count"])
+    await cursor.close()
+    if modern_progress_count:
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at)
+            VALUES (?, datetime('now'))
+            """,
+            (ELONA_BALANCE_MIGRATION,),
+        )
+        await db.commit()
         return
 
     cursor = await db.execute("SELECT COUNT(*) AS count FROM users")
@@ -640,6 +709,152 @@ async def _apply_elona_balance_reset(db, db_path: str) -> None:
             """,
             (ELONA_BALANCE_MIGRATION,),
         )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+
+async def _apply_elona_progression_migration(db, db_path: str) -> None:
+    cursor = await db.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_id = ?",
+        (ELONA_PROGRESSION_MIGRATION,),
+    )
+    already_applied = await cursor.fetchone()
+    await cursor.close()
+    if already_applied:
+        return
+
+    cursor = await db.execute("SELECT COUNT(*) AS count FROM users")
+    user_count = int((await cursor.fetchone())["count"])
+    await cursor.close()
+    if user_count:
+        backup_path = _backup_database_with_suffix(
+            db_path, ELONA_PROGRESSION_BACKUP_SUFFIX
+        )
+        if db_path != ":memory:" and backup_path is None:
+            raise RuntimeError("无法创建成长系统迁移备份")
+
+    await db.execute("BEGIN")
+    try:
+        for table_name in (
+            "attribute_growth_logs",
+            "skill_growth_logs",
+            "spell_growth_logs",
+        ):
+            await _ensure_column(
+                db,
+                table_name,
+                "rules_version",
+                f"TEXT NOT NULL DEFAULT '{LEGACY_RULESET_ID}'",
+            )
+
+        cursor = await db.execute(
+            """
+            SELECT p.user_pk, p.attribute_id, p.exp, p.potential,
+                   u.hp, u.defense, u.speed, u.atk, u.luck, u.willpower
+            FROM user_attribute_progress AS p
+            JOIN users AS u ON u.id = p.user_pk
+            """
+        )
+        attribute_rows = await cursor.fetchall()
+        await cursor.close()
+        attribute_columns = {
+            "strength": "hp",
+            "constitution": "defense",
+            "dexterity": "speed",
+            "perception": "atk",
+            "magic": "luck",
+            "willpower": "willpower",
+        }
+        for row in attribute_rows:
+            attribute_id = row["attribute_id"]
+            if attribute_id not in attribute_columns:
+                continue
+            value = int(row[attribute_columns[attribute_id]])
+            converted = migrate_exp_preserving_progress(
+                int(row["exp"]),
+                legacy_attribute_exp_required(value),
+                attribute_exp_required(value),
+            )
+            await db.execute(
+                """
+                UPDATE user_attribute_progress
+                SET exp = ?, potential = ?
+                WHERE user_pk = ? AND attribute_id = ?
+                """,
+                (
+                    converted,
+                    clamp_potential(int(row["potential"])),
+                    int(row["user_pk"]),
+                    attribute_id,
+                ),
+            )
+
+        cursor = await db.execute(
+            "SELECT user_pk, skill_id, level, exp, potential FROM user_skills"
+        )
+        skill_rows = await cursor.fetchall()
+        await cursor.close()
+        for row in skill_rows:
+            level = int(row["level"])
+            converted = migrate_exp_preserving_progress(
+                int(row["exp"]),
+                legacy_skill_exp_required(level),
+                skill_exp_required(level),
+            )
+            await db.execute(
+                """
+                UPDATE user_skills
+                SET exp = ?, potential = ?
+                WHERE user_pk = ? AND skill_id = ?
+                """,
+                (
+                    converted,
+                    clamp_potential(int(row["potential"])),
+                    int(row["user_pk"]),
+                    row["skill_id"],
+                ),
+            )
+
+        cursor = await db.execute(
+            "SELECT user_pk, spell_id, level, exp, potential FROM user_spells"
+        )
+        spell_rows = await cursor.fetchall()
+        await cursor.close()
+        for row in spell_rows:
+            level = int(row["level"])
+            converted = migrate_exp_preserving_progress(
+                int(row["exp"]),
+                legacy_spell_exp_required(level),
+                spell_exp_required(level),
+            )
+            await db.execute(
+                """
+                UPDATE user_spells
+                SET exp = ?, potential = ?
+                WHERE user_pk = ? AND spell_id = ?
+                """,
+                (
+                    converted,
+                    clamp_potential(int(row["potential"])),
+                    int(row["user_pk"]),
+                    row["spell_id"],
+                ),
+            )
+
+        await db.execute(
+            """
+            INSERT INTO schema_migrations (migration_id, applied_at)
+            VALUES (?, datetime('now'))
+            """,
+            (ELONA_PROGRESSION_MIGRATION,),
+        )
+        cursor = await db.execute("PRAGMA quick_check")
+        integrity = await cursor.fetchone()
+        await cursor.close()
+        if not integrity or integrity[0] != "ok":
+            raise RuntimeError("成长系统迁移后的数据库完整性检查失败")
         await db.commit()
     except Exception:
         await db.rollback()

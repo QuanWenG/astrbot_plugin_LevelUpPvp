@@ -4,9 +4,11 @@ from dataclasses import replace
 
 try:
     from ..models.ability import ActionEffect, ActiveAbilityDefinition
+    from .progression_rules import spell_exp_required
     from .spell_rules import SPELL_RULES
 except ImportError:
     from models.ability import ActionEffect, ActiveAbilityDefinition
+    from services.progression_rules import spell_exp_required
     from services.spell_rules import SPELL_RULES
 
 
@@ -474,6 +476,3 @@ def ability_is_unlocked(definition, skills, spells) -> bool:
     if not skill:
         return False
     return skill.level >= definition.unlock_level
-
-def spell_exp_required(level: int) -> int:
-    return 50 + level * 15

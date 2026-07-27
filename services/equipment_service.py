@@ -212,7 +212,20 @@ class EquipmentService:
 
     async def list_items_in_db(self, db, user_pk: int) -> list[EquipmentItem]:
         cursor = await db.execute(
-            "SELECT * FROM equipment_items WHERE owner_pk = ? ORDER BY id", (user_pk,)
+            """
+            SELECT * FROM equipment_items
+            WHERE owner_pk = ?
+            ORDER BY CASE quality
+                WHEN 'legendary' THEN 6
+                WHEN 'mythic' THEN 5
+                WHEN 'epic' THEN 4
+                WHEN 'rare' THEN 3
+                WHEN 'excellent' THEN 2
+                WHEN 'common' THEN 1
+                ELSE 0
+            END DESC, item_level DESC, id ASC
+            """,
+            (user_pk,),
         )
         rows = await cursor.fetchall()
         await cursor.close()
@@ -243,50 +256,127 @@ class EquipmentService:
             return result
 
     async def equip(self, user_pk: int, equipment_id: int, requested_slot: str = ""):
+        results = await self.equip_many(
+            user_pk,
+            ((equipment_id, requested_slot),),
+        )
+        return results[0]
+
+    async def equip_many(
+        self,
+        user_pk: int,
+        assignments: tuple[tuple[int, str], ...] | list[tuple[int, str]],
+    ) -> list[tuple[EquipmentItem, tuple[str, ...]]]:
+        if not assignments:
+            raise ValueError("请指定要穿戴的装备")
         async with await connect_db(self.db_path) as db:
-            await db.execute("BEGIN")
-            await self.ensure_starter_in_db(db, user_pk)
-            item = await self._get_owned_item_in_db(db, user_pk, equipment_id)
-            slots = self._target_slots(item, requested_slot)
-            if item.hand_mode in {"two_hand_heavy", "two_hand_melee", "two_hand_ranged"}:
-                await db.execute(
-                    "DELETE FROM equipment_loadout WHERE user_pk = ? AND slot IN ('main_hand', 'off_hand')",
-                    (user_pk,),
-                )
-            elif any(slot in {"main_hand", "off_hand"} for slot in slots):
-                await db.execute(
-                    "DELETE FROM equipment_loadout WHERE user_pk = ? AND slot IN ('main_hand', 'off_hand') AND equipment_id IN (SELECT equipment_id FROM equipment_loadout WHERE user_pk = ? GROUP BY equipment_id HAVING COUNT(*) > 1)",
-                    (user_pk, user_pk),
-                )
+            try:
+                await db.execute("BEGIN")
+                await self.ensure_starter_in_db(db, user_pk)
+                resolved = []
+                for equipment_id, requested_slot in assignments:
+                    item = await self._get_owned_item_in_db(
+                        db, user_pk, int(equipment_id)
+                    )
+                    slots = self._target_slots(item, requested_slot)
+                    resolved.append((item, slots))
+                for item, slots in resolved:
+                    await self._equip_in_db(db, user_pk, item, slots)
+                await db.commit()
+                return resolved
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def _equip_in_db(
+        self,
+        db,
+        user_pk: int,
+        item: EquipmentItem,
+        slots: tuple[str, ...],
+    ) -> None:
+        if item.hand_mode in {"two_hand_heavy", "two_hand_melee", "two_hand_ranged"}:
             await db.execute(
-                "DELETE FROM equipment_loadout WHERE user_pk = ? AND equipment_id = ?",
-                (user_pk, equipment_id),
+                "DELETE FROM equipment_loadout "
+                "WHERE user_pk = ? AND slot IN ('main_hand', 'off_hand')",
+                (user_pk,),
             )
-            for slot in slots:
-                await db.execute(
-                    "INSERT OR REPLACE INTO equipment_loadout (user_pk, slot, equipment_id) VALUES (?, ?, ?)",
-                    (user_pk, slot, equipment_id),
-                )
-            await db.commit()
-            return item, slots
+        elif any(slot in {"main_hand", "off_hand"} for slot in slots):
+            await db.execute(
+                "DELETE FROM equipment_loadout WHERE user_pk = ? "
+                "AND slot IN ('main_hand', 'off_hand') "
+                "AND equipment_id IN ("
+                "SELECT equipment_id FROM equipment_loadout "
+                "WHERE user_pk = ? GROUP BY equipment_id HAVING COUNT(*) > 1)",
+                (user_pk, user_pk),
+            )
+        await db.execute(
+            "DELETE FROM equipment_loadout "
+            "WHERE user_pk = ? AND equipment_id = ?",
+            (user_pk, item.id),
+        )
+        for slot in slots:
+            await db.execute(
+                "INSERT OR REPLACE INTO equipment_loadout "
+                "(user_pk, slot, equipment_id) VALUES (?, ?, ?)",
+                (user_pk, slot, item.id),
+            )
 
     async def unequip(self, user_pk: int, slot: str) -> None:
-        if slot not in EQUIPMENT_SLOTS:
+        await self.unequip_many(user_pk, (slot,))
+
+    async def unequip_many(
+        self,
+        user_pk: int,
+        slots: tuple[str, ...] | list[str],
+    ) -> int:
+        if not slots:
+            raise ValueError("请指定要卸下的装备槽")
+        if any(slot not in EQUIPMENT_SLOTS for slot in slots):
             raise ValueError("未知装备槽")
         async with await connect_db(self.db_path) as db:
+            try:
+                await db.execute("BEGIN")
+                placeholders = ",".join("?" for _ in slots)
+                cursor = await db.execute(
+                    "SELECT DISTINCT equipment_id FROM equipment_loadout "
+                    f"WHERE user_pk = ? AND slot IN ({placeholders})",
+                    (user_pk, *slots),
+                )
+                equipment_ids = [
+                    int(row["equipment_id"]) for row in await cursor.fetchall()
+                ]
+                await cursor.close()
+                if not equipment_ids:
+                    raise ValueError("指定位置没有装备")
+                id_placeholders = ",".join("?" for _ in equipment_ids)
+                await db.execute(
+                    "DELETE FROM equipment_loadout WHERE user_pk = ? "
+                    f"AND equipment_id IN ({id_placeholders})",
+                    (user_pk, *equipment_ids),
+                )
+                await db.commit()
+                return len(equipment_ids)
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def unequip_all(self, user_pk: int) -> int:
+        async with await connect_db(self.db_path) as db:
             cursor = await db.execute(
-                "SELECT equipment_id FROM equipment_loadout WHERE user_pk = ? AND slot = ?",
-                (user_pk, slot),
+                "SELECT COUNT(DISTINCT equipment_id) AS count "
+                "FROM equipment_loadout WHERE user_pk = ?",
+                (user_pk,),
             )
             row = await cursor.fetchone()
             await cursor.close()
-            if not row:
-                raise ValueError("该位置没有装备")
+            count = int(row["count"])
             await db.execute(
-                "DELETE FROM equipment_loadout WHERE user_pk = ? AND equipment_id = ?",
-                (user_pk, row["equipment_id"]),
+                "DELETE FROM equipment_loadout WHERE user_pk = ?",
+                (user_pk,),
             )
             await db.commit()
+            return count
 
     async def item_detail(self, user_pk: int, equipment_id: int) -> EquipmentItem:
         async with await connect_db(self.db_path) as db:

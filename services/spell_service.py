@@ -16,6 +16,14 @@ try:
     from .attribute_service import training_efficiency
     from .build_service import CombatBuildService
     from .db import connect_db
+    from .progression_rules import (
+        RULESET_ID,
+        decay_skill_potential,
+        display_exp,
+        recover_potential,
+        scaled_exp_gain,
+        spell_level_cap,
+    )
     from .user_service import utc_now_text
 except ImportError:
     from models.ability import SpellBookItem, SpellGrowth, SpellReadResult, UserSpell
@@ -23,6 +31,14 @@ except ImportError:
     from services.attribute_service import training_efficiency
     from services.build_service import CombatBuildService
     from services.db import connect_db
+    from services.progression_rules import (
+        RULESET_ID,
+        decay_skill_potential,
+        display_exp,
+        recover_potential,
+        scaled_exp_gain,
+        spell_level_cap,
+    )
     from services.user_service import utc_now_text
 
 
@@ -258,10 +274,9 @@ class SpellService:
                 )
             elif success and existing:
                 silent_reading = effective_levels.get("silent_reading", 0)
-                potential_gain = round(20 * (1 + silent_reading * 0.005))
-                potential = min(
-                    self.MAX_POTENTIAL,
-                    existing.potential + potential_gain,
+                potential = recover_potential(
+                    existing.potential,
+                    1 + silent_reading * 0.005,
                 )
                 potential_gain = potential - existing.potential
                 result_spell = UserSpell(
@@ -380,19 +395,16 @@ class SpellService:
             definition = SPELL_DEFINITIONS.get(spell_id)
             if not current or not definition or raw <= 0:
                 continue
-            level_cap = min(
+            level_cap = spell_level_cap(
+                skill_levels.get(definition.unlock_skill_id, 0),
                 self.MAX_LEVEL,
-                skill_levels.get(definition.unlock_skill_id, 0) + 20,
             )
             if current.level >= level_cap:
                 continue
-            gain = max(
-                1,
-                round(
-                    min(self.RAW_XP_CAP, raw)
-                    * max(0.10, current.potential / 100)
-                    * will_efficiency
-                ),
+            gain = scaled_exp_gain(
+                min(self.RAW_XP_CAP, raw),
+                current.potential,
+                will_efficiency,
             )
             level = current.level
             exp = current.exp + gain
@@ -400,7 +412,7 @@ class SpellService:
             while level < level_cap and exp >= spell_exp_required(level):
                 exp -= spell_exp_required(level)
                 level += 1
-                potential //= 2
+                potential = decay_skill_potential(potential)
             await db.execute(
                 """
                 UPDATE user_spells
@@ -414,8 +426,8 @@ class SpellService:
                 INSERT INTO spell_growth_logs (
                     user_pk, battle_id, spell_id, exp_gain,
                     from_level, to_level, potential_before,
-                    potential_after, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    potential_after, created_at, rules_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_pk,
@@ -427,6 +439,7 @@ class SpellService:
                     current.potential,
                     potential,
                     utc_now_text(),
+                    RULESET_ID,
                 ),
             )
             growths.append(
@@ -434,7 +447,7 @@ class SpellService:
                     user_pk,
                     spell_id,
                     definition.name,
-                    gain,
+                    display_exp(gain),
                     current.level,
                     level,
                     potential,

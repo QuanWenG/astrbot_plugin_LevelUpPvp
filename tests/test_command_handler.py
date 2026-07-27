@@ -1,4 +1,6 @@
+import os
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -65,7 +67,10 @@ _install_dependency_stubs()
 
 from astrbot.api.message_components import At
 from handles.command_handler import LevelUpPvpCommandHandler
-from models.user import CheckinResult, User
+from models.user import CheckinResult, User, UserIdentity
+from services.db import connect_db, init_db
+from services.skill_service import SkillService
+from services.user_service import UserService
 
 
 class FakeEvent:
@@ -249,6 +254,47 @@ class AutoCheckinHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("今日签到经验：20", replies[0])
         self.assertIn("连续签到：1 天", replies[0])
         self.assertIn("等级：Lv.1 经验：20/100", replies[0])
+
+
+class BatchCommandParsingTests(unittest.TestCase):
+    def setUp(self):
+        self.handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=None,
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+        )
+
+    def test_skill_range_uses_skill_display_order_and_is_inclusive(self):
+        self.assertEqual(
+            self.handler._expand_skill_names("斧头专精-战术"),
+            ("斧头专精", "格斗技巧", "镰刀专精", "战术"),
+        )
+        with self.assertRaisesRegex(ValueError, "顺序"):
+            self.handler._expand_skill_names("战术-斧头专精")
+
+    def test_batch_pair_parsers(self):
+        self.assertEqual(
+            self.handler._parse_train_assignments(
+                "斧头专精 2 格斗技巧 1"
+            ),
+            (("斧头专精", 2), ("格斗技巧", 1)),
+        )
+        self.assertEqual(
+            self.handler._parse_train_assignments("斧头专精"),
+            (("斧头专精", 1),),
+        )
+        self.assertEqual(
+            self.handler._parse_skill_slot_assignments(
+                "1 强击 2 清空"
+            ),
+            ((1, "强击"), (2, "清空")),
+        )
+        self.assertEqual(
+            self.handler._parse_equip_assignments("2 头 3 颈"),
+            ((2, "head"), (3, "neck")),
+        )
 
 
 class LongTextReplyTests(unittest.IsolatedAsyncioTestCase):
@@ -965,3 +1011,86 @@ class QQOfficialChallengeDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["战斗已触发"], replies)
         battle_service.battle.assert_awaited_once()
         self.assertEqual(target_id, battle_service.battle.await_args.args[1].user_id)
+
+class LearnSkillRangeTests(unittest.IsolatedAsyncioTestCase):
+    """Range learning should skip already-learned skills instead of failing."""
+
+    async def asyncSetUp(self):
+        handle, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(handle)
+        await init_db(self.db_path)
+        self.users = UserService(self.db_path)
+        self.skills = SkillService(self.db_path)
+        self.identity = UserIdentity(
+            platform="test", group_id="group-1",
+            user_id="user-1", nickname="测试用户",
+        )
+        self.user = await self.users.get_or_create_user(self.identity)
+        await self.users.register_nickname(self.identity, "测试用户")
+        async with await connect_db(self.db_path) as db:
+            await db.execute(
+                "UPDATE users SET skill_points = 20 WHERE id = ?",
+                (self.user.id,),
+            )
+            await db.commit()
+        self.handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=self.users,
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+            skill_service=self.skills,
+        )
+
+    async def asyncTearDown(self):
+        os.remove(self.db_path)
+
+    async def test_range_learning_skips_already_learned_skills(self):
+        replies = [
+            reply
+            async for reply in self.handler.learn_skill(
+                FakeEvent(), "斧头专精-法杖专精"
+            )
+        ]
+        self.assertEqual(len(replies), 1)
+        self.assertIn("已学习技能", replies[0])
+        self.assertIn("斧头专精", replies[0])
+        self.assertIn("法杖专精", replies[0])
+        self.assertIn("已跳过已学会技能", replies[0])
+        self.assertIn("战术", replies[0])
+        self.assertIn("举重", replies[0])
+        skills, _ = await self.skills.get_skills(self.user)
+        self.assertIn("axe", skills)
+        self.assertIn("staff", skills)
+        self.assertEqual(skills["axe"].level, 1)
+
+    async def test_single_already_learned_skill_still_errors(self):
+        replies = [
+            reply
+            async for reply in self.handler.learn_skill(
+                FakeEvent(), "战术"
+            )
+        ]
+        self.assertEqual(len(replies), 1)
+        self.assertIn("学习失败", replies[0])
+        self.assertIn("战术", replies[0])
+        self.assertIn("已经学会", replies[0])
+
+    async def test_all_learned_range_reports_error(self):
+        replies1 = [
+            reply
+            async for reply in self.handler.learn_skill(
+                FakeEvent(), "斧头专精-镰刀专精"
+            )
+        ]
+        self.assertIn("已学习技能", replies1[0])
+        # Now every skill in that range is learned; re-learning should fail.
+        replies2 = [
+            reply
+            async for reply in self.handler.learn_skill(
+                FakeEvent(), "斧头专精-战术"
+            )
+        ]
+        self.assertEqual(len(replies2), 1)
+        self.assertIn("学习失败", replies2[0])
+        self.assertIn("已经学会", replies2[0])

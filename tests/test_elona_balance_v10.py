@@ -159,7 +159,7 @@ class ElonaBalanceMigrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.temp_dir.cleanup()
 
-    async def test_reset_preserves_level_history_and_regrants_starters_once(self):
+    async def test_missing_historical_marker_preserves_modern_assets(self):
         async with await connect_db(self.db_path) as db:
             await db.execute(
                 """
@@ -244,14 +244,14 @@ class ElonaBalanceMigrationTests(unittest.IsolatedAsyncioTestCase):
             row = await cursor.fetchone()
             await cursor.close()
             self.assertEqual((row["level"], row["exp"], row["total_exp"]), (10, 37, 999))
-            self.assertEqual((row["stat_points"], row["skill_points"]), (9, 9))
+            self.assertEqual((row["stat_points"], row["skill_points"]), (3, 9))
             self.assertEqual(
                 tuple(row[key] for key in ("hp", "atk", "defense", "speed", "luck", "willpower")),
-                (1, 1, 1, 1, 1, 1),
+                (20, 21, 22, 23, 24, 25),
             )
             self.assertEqual(
                 tuple(row[key] for key in ("life_growth", "mana_growth", "advanced_speed", "advanced_luck")),
-                (100, 100, 100, 100),
+                (120, 130, 140, 150),
             )
             self.assertEqual((row["wins"], row["losses"]), (7, 8))
             for table in (
@@ -261,22 +261,22 @@ class ElonaBalanceMigrationTests(unittest.IsolatedAsyncioTestCase):
                 cursor = await db.execute(
                     f"SELECT COUNT(*) AS count FROM {table}"
                 )
-                self.assertEqual(int((await cursor.fetchone())["count"]), 0)
+                self.assertGreater(int((await cursor.fetchone())["count"]), 0)
                 await cursor.close()
             cursor = await db.execute(
                 "SELECT status, released_at FROM level_freezes"
             )
             freeze = await cursor.fetchone()
             await cursor.close()
-            self.assertEqual(freeze["status"], "released")
-            self.assertIsNotNone(freeze["released_at"])
+            self.assertEqual(freeze["status"], "frozen")
+            self.assertIsNone(freeze["released_at"])
             cursor = await db.execute(
                 "SELECT COUNT(*) AS count FROM checkins"
             )
             self.assertEqual(int((await cursor.fetchone())["count"]), 1)
             await cursor.close()
 
-        self.assertTrue(
+        self.assertFalse(
             os.path.exists(self.db_path + ELONA_BALANCE_BACKUP_SUFFIX)
         )
         user = await self.users.get_user_by_pk(user_pk)

@@ -121,3 +121,25 @@ class PersistentStorageTests(unittest.TestCase):
                 _read_one(selected, "SELECT level FROM users")[0],
                 12,
             )
+
+    def test_corrupt_target_recovers_from_its_progression_backup_first(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            persistent = root_path / "persistent"
+            persistent.mkdir()
+            target = persistent / DATABASE_FILENAME
+            target.write_bytes(b"not-a-sqlite-database")
+            target_backup = Path(
+                str(target) + ".pre-elona-progression-v2.bak"
+            )
+            _write_user_database(target_backup, 31, 8000)
+            legacy = root_path / "plugin" / "data" / DATABASE_FILENAME
+            _write_user_database(legacy, 10, 1000)
+
+            selected = prepare_persistent_database(persistent, legacy)
+
+            self.assertEqual(selected, str(target))
+            self.assertEqual(
+                _read_one(selected, "SELECT level, total_exp FROM users"),
+                (31, 8000),
+            )

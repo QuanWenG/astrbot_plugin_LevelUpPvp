@@ -11,6 +11,7 @@ from services.combat_engine import SideviewCombatEngine
 from services.db import connect_db, init_db
 from services.equipment_catalog import EquipmentFactory, STARTER_BY_ID
 from services.equipment_service import EquipmentService
+from services.skill_catalog import skill_exp_required
 from services.skill_service import SkillService
 from services.user_service import UserService
 
@@ -80,6 +81,65 @@ class EquipmentSkillSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(slots["main_hand"], dagger.id)
         self.assertNotIn("off_hand", slots)
 
+    async def test_batch_equip_is_atomic_and_batch_unequip_handles_shared_item(self):
+        items = await self.equipment.list_items(self.user.id)
+        axe = next(
+            item
+            for item in items
+            if item.template_id == "training_greataxe"
+        )
+        original_slots, _ = await self.equipment.get_loadout(self.user.id)
+
+        with self.assertRaises(ValueError):
+            await self.equipment.equip_many(
+                self.user.id,
+                ((axe.id, ""), (999999, "")),
+            )
+        slots, _ = await self.equipment.get_loadout(self.user.id)
+        self.assertEqual(slots, original_slots)
+
+        await self.equipment.equip_many(self.user.id, ((axe.id, ""),))
+        removed = await self.equipment.unequip_many(
+            self.user.id, ("main_hand", "off_hand")
+        )
+        self.assertEqual(removed, 1)
+        slots, _ = await self.equipment.get_loadout(self.user.id)
+        self.assertNotIn("main_hand", slots)
+        self.assertNotIn("off_hand", slots)
+
+        await self.equipment.equip(self.user.id, axe.id)
+        removed = await self.equipment.unequip_all(self.user.id)
+        self.assertGreaterEqual(removed, 1)
+        slots, _ = await self.equipment.get_loadout(self.user.id)
+        self.assertEqual(slots, {})
+
+    async def test_inventory_sorts_by_quality_then_level_then_id(self):
+        items = await self.equipment.list_items(self.user.id)
+        first, second, third = items[:3]
+        async with await connect_db(self.db_path) as db:
+            await db.execute(
+                "UPDATE equipment_items SET quality = 'rare', item_level = 10 "
+                "WHERE id = ?",
+                (first.id,),
+            )
+            await db.execute(
+                "UPDATE equipment_items SET quality = 'epic', item_level = 1 "
+                "WHERE id = ?",
+                (second.id,),
+            )
+            await db.execute(
+                "UPDATE equipment_items SET quality = 'rare', item_level = 20 "
+                "WHERE id = ?",
+                (third.id,),
+            )
+            await db.commit()
+
+        sorted_items = await self.equipment.list_items(self.user.id)
+        self.assertEqual(
+            [item.id for item in sorted_items[:3]],
+            [second.id, third.id, first.id],
+        )
+
     async def test_character_level_skill_point_freezes_and_restores(self):
         await self.skills.get_skills(self.user)
         async with await connect_db(self.db_path) as db:
@@ -132,9 +192,45 @@ class EquipmentSkillSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(slots[0], "power_strike")
 
         trained = await self.skills.train_potential(self.user, "长剑", 2)
-        self.assertEqual(trained.potential, 140)
+        self.assertEqual(trained.potential, 133)
         with self.assertRaises(ValueError):
             await self.skills.learn(self.user, "长剑")
+
+    async def test_batch_skill_mutations_are_atomic(self):
+        await self.skills.get_skills(self.user)
+        async with await connect_db(self.db_path) as db:
+            await db.execute(
+                "UPDATE users SET skill_points = 8 WHERE id = ?",
+                (self.user.id,),
+            )
+            await db.commit()
+        self.user = await self.users.get_user_by_pk(self.user.id)
+
+        with self.assertRaises(ValueError):
+            await self.skills.learn_many(
+                self.user, ("斧头专精", "不存在的技能")
+            )
+        learned, _ = await self.skills.get_skills(self.user)
+        self.assertNotIn("axe", learned)
+
+        results = await self.skills.learn_many(
+            self.user, ("斧头专精", "格斗技巧")
+        )
+        self.assertEqual(
+            [result.skill_id for result in results], ["axe", "unarmed"]
+        )
+        trained = await self.skills.train_many(
+            self.user, (("斧头专精", 2), ("格斗技巧", 1))
+        )
+        self.assertEqual(
+            [skill.potential for skill in trained], [133, 118]
+        )
+
+        await self.skills.set_active_slots(
+            self.user, ((1, "清空"), (2, "强击"))
+        )
+        _, slots = await self.skills.get_skills(self.user)
+        self.assertEqual(slots[:2], ("", "power_strike"))
 
     async def test_skill_initialization_does_not_duplicate_new_level_points(self):
         other = await self.users.get_or_create_user(
@@ -171,15 +267,16 @@ class EquipmentSkillSystemTests(unittest.IsolatedAsyncioTestCase):
 
         async with await connect_db(self.db_path) as db:
             await db.execute(
-                "UPDATE user_skills SET exp = 64, potential = 200 WHERE user_pk = ? AND skill_id = 'longsword'",
-                (self.user.id,),
+                "UPDATE user_skills SET exp = ?, potential = 200 "
+                "WHERE user_pk = ? AND skill_id = 'longsword'",
+                (skill_exp_required(1) - 202, self.user.id),
             )
             growth = await self.skills.apply_growth_in_db(
                 db, self.user.id, {"longsword": 1}, None
             )
             await db.commit()
         self.assertEqual(growth[0].to_level, 2)
-        self.assertEqual(growth[0].potential_after, 100)
+        self.assertEqual(growth[0].potential_after, 180)
 
     async def test_dual_wield_produces_a_second_damage_segment(self):
         items = await self.equipment.list_items(self.user.id)

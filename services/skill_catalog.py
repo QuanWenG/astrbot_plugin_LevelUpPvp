@@ -1,7 +1,9 @@
 ﻿try:
     from ..models.skill import SkillDefinition, SkillEffect
+    from .progression_rules import skill_exp_required
 except ImportError:
     from models.skill import SkillDefinition, SkillEffect
+    from services.progression_rules import skill_exp_required
 
 
 def _effect(
@@ -197,7 +199,3 @@ INITIAL_SKILLS = (
 def skill_id_for(value: str) -> str | None:
     value = (value or "").strip()
     return value if value in SKILL_DEFINITIONS else SKILL_NAME_TO_ID.get(value)
-
-
-def skill_exp_required(level: int) -> int:
-    return 50 + level * 15

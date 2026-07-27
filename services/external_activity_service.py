@@ -8,6 +8,12 @@ try:
     from ..models.user import UserIdentity
     from .attribute_service import attribute_exp_required, training_efficiency
     from .db import connect_db
+    from .progression_rules import (
+        RULESET_ID,
+        decay_attribute_potential,
+        display_exp,
+        scaled_exp_gain,
+    )
     from .user_service import utc_now_text
 except ImportError:
     from models.user import UserIdentity
@@ -16,6 +22,12 @@ except ImportError:
         training_efficiency,
     )
     from services.db import connect_db
+    from services.progression_rules import (
+        RULESET_ID,
+        decay_attribute_potential,
+        display_exp,
+        scaled_exp_gain,
+    )
     from services.user_service import utc_now_text
 
 
@@ -107,13 +119,10 @@ class ExternalActivityService:
                 efficiency = training_efficiency(user.willpower)
                 for attribute_id in self.ATTRIBUTE_COLUMNS:
                     state = progress[attribute_id]
-                    per_component[attribute_id] = max(
-                        1,
-                        round(
-                            self.COMPONENT_RAW_TRAINING
-                            * max(0.10, state.potential / 100)
-                            * efficiency
-                        ),
+                    per_component[attribute_id] = scaled_exp_gain(
+                        self.COMPONENT_RAW_TRAINING,
+                        state.potential,
+                        efficiency,
                     )
 
                 level_exp = 0
@@ -148,7 +157,7 @@ class ExternalActivityService:
                     while exp >= attribute_exp_required(value):
                         exp -= attribute_exp_required(value)
                         value += 1
-                        potential //= 2
+                        potential = decay_attribute_potential(potential)
                     await db.execute(
                         """
                         UPDATE user_attribute_progress
@@ -168,8 +177,8 @@ class ExternalActivityService:
                         INSERT INTO attribute_growth_logs (
                             user_pk, battle_id, attribute_id, exp_gain,
                             from_value, to_value, potential_before,
-                            potential_after, created_at
-                        ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)
+                            potential_after, created_at, rules_version
+                        ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             user.id,
@@ -180,6 +189,7 @@ class ExternalActivityService:
                             state.potential,
                             potential,
                             now,
+                            RULESET_ID,
                         ),
                     )
 
@@ -199,8 +209,8 @@ class ExternalActivityService:
                             reward_key,
                             component,
                             component_level_exp,
-                            per_component["perception"],
-                            per_component["magic"],
+                            display_exp(per_component["perception"]),
+                            display_exp(per_component["magic"]),
                             now,
                         ),
                     )
@@ -209,7 +219,10 @@ class ExternalActivityService:
                     "nickname": user.nickname,
                     "applied_components": components,
                     "level_exp": level_exp,
-                    "attribute_exp": attribute_exp,
+                    "attribute_exp": {
+                        attribute_id: display_exp(gain)
+                        for attribute_id, gain in attribute_exp.items()
+                    },
                     "level_ups": level_ups,
                 }
             except Exception:

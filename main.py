@@ -46,7 +46,7 @@ PLUGIN_NAME = "astrbot_plugin_LevelUpPvp"
 LEGACY_DB_PATH = os.path.join(PLUGIN_DIR, "data", "db_level_up_pvp.db")
 
 
-@register(PLUGIN_NAME, "QuanWenG", "群聊自动签到，升级就开打", "1.7.2")
+@register(PLUGIN_NAME, "QuanWenG", "群聊自动签到，升级就开打", "1.8.0")
 class MyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -262,14 +262,14 @@ class MyPlugin(Star):
         async for result in self.command_handler.equipment_detail(event, equipment_id): yield result
 
     @filter.command("穿戴")
-    async def equip_item(self, event: AstrMessageEvent, equipment_id: int, slot: str = ""):
+    async def equip_item(self, event: AstrMessageEvent, args: GreedyStr):
         await self._ensure_database_ready()
-        async for result in self.command_handler.equip_item(event, equipment_id, slot): yield result
+        async for result in self.command_handler.equip_item(event, args): yield result
 
     @filter.command("卸下")
-    async def unequip_item(self, event: AstrMessageEvent, slot: str):
+    async def unequip_item(self, event: AstrMessageEvent, args: GreedyStr):
         await self._ensure_database_ready()
-        async for result in self.command_handler.unequip_item(event, slot): yield result
+        async for result in self.command_handler.unequip_item(event, args): yield result
 
     @filter.command("技能")
     async def skills(self, event: AstrMessageEvent):
@@ -282,14 +282,14 @@ class MyPlugin(Star):
         async for result in self.command_handler.learn_skill(event, name): yield result
 
     @filter.command("训练技能")
-    async def train_skill(self, event: AstrMessageEvent, name: str, points: int = 1):
+    async def train_skill(self, event: AstrMessageEvent, args: GreedyStr):
         await self._ensure_database_ready()
-        async for result in self.command_handler.train_skill(event, name, points): yield result
+        async for result in self.command_handler.train_skill(event, args): yield result
 
     @filter.command("技能栏")
-    async def skill_slot(self, event: AstrMessageEvent, slot: int, name: GreedyStr):
+    async def skill_slot(self, event: AstrMessageEvent, args: GreedyStr):
         await self._ensure_database_ready()
-        async for result in self.command_handler.set_skill_slot(event, slot, name): yield result
+        async for result in self.command_handler.set_skill_slot(event, args): yield result
     @filter.command("魔法书")
     async def spellbooks(self, event: AstrMessageEvent, page: int = 1):
         await self._ensure_database_ready()
@@ -371,10 +371,7 @@ class MyPlugin(Star):
                     async for result in self.command_handler.equipment_detail(event, int(args.strip())): yield result
                 else: yield event.plain_result("用法：/装备详情 装备ID")
             elif command == "穿戴":
-                parts = args.split()
-                if parts and parts[0].isdigit():
-                    async for result in self.command_handler.equip_item(event, int(parts[0]), parts[1] if len(parts) > 1 else ""): yield result
-                else: yield event.plain_result("用法：/穿戴 装备ID [槽位]")
+                async for result in self.command_handler.equip_item(event, args): yield result
             elif command == "卸下":
                 async for result in self.command_handler.unequip_item(event, args.strip()): yield result
             elif command == "技能":
@@ -382,15 +379,9 @@ class MyPlugin(Star):
             elif command == "学习":
                 async for result in self.command_handler.learn_skill(event, args.strip()): yield result
             elif command == "训练技能":
-                parts = args.split()
-                points = int(parts[-1]) if parts and parts[-1].isdigit() else 1
-                name = " ".join(parts[:-1]) if parts and parts[-1].isdigit() else args.strip()
-                async for result in self.command_handler.train_skill(event, name, points): yield result
+                async for result in self.command_handler.train_skill(event, args): yield result
             elif command == "技能栏":
-                parts = args.split(maxsplit=1)
-                if len(parts) == 2 and parts[0].isdigit():
-                    async for result in self.command_handler.set_skill_slot(event, int(parts[0]), parts[1]): yield result
-                else: yield event.plain_result("用法：/技能栏 位置 技能名|清空")
+                async for result in self.command_handler.set_skill_slot(event, args): yield result
             elif command == "魔法书":
                 page = int(args) if args.strip().isdigit() else 1
                 async for result in self.command_handler.spellbooks(event, page): yield result

@@ -1,5 +1,3 @@
-import math
-
 try:
     from ..models.attributes import (
         DAMAGE_TYPES,
@@ -16,6 +14,14 @@ try:
         attack_mode_attribute,
         physical_offense_multiplier,
         resistance_multiplier,
+    )
+    from .progression_rules import (
+        RULESET_ID,
+        attribute_exp_required,
+        decay_attribute_potential,
+        display_exp,
+        scaled_exp_gain,
+        skill_level_cap as scaled_skill_level_cap,
     )
     from .user_service import utc_now_text
 except ImportError:
@@ -34,6 +40,14 @@ except ImportError:
         attack_mode_attribute,
         physical_offense_multiplier,
         resistance_multiplier,
+    )
+    from services.progression_rules import (
+        RULESET_ID,
+        attribute_exp_required,
+        decay_attribute_potential,
+        display_exp,
+        scaled_exp_gain,
+        skill_level_cap as scaled_skill_level_cap,
     )
     from services.user_service import utc_now_text
 
@@ -139,20 +153,12 @@ def skill_level_cap(
     skill_id: str = "",
 ) -> int:
     primary = max((attributes.get(name) for name in governing), default=0)
-    cap = min(
-        100,
-        max(1, math.floor(20 + primary * 0.8 + attributes.magic * 0.25)),
-    )
+    cap = scaled_skill_level_cap(attributes.magic, primary)
     if skill_id == "healing":
         cap = min(cap, max(1, attributes.constitution))
     elif skill_id == "meditation":
         cap = min(cap, max(1, attributes.willpower))
     return cap
-
-
-def attribute_exp_required(attribute_value: int) -> int:
-    return 100 + max(0, int(attribute_value)) * 20
-
 
 def training_efficiency(willpower: int) -> float:
     return min(2.0, 1.0 + max(0, willpower) * 0.01)
@@ -476,13 +482,10 @@ class AttributeService:
             if raw <= 0:
                 continue
             state = progress[attribute_id]
-            gain = max(
-                1,
-                round(
-                    min(self.BATTLE_RAW_EXP_CAP, raw)
-                    * max(0.10, state.potential / 100)
-                    * efficiency
-                ),
+            gain = scaled_exp_gain(
+                min(self.BATTLE_RAW_EXP_CAP, raw),
+                state.potential,
+                efficiency,
             )
             value = values[attribute_id]
             old_value = value
@@ -491,7 +494,7 @@ class AttributeService:
             while exp >= attribute_exp_required(value):
                 exp -= attribute_exp_required(value)
                 value += 1
-                potential //= 2
+                potential = decay_attribute_potential(potential)
             await db.execute(
                 """
                 UPDATE user_attribute_progress
@@ -511,8 +514,8 @@ class AttributeService:
                 INSERT INTO attribute_growth_logs (
                     user_pk, battle_id, attribute_id, exp_gain,
                     from_value, to_value, potential_before,
-                    potential_after, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    potential_after, created_at, rules_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_pk,
@@ -524,13 +527,14 @@ class AttributeService:
                     state.potential,
                     potential,
                     utc_now_text(),
+                    RULESET_ID,
                 ),
             )
             growths.append(
                 AttributeGrowth(
                     user_pk,
                     attribute_id,
-                    gain,
+                    display_exp(gain),
                     old_value,
                     value,
                     potential,
