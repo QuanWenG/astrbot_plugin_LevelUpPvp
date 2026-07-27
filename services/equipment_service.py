@@ -1,4 +1,5 @@
 import json
+import random
 import secrets
 from dataclasses import dataclass
 
@@ -10,6 +11,7 @@ try:
         EquipmentCatalog,
         EquipmentFactory,
     )
+    from .equipment_catalog import EquipmentCatalogEntry
     from .user_service import utc_now_text
 except ImportError:
     from models.equipment import EQUIPMENT_SLOTS, EquipmentItem
@@ -19,6 +21,7 @@ except ImportError:
         EquipmentCatalog,
         EquipmentFactory,
     )
+    from services.equipment_catalog import EquipmentCatalogEntry
     from services.user_service import utc_now_text
 
 
@@ -183,6 +186,91 @@ class EquipmentService:
             skipped=skipped,
         )
 
+    def generate_reward(
+        self,
+        owner_pk: int,
+        catalog_id_min: int,
+        catalog_id_max: int,
+        level_min: int,
+        level_max: int,
+        seed: int | None = None,
+    ) -> EquipmentItem:
+        """Generate a single random equipment reward within a catalog-ID range.
+
+        The item_level is forced into [level_min, level_max], overriding the
+        catalog's own generation range so dungeon rewards match the dungeon's
+        intended tier.
+        """
+        candidates = tuple(
+            entry
+            for entry in self.catalog.snapshot.entries
+            if (
+                catalog_id_min <= entry.catalog_id < catalog_id_max
+                and entry.mode == "generated"
+            )
+        )
+        if not candidates:
+            raise ValueError(
+                f"装备目录中不存在ID范围[{catalog_id_min},{catalog_id_max})的可生成装备"
+            )
+        rng = random.Random(seed if seed is not None else self._seed_source())
+        entry: EquipmentCatalogEntry = rng.choice(candidates)
+        generation = entry.generation
+        item_level = rng.randint(
+            max(0, int(level_min)),
+            max(int(level_min), int(level_max)),
+        )
+        qualities = generation.get("qualities", ())
+        if qualities:
+            quality = rng.choices(
+                [item["quality"] for item in qualities],
+                weights=[float(item["weight"]) for item in qualities],
+                k=1,
+            )[0]
+        else:
+            quality = "common"
+        materials = generation.get("materials", ())
+        if materials:
+            material = rng.choices(
+                [item["material"] for item in materials],
+                weights=[float(item["weight"]) for item in materials],
+                k=1,
+            )[0]
+        else:
+            material = entry.template.material
+        from dataclasses import replace as _replace
+        template = _replace(entry.template, material=material)
+        item = self.factory.generate(
+            owner_pk,
+            template,
+            item_level,
+            quality,
+            rng.getrandbits(63),
+        )
+        return _replace(item, bound=entry.bound)
+
+    async def generate_reward_in_db(
+        self,
+        db,
+        owner_pk: int,
+        catalog_id_min: int,
+        catalog_id_max: int,
+        level_min: int,
+        level_max: int,
+        seed: int | None = None,
+    ) -> EquipmentItem:
+        """Generate a reward and persist it within an existing transaction."""
+        item = self.generate_reward(
+            owner_pk,
+            catalog_id_min,
+            catalog_id_max,
+            level_min,
+            level_max,
+            seed,
+        )
+        await self._insert_item_in_db(db, item)
+        return item
+
     async def _insert_item_in_db(self, db, item: EquipmentItem) -> int:
         cursor = await db.execute(
             """
@@ -273,6 +361,38 @@ class EquipmentService:
             try:
                 await db.execute("BEGIN")
                 await self.ensure_starter_in_db(db, user_pk)
+                resolved = []
+                for equipment_id, requested_slot in assignments:
+                    item = await self._get_owned_item_in_db(
+                        db, user_pk, int(equipment_id)
+                    )
+                    slots = self._target_slots(item, requested_slot)
+                    resolved.append((item, slots))
+                for item, slots in resolved:
+                    await self._equip_in_db(db, user_pk, item, slots)
+                await db.commit()
+                return resolved
+            except Exception:
+                await db.rollback()
+                raise
+
+
+    async def auto_equip(
+        self,
+        user_pk: int,
+        assignments: tuple[tuple[int, str], ...] | list[tuple[int, str]],
+    ) -> list[tuple[EquipmentItem, tuple[str, ...]]]:
+        """Atomically replace the entire loadout with the given assignments."""
+        if not assignments:
+            raise ValueError("没有可穿戴的装备")
+        async with await connect_db(self.db_path) as db:
+            try:
+                await db.execute("BEGIN")
+                await self.ensure_starter_in_db(db, user_pk)
+                await db.execute(
+                    "DELETE FROM equipment_loadout WHERE user_pk = ?",
+                    (user_pk,),
+                )
                 resolved = []
                 for equipment_id, requested_slot in assignments:
                     item = await self._get_owned_item_in_db(

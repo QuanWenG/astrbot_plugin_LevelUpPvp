@@ -20,6 +20,10 @@ try:
     from .services.skill_service import SkillService
     from .services.spell_service import SpellService
     from .services.stat_service import StatService
+    from .services.dungeon_catalog import DungeonCatalog
+    from .services.dungeon_service import DungeonService
+    from .services.monster_catalog import MonsterCatalog
+    from .services.monster_build_service import MonsterBuildService
     from .services.storage import prepare_persistent_database
     from .services.user_service import UserService
 except ImportError:
@@ -31,9 +35,13 @@ except ImportError:
     from services.challenge_queue import ChallengeQueueService
     from services.checkin_service import CheckinService
     from services.db import init_db
+    from services.dungeon_catalog import DungeonCatalog
+    from services.dungeon_service import DungeonService
     from services.equipment_service import EquipmentService
     from services.external_activity_service import ExternalActivityService
     from services.llm_service import LLMService
+    from services.monster_catalog import MonsterCatalog
+    from services.monster_build_service import MonsterBuildService
     from services.skill_service import SkillService
     from services.spell_service import SpellService
     from services.stat_service import StatService
@@ -83,6 +91,22 @@ class MyPlugin(Star):
             attribute_service, spell_service
         )
         self.challenge_queue = ChallengeQueueService(battle_service)
+        monster_catalog = MonsterCatalog()
+        monster_build_service = MonsterBuildService(monster_catalog, attribute_service)
+        dungeon_catalog = DungeonCatalog(monster_catalog=monster_catalog)
+        dungeon_service = DungeonService(
+            self.db_path,
+            user_service,
+            build_service,
+            monster_build_service,
+            equipment_service,
+            skill_service,
+            attribute_service,
+            spell_service,
+            battle_service.combat_engine,
+            battle_service.combat_state_service,
+            dungeon_catalog,
+        )
         self.command_handler = LevelUpPvpCommandHandler(
             context=context,
             user_service=user_service,
@@ -95,6 +119,7 @@ class MyPlugin(Star):
             build_service=build_service,
             attribute_service=attribute_service,
             spell_service=spell_service,
+            dungeon_service=dungeon_service,
         )
 
     async def initialize(self):
@@ -266,6 +291,13 @@ class MyPlugin(Star):
         await self._ensure_database_ready()
         async for result in self.command_handler.equip_item(event, args): yield result
 
+    @filter.command("一键穿戴")
+    async def auto_equip(self, event: AstrMessageEvent):
+        """自动从背包挑选最优装备穿戴。"""
+        await self._ensure_database_ready()
+        async for result in self.command_handler.auto_equip(event):
+            yield result
+
     @filter.command("卸下")
     async def unequip_item(self, event: AstrMessageEvent, args: GreedyStr):
         await self._ensure_database_ready()
@@ -370,6 +402,8 @@ class MyPlugin(Star):
                 if args.strip().isdigit():
                     async for result in self.command_handler.equipment_detail(event, int(args.strip())): yield result
                 else: yield event.plain_result("用法：/装备详情 装备ID")
+            elif command == "一键穿戴":
+                async for result in self.command_handler.auto_equip(event): yield result
             elif command == "穿戴":
                 async for result in self.command_handler.equip_item(event, args): yield result
             elif command == "卸下":
@@ -396,6 +430,12 @@ class MyPlugin(Star):
             elif command == "挑战":
                 async for result in self.command_handler.challenge(event):
                     yield result
+            elif command == "副本":
+                async for result in self.command_handler.list_dungeons(event):
+                    yield result
+            elif command == "副本详情":
+                async for result in self.command_handler.dungeon_detail(event, args):
+                    yield result
             event.stop_event()
             return
 
@@ -404,6 +444,20 @@ class MyPlugin(Star):
         async for result in self.command_handler.challenge(event):
             yield result
         event.stop_event()
+
+    @filter.command("副本")
+    async def list_dungeons(self, event: AstrMessageEvent):
+        """查看所有可用副本。"""
+        await self._ensure_database_ready()
+        async for result in self.command_handler.list_dungeons(event):
+            yield result
+
+    @filter.command("副本详情")
+    async def dungeon_detail(self, event: AstrMessageEvent, name: GreedyStr = ""):
+        """查看指定副本的波次与奖励详情。"""
+        await self._ensure_database_ready()
+        async for result in self.command_handler.dungeon_detail(event, name):
+            yield result
 
     async def terminate(self):
         """插件卸载时无需额外清理。"""

@@ -407,6 +407,22 @@ async def init_db(db_path: str) -> None:
                 UNIQUE(user_pk, source, reward_key, component),
                 FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS dungeon_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_pk INTEGER NOT NULL,
+                dungeon_id TEXT NOT NULL,
+                cleared INTEGER NOT NULL DEFAULT 0,
+                monsters_killed INTEGER NOT NULL DEFAULT 0,
+                total_monsters INTEGER NOT NULL DEFAULT 0,
+                exp_gain INTEGER NOT NULL DEFAULT 0,
+                rewards_json TEXT NOT NULL DEFAULT '[]',
+                strategy TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                created_at_ts INTEGER NOT NULL,
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_dungeon_runs_user
+                ON dungeon_runs(user_pk);
             CREATE INDEX IF NOT EXISTS idx_checkins_user_date
                 ON checkins(user_pk, checkin_date);
             CREATE INDEX IF NOT EXISTS idx_battles_attacker

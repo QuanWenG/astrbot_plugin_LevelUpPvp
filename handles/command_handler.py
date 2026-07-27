@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import re
+from collections import defaultdict
 from collections.abc import AsyncGenerator
 
 from astrbot.api import logger
@@ -31,12 +32,15 @@ if RENDERER_REVISION != EXPECTED_RENDERER_REVISION:
     )
 
 try:
+    from ..models.attributes import PRIMARY_ATTRIBUTE_IDS
     from ..models.equipment import SLOT_LABELS
     from ..models.user import LevelDownEvent, LevelUpEvent, User, UserIdentity
     from ..services.attribute_service import (
         ADVANCED_ATTRIBUTE_LABELS,
         ATTRIBUTE_LABELS,
         DAMAGE_TYPE_LABELS,
+        LEGACY_ATTRIBUTE_MAP,
+        WEAPON_PRIMARY_WEIGHTS,
         attribute_exp_required,
         skill_level_cap,
     )
@@ -44,7 +48,7 @@ try:
         effective_inherent_affixes,
         inherent_affix_level_ratio,
     )
-    from ..services.equipment_catalog import QUALITY_LABELS
+    from ..services.equipment_catalog import QUALITY_LABELS, QUALITY_MULTIPLIERS
     from ..services.equipment_proc_service import EQUIPMENT_PROC_NAMES
     from ..services.material_catalog import actual_weight, material_for
     from ..services.progression_rules import progress_percent
@@ -55,12 +59,15 @@ try:
     )
     from ..services import config
 except ImportError:
+    from models.attributes import PRIMARY_ATTRIBUTE_IDS
     from models.equipment import SLOT_LABELS
     from models.user import LevelDownEvent, LevelUpEvent, User, UserIdentity
     from services.attribute_service import (
         ADVANCED_ATTRIBUTE_LABELS,
         ATTRIBUTE_LABELS,
         DAMAGE_TYPE_LABELS,
+        LEGACY_ATTRIBUTE_MAP,
+        WEAPON_PRIMARY_WEIGHTS,
         attribute_exp_required,
         skill_level_cap,
     )
@@ -68,7 +75,7 @@ except ImportError:
         effective_inherent_affixes,
         inherent_affix_level_ratio,
     )
-    from services.equipment_catalog import QUALITY_LABELS
+    from services.equipment_catalog import QUALITY_LABELS, QUALITY_MULTIPLIERS
     from services.equipment_proc_service import EQUIPMENT_PROC_NAMES
     from services.material_catalog import actual_weight, material_for
     from services.progression_rules import progress_percent
@@ -85,7 +92,7 @@ CHALLENGE_WAKE_WORDS = [
     "艾斯比",
     "啥比"
 ]
-MENTION_COMMAND_NAMES = ("重载装备表", "装备图鉴", "魔法书", "阅读", "法术", "战技", "修改登记", "装备详情", "训练技能", "技能栏", "签到", "面板", "加点", "排行", "登记", "挑战", "背包", "装备", "穿戴", "卸下", "技能", "学习", "给予")
+MENTION_COMMAND_NAMES = ("重载装备表", "装备图鉴", "魔法书", "阅读", "法术", "战技", "修改登记", "装备详情", "训练技能", "技能栏", "签到", "面板", "加点", "排行", "登记", "挑战", "背包", "装备", "一键穿戴", "穿戴", "卸下", "技能", "学习", "给予", "副本", "副本详情")
 MENTION_COMMAND_PATTERN = re.compile(
     rf"^/?({'|'.join(MENTION_COMMAND_NAMES)})(?:\s|$)"
 )
@@ -119,6 +126,7 @@ class LevelUpPvpCommandHandler:
         build_service=None,
         attribute_service=None,
         spell_service=None,
+        dungeon_service=None,
     ):
         self.context = context
         self.user_service = user_service
@@ -131,6 +139,7 @@ class LevelUpPvpCommandHandler:
         self.build_service = build_service
         self.attribute_service = attribute_service
         self.spell_service = spell_service
+        self.dungeon_service = dungeon_service
 
     @staticmethod
     def _is_long_text(text: str) -> bool:
@@ -624,6 +633,261 @@ class LevelUpPvpCommandHandler:
             )
         except Exception as exc:
             yield await self.reply_text(event, f"卸下失败：{exc}")
+
+    async def auto_equip(self, event):
+        try:
+            user = await self._own_user(event)
+            items = await self.equipment_service.list_items(user.id)
+            if not items:
+                yield await self.reply_text(event, "背包里没有装备。")
+                return
+            skills, _ = await self.skill_service.get_skills(user)
+            attributes = self.attribute_service.attributes_for_user(user)
+            dominant = self._dominant_attribute(attributes)
+            assignments = self._select_optimal_loadout(
+                items, user, skills, dominant
+            )
+            if not assignments:
+                yield await self.reply_text(event, "没有可选的装备。")
+                return
+            results = await self.equipment_service.auto_equip(user.id, assignments)
+            lines = [f"{self._display_name(user)} 已自动穿戴"]
+            for item, slots in results:
+                slot_labels = "、".join(SLOT_LABELS[s] for s in slots)
+                quality = QUALITY_LABELS.get(item.quality, item.quality)
+                lines.append(
+                    f"{quality} {item.name} Lv.{item.item_level}：{slot_labels}"
+                )
+            yield await self.reply_text(
+                event, "\n".join(lines), "LevelUpPvp 一键穿戴"
+            )
+        except Exception as exc:
+            yield await self.reply_text(event, f"一键穿戴失败：{exc}")
+
+    @staticmethod
+    def _dominant_attribute(attributes) -> str:
+        return max(PRIMARY_ATTRIBUTE_IDS, key=lambda name: attributes.get(name))
+
+    def _score_item(self, item, user, dominant_attr: str) -> float:
+        material = material_for(item.material)
+        level_factor = max(
+            0.50, 1.0 - max(0, item.item_level - user.level) * 0.03
+        )
+        quality_factor = QUALITY_MULTIPLIERS.get(item.quality, 1.0)
+        score = 0.0
+        for stat, raw_value in item.base_stats.items():
+            raw_value = float(raw_value)
+            if stat in {"atk", "weapon_power"} and item.item_type == "weapon":
+                value = (
+                    raw_value * material.attack_factor * quality_factor
+                    + item.enhancement_level
+                    + item.item_level // 10
+                ) * level_factor
+                score += value * 3.0
+            elif stat in {"defense", "armor_power"}:
+                value = (
+                    raw_value * material.defense_factor * quality_factor
+                    + item.enhancement_level * 2
+                ) * level_factor
+                score += value * 2.0
+            elif stat == "accuracy":
+                score += (
+                    raw_value * material.accuracy_factor
+                    * quality_factor * level_factor * 0.5
+                )
+            elif stat == "evasion":
+                score += (
+                    raw_value * material.evasion_factor
+                    * quality_factor * level_factor * 0.5
+                )
+            elif stat in PRIMARY_ATTRIBUTE_IDS:
+                value = raw_value * quality_factor * level_factor
+                weight = 2.0 if stat == dominant_attr else 0.5
+                score += value * weight
+            elif stat == "hp":
+                score += raw_value * quality_factor * level_factor * 10 * 0.1
+            elif stat == "speed":
+                score += raw_value * quality_factor * level_factor * 3 * 0.2
+            elif stat == "luck":
+                score += raw_value * quality_factor * level_factor * 0.5
+        effective_inherent = effective_inherent_affixes(
+            item.inherent_affixes, user.level, item.item_level
+        )
+        for affix in (
+            effective_inherent
+            + item.random_affixes
+            + item.fusion_affixes
+        ):
+            kind = str(affix.get("type", ""))
+            value = float(affix.get("value", 0))
+            if kind == "stat_flat":
+                stat = LEGACY_ATTRIBUTE_MAP.get(
+                    str(affix.get("stat", "")),
+                    str(affix.get("stat", "")),
+                )
+                if stat in PRIMARY_ATTRIBUTE_IDS:
+                    weight = 2.0 if stat == dominant_attr else 0.5
+                    score += value * weight
+            elif kind == "advanced_stat":
+                score += value * 0.5
+            elif kind == "skill_level":
+                score += value * 5.0
+            elif kind == "trigger_ability":
+                score += value * 3.0
+            elif kind == "element_resistance":
+                score += value * 0.3
+            else:
+                score += value
+        if item.item_type == "weapon":
+            weights = WEAPON_PRIMARY_WEIGHTS.get(
+                item.weapon_type, WEAPON_PRIMARY_WEIGHTS[""]
+            )
+            match = weights.get(dominant_attr, 0)
+            score *= 0.2 + match
+        return score
+
+    def _select_optimal_loadout(self, items, user, skills, dominant_attr: str):
+        shields = []
+        weapons = []
+        rings = []
+        by_slot = defaultdict(list)
+        for item in items:
+            if item.hand_mode == "shield":
+                shields.append(item)
+            elif item.item_type == "weapon":
+                weapons.append(item)
+            elif item.equip_slot in {"left_finger", "right_finger"}:
+                rings.append(item)
+            else:
+                by_slot[item.equip_slot].append(item)
+        base_slots = {}
+        for slot in (
+            "head", "neck", "back", "body", "wrist", "waist", "feet"
+        ):
+            candidates = by_slot.get(slot)
+            if candidates:
+                best = max(
+                    candidates,
+                    key=lambda i: self._score_item(i, user, dominant_attr),
+                )
+                base_slots[slot] = best
+        scored_rings = sorted(
+            rings,
+            key=lambda i: self._score_item(i, user, dominant_attr),
+            reverse=True,
+        )
+        for index, ring in enumerate(scored_rings[:2]):
+            base_slots[("left_finger", "right_finger")[index]] = ring
+        hand_options = self._generate_hand_options(
+            weapons, shields, user, dominant_attr
+        )
+        best_score = -1.0
+        best_slots = dict(base_slots)
+        for hand_slots, _hand_items in hand_options:
+            test_slots = dict(base_slots)
+            test_slots.update(hand_slots)
+            slot_ids = {slot: item.id for slot, item in test_slots.items()}
+            unique_items = list(
+                {item.id: item for item in test_slots.values()}.values()
+            )
+            build = self.build_service.resolve_equipment(
+                user, slot_ids, unique_items, skills
+            )
+            score = self._score_build(build, dominant_attr)
+            if score > best_score:
+                best_score = score
+                best_slots = test_slots
+        seen_ids = set()
+        assignments = []
+        for slot, item in best_slots.items():
+            if item.id in seen_ids:
+                continue
+            seen_ids.add(item.id)
+            if slot in {"main_hand", "off_hand", "left_finger", "right_finger"}:
+                assignments.append((item.id, slot))
+            else:
+                assignments.append((item.id, ""))
+        return assignments
+
+    def _generate_hand_options(self, weapons, shields, user, dominant_attr):
+        options = []
+        two_hand = [
+            w for w in weapons if w.hand_mode.startswith("two_hand")
+        ]
+        one_hand = [
+            w for w in weapons if not w.hand_mode.startswith("two_hand")
+        ]
+        for w in two_hand:
+            options.append(({"main_hand": w, "off_hand": w}, [w]))
+        if one_hand and shields:
+            best_w = max(
+                one_hand,
+                key=lambda i: self._score_item(i, user, dominant_attr),
+            )
+            best_s = max(
+                shields,
+                key=lambda i: self._score_item(i, user, dominant_attr),
+            )
+            options.append(
+                ({"main_hand": best_w, "off_hand": best_s}, [best_w, best_s])
+            )
+        if len(one_hand) >= 2:
+            scored = sorted(
+                one_hand,
+                key=lambda i: self._score_item(i, user, dominant_attr),
+                reverse=True,
+            )
+            options.append(
+                (
+                    {"main_hand": scored[0], "off_hand": scored[1]},
+                    [scored[0], scored[1]],
+                )
+            )
+        if one_hand:
+            best_w = max(
+                one_hand,
+                key=lambda i: self._score_item(i, user, dominant_attr),
+            )
+            options.append(({"main_hand": best_w}, [best_w]))
+        if shields:
+            best_s = max(
+                shields,
+                key=lambda i: self._score_item(i, user, dominant_attr),
+            )
+            options.append(({"off_hand": best_s}, [best_s]))
+        return options
+
+    @staticmethod
+    def _score_build(equipment, dominant_attr: str) -> float:
+        weapon_match = 1.0
+        if equipment.weapon_type:
+            weights = WEAPON_PRIMARY_WEIGHTS.get(
+                equipment.weapon_type, WEAPON_PRIMARY_WEIGHTS[""]
+            )
+            match = weights.get(dominant_attr, 0)
+            weapon_match = 0.3 + match * 0.7
+        score = (
+            equipment.weapon_power * 3.0
+            * equipment.damage_multiplier * weapon_match
+        )
+        score += equipment.armor_power * 2.0
+        for attr in PRIMARY_ATTRIBUTE_IDS:
+            value = equipment.stat_modifiers.get(attr, 0)
+            weight = 2.0 if attr == dominant_attr else 0.5
+            score += value * weight
+        for value in equipment.skill_modifiers.values():
+            score += value * 3.0
+        effects = equipment.combat_effects
+        score += effects.get("max_hp", 0) * 0.1
+        score += effects.get("accuracy", 0) * 0.5
+        score += effects.get("evasion", 0) * 0.5
+        score += effects.get("critical_rate", 0) * 50.0
+        score += effects.get("critical_damage", 0) * 20.0
+        score += effects.get("block_rate", 0) * 30.0
+        score += effects.get("knockback_resistance", 0) * 20.0
+        if equipment.overloaded:
+            score *= 0.5
+        return score
 
     async def skills(self, event):
         try:
@@ -1154,6 +1418,11 @@ class LevelUpPvpCommandHandler:
         try:
             target_identity = self._target_identity_from_event(event)
             if not target_identity:
+                # No @target: try to parse as a PvE dungeon challenge.
+                if self.dungeon_service is not None:
+                    async for result in self._try_dungeon_challenge(event):
+                        yield result
+                    return
                 yield await self.reply_text(
                     event, "请 At 一个要挑战的用户。用法：/挑战 @用户 策略描述"
                 )
@@ -1185,6 +1454,139 @@ class LevelUpPvpCommandHandler:
         except Exception as exc:
             logger.exception("LevelUpPvp battle failed")
             yield await self.reply_text(event, f"挑战失败：{exc}")
+
+    async def _try_dungeon_challenge(self, event: AstrMessageEvent) -> AsyncGenerator:
+        """Attempt to parse the challenge text as a dungeon name + strategy."""
+        message = (event.get_message_str() or "").strip()
+        message = CHALLENGE_COMMAND_PATTERN.sub("", message).strip()
+        message = MENTION_MARKUP_PATTERN.sub(" ", message).strip()
+        tokens = message.split()
+        if not tokens:
+            yield await self.reply_text(
+                event,
+                "用法：/挑战 @用户 策略  或  /挑战 副本名 策略",
+            )
+            return
+        dungeon = self.dungeon_service.get_dungeon_by_name(tokens[0])
+        if dungeon is None:
+            yield await self.reply_text(
+                event,
+                f"未知副本：{tokens[0]}。可用 /副本 查看所有副本。",
+            )
+            return
+        strategy = " ".join(tokens[1:]) if len(tokens) > 1 else ""
+        identity = self._identity_from_event(event)
+        result = await self.dungeon_service.run_dungeon(
+            identity, dungeon.dungeon_id, strategy
+        )
+        yield await self._dungeon_result(event, result)
+
+    async def list_dungeons(self, event: AstrMessageEvent) -> AsyncGenerator:
+        """列出所有可用副本。"""
+        if self.dungeon_service is None:
+            yield await self.reply_text(event, "副本功能未启用。")
+            return
+        try:
+            dungeons = self.dungeon_service.list_dungeons()
+            if not dungeons:
+                yield await self.reply_text(event, "暂无可用副本。")
+                return
+            lines = ["可用副本："]
+            for dungeon in dungeons:
+                lines.append(
+                    f"「{dungeon.name}」 推荐等级 Lv.{dungeon.recommended_level}"
+                    f"  波数 {len(dungeon.waves)}"
+                )
+            lines.append("用法：/副本 查看全部，/副本详情 副本名 查看详情，/挑战 副本名 发起挑战")
+            yield await self.reply_text(event, "\n".join(lines))
+        except Exception as exc:
+            yield await self.reply_text(event, f"副本列表失败：{exc}")
+
+    async def dungeon_detail(self, event: AstrMessageEvent, name: str) -> AsyncGenerator:
+        """查看指定副本的详情。"""
+        if self.dungeon_service is None:
+            yield await self.reply_text(event, "副本功能未启用。")
+            return
+        try:
+            name = str(name or "").strip()
+            dungeon = self.dungeon_service.get_dungeon_by_name(name)
+            if dungeon is None:
+                yield await self.reply_text(event, f"未知副本：{name}")
+                return
+            lines = [
+                f"副本：「{dungeon.name}」",
+                f"推荐等级：Lv.{dungeon.recommended_level}",
+                f"经验折扣：{int(dungeon.exp_discount_rate * 100)}%",
+                f"说明：{dungeon.description}" if dungeon.description else "",
+                "波次（{0}）：".format(len(dungeon.waves)),
+            ]
+            for index, wave in enumerate(dungeon.waves, 1):
+                lines.append(
+                    f"  {index}. {wave.template_id} Lv.{wave.level} {wave.rank}"
+                )
+            cr = dungeon.clear_rewards
+            pr = dungeon.partial_kill_rewards
+            lines.append(
+                f"通关奖励：{cr.equipment_count}件装备"
+                f"（Lv.{cr.equipment_level_min}-{cr.equipment_level_max}）"
+            )
+            lines.append(
+                f"部分击杀奖励：{int(pr.chance * 100)}%概率"
+                f" {pr.equipment_count}件装备"
+                f"（Lv.{pr.equipment_level_min}-{pr.equipment_level_max}）"
+            )
+            lines.append("用法：/挑战 副本名 策略")
+            yield await self.reply_text(event, "\n".join(line for line in lines if line))
+        except Exception as exc:
+            yield await self.reply_text(event, f"副本详情失败：{exc}")
+
+    async def _dungeon_result(self, event: AstrMessageEvent, result):
+        """渲染副本战报。"""
+        return await self.reply_text(
+            event, self._format_dungeon_result(result), "LevelUpPvp 副本战报"
+        )
+
+    def _format_dungeon_result(self, result) -> str:
+        dungeon = result.dungeon
+        name = dungeon.name
+        status = "通关" if result.cleared else "失败"
+        lines = [
+            f"副本：「{name}」  结果：{status}",
+            f"击杀：{result.monsters_killed}/{result.total_monsters}",
+        ]
+        if result.exp_gain > 0:
+            lines.append(f"经验：+{result.exp_gain}")
+        if result.level_ups:
+            lines.append(self._format_level_ups(result.level_ups))
+        skill_levelups = [item for item in (result.skill_growths or []) if item.to_level > item.from_level]
+        if skill_levelups:
+            growth = " / ".join(
+                f"{item.skill_name} Lv.{item.from_level}→{item.to_level}"
+                for item in skill_levelups[:10]
+            )
+            lines.append("技能升级：" + growth)
+        spell_levelups = [item for item in (result.spell_growths or []) if item.to_level > item.from_level]
+        if spell_levelups:
+            lines.append("法术升级：")
+            lines.extend(
+                f"- {item.spell_name} Lv.{item.from_level}→{item.to_level}"
+                for item in spell_levelups[:10]
+            )
+        attr_levelups = [item for item in (result.attribute_growths or []) if item.to_value > item.from_value]
+        if attr_levelups:
+            growth = " / ".join(
+                f"{ATTRIBUTE_LABELS[item.attribute_id]} {item.from_value}→{item.to_value}"
+                for item in attr_levelups[:8]
+            )
+            lines.append("属性提升：" + growth)
+        if result.rewards:
+            reward_labels = " / ".join(
+                f"{item.name}(Lv.{item.item_level})" for item in result.rewards
+            )
+            lines.append(f"装备奖励：{reward_labels}")
+        if result.player_defeated:
+            lines.append("战败，状态已恢复。")
+        return "\n".join(lines)
 
     def is_alias_challenge_event(self, event: AstrMessageEvent) -> bool:
         message = (event.get_message_str() or "").strip()

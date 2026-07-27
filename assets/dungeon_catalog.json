@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "dungeons": [
+    {
+      "dungeon_id": "verdant_wetland",
+      "name": "新绿湿地",
+      "description": "湿地边缘栖息着一群温顺的史莱姆，是新手冒险者磨砺身手的理想去处。注意别被酸液溅到。",
+      "recommended_level": 1,
+      "exp_discount_rate": 0.05,
+      "waves": [
+        {
+          "template_id": "monster_001",
+          "level": 1,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_139",
+          "level": 1,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_002",
+          "level": 1,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_186",
+          "level": 1,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_127",
+          "level": 1,
+          "rank": "normal"
+        }
+      ],
+      "clear_rewards": {
+        "equipment_count": 2,
+        "equipment_level_min": 1,
+        "equipment_level_max": 5,
+        "catalog_id_min": 3001,
+        "catalog_id_max": 3113
+      },
+      "partial_kill_rewards": {
+        "equipment_count": 1,
+        "equipment_level_min": 1,
+        "equipment_level_max": 5,
+        "catalog_id_min": 3001,
+        "catalog_id_max": 3113,
+        "chance": 0.2
+      }
+    },
+    {
+      "dungeon_id": "ember_outpost",
+      "name": "焰火据点",
+      "description": "哥布林在旧据点囤积了焰火与兵器，营地深处还潜伏着一位精英火焰信徒。只有足够老练的冒险者才敢踏足。",
+      "recommended_level": 15,
+      "exp_discount_rate": 0.05,
+      "waves": [
+        {
+          "template_id": "monster_068",
+          "level": 10,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_069",
+          "level": 10,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_070",
+          "level": 10,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_071",
+          "level": 15,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_107",
+          "level": 15,
+          "rank": "elite"
+        }
+      ],
+      "clear_rewards": {
+        "equipment_count": 2,
+        "equipment_level_min": 5,
+        "equipment_level_max": 15,
+        "catalog_id_min": 3001,
+        "catalog_id_max": 3113
+      },
+      "partial_kill_rewards": {
+        "equipment_count": 1,
+        "equipment_level_min": 5,
+        "equipment_level_max": 15,
+        "catalog_id_min": 3001,
+        "catalog_id_max": 3113,
+        "chance": 0.2
+      }
+    }
+  ]
+}
