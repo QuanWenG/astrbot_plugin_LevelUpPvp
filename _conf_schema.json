@@ -1,0 +1,8 @@
+{
+  "effect_whitelist": {
+    "description": "LevelUpPVP 生效白名单",
+    "type": "list",
+    "default": [],
+    "hint": "仅处理列表中的完整 UMO 或群 ID。使用 /sid 获取；留空时插件在所有会话中均不生效。"
+  }
+}

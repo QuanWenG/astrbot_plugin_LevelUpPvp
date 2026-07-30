@@ -1,6 +1,7 @@
 import asyncio
 import os
 
+from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.star.filter.command import GreedyStr
@@ -15,6 +16,12 @@ try:
     from .services.checkin_service import CheckinService
     from .services.db import init_db
     from .services.equipment_service import EquipmentService
+    from .services.effect_whitelist import (
+        EffectWhitelist,
+        effect_whitelist_only,
+        external_effect_whitelist_only,
+        should_stop_denied_llm,
+    )
     from .services.external_activity_service import ExternalActivityService
     from .services.llm_service import LLMService
     from .services.skill_service import SkillService
@@ -38,6 +45,12 @@ except ImportError:
     from services.dungeon_catalog import DungeonCatalog
     from services.dungeon_service import DungeonService
     from services.equipment_service import EquipmentService
+    from services.effect_whitelist import (
+        EffectWhitelist,
+        effect_whitelist_only,
+        external_effect_whitelist_only,
+        should_stop_denied_llm,
+    )
     from services.external_activity_service import ExternalActivityService
     from services.llm_service import LLMService
     from services.monster_catalog import MonsterCatalog
@@ -54,10 +67,18 @@ PLUGIN_NAME = "astrbot_plugin_LevelUpPvp"
 LEGACY_DB_PATH = os.path.join(PLUGIN_DIR, "data", "db_level_up_pvp.db")
 
 
-@register(PLUGIN_NAME, "QuanWenG", "群聊自动签到，升级就开打", "1.8.0")
+@register(PLUGIN_NAME, "QuanWenG", "群聊自动签到，升级就开打", "1.9.2")
 class MyPlugin(Star):
-    def __init__(self, context: Context):
-        super().__init__(context)
+    def __init__(
+        self,
+        context: Context,
+        config: AstrBotConfig | None = None,
+    ):
+        super().__init__(context, config)
+        self.config = config or {}
+        self.effect_whitelist = EffectWhitelist(
+            self.config.get("effect_whitelist", [])
+        )
         self.db_path = prepare_persistent_database(
             StarTools.get_data_dir(PLUGIN_NAME),
             LEGACY_DB_PATH,
@@ -131,6 +152,7 @@ class MyPlugin(Star):
         """Block every event until schema creation and migrations finish."""
         await self._db_init_task
 
+    @external_effect_whitelist_only
     async def grant_external_activity(
         self,
         *,
@@ -142,7 +164,8 @@ class MyPlugin(Star):
         reward_key: str,
         valid_attempt: bool,
         correct: bool,
-    ) -> dict:
+        unified_msg_origin: str = "",
+    ) -> dict | None:
         """Grant an idempotent reward requested by another AstrBot plugin.
 
         Args:
@@ -154,9 +177,12 @@ class MyPlugin(Star):
             reward_key: Caller-scoped idempotency key.
             valid_attempt: Whether to grant the attempt component.
             correct: Whether to grant the correct-answer component.
+            unified_msg_origin: Optional full AstrBot message origin. Older
+                callers may omit it and match by group ID only.
 
         Returns:
-            Concrete applied components and experience gains.
+            Concrete applied components and experience gains, or ``None`` when
+            the origin is outside the effect whitelist.
         """
         await self._ensure_database_ready()
         identity = UserIdentity(
@@ -173,10 +199,20 @@ class MyPlugin(Star):
             correct=correct,
         )
 
+    @filter.on_waiting_llm_request(priority=1000)
+    async def stop_denied_levelup_llm(self, event: AstrMessageEvent) -> None:
+        """Prevent denied LevelUpPVP commands from reaching default LLM."""
+        if should_stop_denied_llm(
+            whitelist=self.effect_whitelist,
+            event=event,
+        ):
+            event.stop_event()
+
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE,
         priority=100,
     )
+    @effect_whitelist_only
     async def auto_checkin(self, event: AstrMessageEvent):
         """自动登记群成员，并处理签到。"""
         await self._ensure_database_ready()
@@ -191,6 +227,7 @@ class MyPlugin(Star):
             yield result
 
     @filter.command("签到")
+    @effect_whitelist_only
     async def sign(self, event: AstrMessageEvent):
         """每日签到获取随机经验。"""
         await self._ensure_database_ready()
@@ -198,6 +235,7 @@ class MyPlugin(Star):
             yield result
 
     @filter.command("面板")
+    @effect_whitelist_only
     async def profile(self, event: AstrMessageEvent):
         """查看自己的等级、经验和属性。"""
         await self._ensure_database_ready()
@@ -205,6 +243,7 @@ class MyPlugin(Star):
             yield result
 
     @filter.command("加点")
+    @effect_whitelist_only
     async def add_point(
         self,
         event: AstrMessageEvent,
@@ -217,6 +256,7 @@ class MyPlugin(Star):
             yield result
 
     @filter.command("排行")
+    @effect_whitelist_only
     async def ranking(self, event: AstrMessageEvent):
         """查看当前群等级排行榜，At 用户时查看该用户排名。"""
         await self._ensure_database_ready()
@@ -224,6 +264,7 @@ class MyPlugin(Star):
             yield result
 
     @filter.command("登记")
+    @effect_whitelist_only
     async def register_nickname(self, event: AstrMessageEvent, nickname: str = ""):
         """使用平台用户名登记展示昵称，可选手动覆盖。"""
         await self._ensure_database_ready()
@@ -232,6 +273,7 @@ class MyPlugin(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("修改登记")
+    @effect_whitelist_only
     async def modify_registered_nickname(
         self,
         event: AstrMessageEvent,
@@ -247,6 +289,7 @@ class MyPlugin(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("给予")
+    @effect_whitelist_only
     async def grant_equipment(self, event: AstrMessageEvent, args: GreedyStr):
         """向单人、本群或全服发放装备表中的一件装备。"""
         await self._ensure_database_ready()
@@ -255,6 +298,7 @@ class MyPlugin(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("重载装备表")
+    @effect_whitelist_only
     async def reload_equipment_catalog(self, event: AstrMessageEvent):
         """校验并原子重载装备目录。"""
         await self._ensure_database_ready()
@@ -262,16 +306,19 @@ class MyPlugin(Star):
             yield result
 
     @filter.command("背包")
+    @effect_whitelist_only
     async def inventory(self, event: AstrMessageEvent, page: int = 1):
         await self._ensure_database_ready()
         async for result in self.command_handler.inventory(event, page): yield result
 
     @filter.command("装备")
+    @effect_whitelist_only
     async def equipment(self, event: AstrMessageEvent):
         await self._ensure_database_ready()
         async for result in self.command_handler.equipment(event): yield result
 
     @filter.command("装备图鉴")
+    @effect_whitelist_only
     async def equipment_catalog(
         self,
         event: AstrMessageEvent,
@@ -282,16 +329,19 @@ class MyPlugin(Star):
             yield result
 
     @filter.command("装备详情")
+    @effect_whitelist_only
     async def equipment_detail(self, event: AstrMessageEvent, equipment_id: int):
         await self._ensure_database_ready()
         async for result in self.command_handler.equipment_detail(event, equipment_id): yield result
 
     @filter.command("穿戴")
+    @effect_whitelist_only
     async def equip_item(self, event: AstrMessageEvent, args: GreedyStr):
         await self._ensure_database_ready()
         async for result in self.command_handler.equip_item(event, args): yield result
 
     @filter.command("一键穿戴")
+    @effect_whitelist_only
     async def auto_equip(self, event: AstrMessageEvent):
         """自动从背包挑选最优装备穿戴。"""
         await self._ensure_database_ready()
@@ -299,49 +349,59 @@ class MyPlugin(Star):
             yield result
 
     @filter.command("卸下")
+    @effect_whitelist_only
     async def unequip_item(self, event: AstrMessageEvent, args: GreedyStr):
         await self._ensure_database_ready()
         async for result in self.command_handler.unequip_item(event, args): yield result
 
     @filter.command("技能")
+    @effect_whitelist_only
     async def skills(self, event: AstrMessageEvent):
         await self._ensure_database_ready()
         async for result in self.command_handler.skills(event): yield result
 
     @filter.command("学习")
+    @effect_whitelist_only
     async def learn_skill(self, event: AstrMessageEvent, name: GreedyStr):
         await self._ensure_database_ready()
         async for result in self.command_handler.learn_skill(event, name): yield result
 
     @filter.command("训练技能")
+    @effect_whitelist_only
     async def train_skill(self, event: AstrMessageEvent, args: GreedyStr):
         await self._ensure_database_ready()
         async for result in self.command_handler.train_skill(event, args): yield result
 
     @filter.command("技能栏")
+    @effect_whitelist_only
     async def skill_slot(self, event: AstrMessageEvent, args: GreedyStr):
         await self._ensure_database_ready()
         async for result in self.command_handler.set_skill_slot(event, args): yield result
     @filter.command("魔法书")
+    @effect_whitelist_only
     async def spellbooks(self, event: AstrMessageEvent, page: int = 1):
         await self._ensure_database_ready()
         async for result in self.command_handler.spellbooks(event, page): yield result
 
     @filter.command("阅读")
+    @effect_whitelist_only
     async def read_spellbook(self, event: AstrMessageEvent, book_id: int):
         await self._ensure_database_ready()
         async for result in self.command_handler.read_spellbook(event, book_id): yield result
 
     @filter.command("法术")
+    @effect_whitelist_only
     async def spells(self, event: AstrMessageEvent):
         await self._ensure_database_ready()
         async for result in self.command_handler.spells(event): yield result
 
     @filter.command("战技")
+    @effect_whitelist_only
     async def techniques(self, event: AstrMessageEvent):
         await self._ensure_database_ready()
         async for result in self.command_handler.techniques(event): yield result
     @filter.command("挑战")
+    @effect_whitelist_only
     async def challenge(self, event: AstrMessageEvent):
         """At 一名用户发起概率战斗。"""
         await self._ensure_database_ready()
@@ -349,6 +409,7 @@ class MyPlugin(Star):
             yield result
 
     @filter.event_message_type(filter.EventMessageType.ALL)
+    @effect_whitelist_only
     async def mentioned_command(self, event: AstrMessageEvent):
         """普通消息里的 @机器人指令 或挑战唤起词。"""
         await self._ensure_database_ready()
@@ -446,6 +507,7 @@ class MyPlugin(Star):
         event.stop_event()
 
     @filter.command("副本")
+    @effect_whitelist_only
     async def list_dungeons(self, event: AstrMessageEvent):
         """查看所有可用副本。"""
         await self._ensure_database_ready()
@@ -453,6 +515,7 @@ class MyPlugin(Star):
             yield result
 
     @filter.command("副本详情")
+    @effect_whitelist_only
     async def dungeon_detail(self, event: AstrMessageEvent, name: GreedyStr = ""):
         """查看指定副本的波次与奖励详情。"""
         await self._ensure_database_ready()
