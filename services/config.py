@@ -1,7 +1,17 @@
-import math
+try:
+    from .progression_rules import (
+        level_daily_exp_budget,
+        level_exp_required,
+    )
+except ImportError:
+    from services.progression_rules import (
+        level_daily_exp_budget,
+        level_exp_required,
+    )
 
 
 INITIAL_LEVEL = 1
+MAX_LEVEL = 100
 INITIAL_EXP = 0
 INITIAL_TOTAL_EXP = 0
 INITIAL_STAT_POINTS = 0
@@ -40,17 +50,19 @@ STAT_ALIASES = {
     "意志": "willpower", "wil": "willpower", "will": "willpower",
 }
 
+# Retained for readers and migration tooling; live progression uses the v11
+# daily-budget curve exposed by ``exp_required_for_next_level`` below.
 LEVEL_EXP_BASE = 100
 LEVEL_EXP_GROWTH = 1.18
 STAT_POINTS_PER_LEVEL = 1
 SKILL_POINTS_PER_LEVEL = 1
-CHECKIN_ROLL_EXP_RANGE = (1, 100)
-CHECKIN_FALLBACK_THRESHOLD_RATE = 0.10
-CHECKIN_FALLBACK_EXP_RATE_RANGE = (0.08, 0.12)
-CHECKIN_BASE_EXP_CAP_RATE = 0.60
-CHECKIN_DAY_RESET_HOUR = 5
+CHECKIN_DAY_RESET_HOUR = 4
 CHECKIN_MAX_STREAK_BONUS_DAYS = 7
-CHECKIN_STREAK_BONUS_STEP = 5
+CHECKIN_DAILY_BUDGET_SHARE = 0.55
+CHECKIN_VARIANCE_RANGE = (0.90, 1.10)
+CHECKIN_STREAK_BONUS_RATE_STEP = 0.02
+CHECKIN_CATCHUP_MAX_MULTIPLIER = 1.60
+CHECKIN_ACTIVE_REFERENCE_DAYS = 30
 
 BATTLE_ACTIVE_CHALLENGE_WINDOW_SECONDS = 10 * 60
 BATTLE_ACTIVE_CHALLENGE_LIMIT = 3
@@ -266,7 +278,12 @@ BATTLE_STRATEGY_ATTRIBUTE_RULES = {
 
 
 def exp_required_for_next_level(level: int) -> int:
-    return math.floor(LEVEL_EXP_BASE * (LEVEL_EXP_GROWTH ** (level - 1)))
+    return level_exp_required(level)
+
+
+def exp_daily_budget(level: int) -> int:
+    """Shared daily XP budget for check-in and activity reward policies."""
+    return level_daily_exp_budget(level)
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:

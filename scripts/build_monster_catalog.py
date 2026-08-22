@@ -713,9 +713,19 @@ def monster_record(row: dict, race_map: dict[str, str]) -> dict:
         resistances["nature"] = 25
     source_effects = []
     if "塊" in source_name or "キューブ" in source_name:
-        source_effects.append("分裂（当前引擎未结算）")
+        abilities.append(
+            {"ability_id": "monster_split", "min_level": 1, "priority": 100}
+        )
+        source_effects.append("分出短命复制体协同攻击")
     if "酸" in source_name:
-        source_effects.append("腐蚀装备（当前引擎未结算）")
+        abilities.append(
+            {
+                "ability_id": "monster_corrosive_splash",
+                "min_level": 1,
+                "priority": 100,
+            }
+        )
+        source_effects.append("弱酸会暂时降低护甲，不损坏装备")
     localization = (
         "community"
         if source_name in COMMUNITY_CN_NAME_KEYS

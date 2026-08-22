@@ -27,6 +27,18 @@ class ManaCostBreakdown:
     spell_power: float
 
 
+@dataclass(frozen=True)
+class SpellEffectScale:
+    """Bounded utility growth derived from the learned spell itself."""
+
+    spell_level: int
+    progress: float
+    magnitude_multiplier: float
+    duration_multiplier: float
+    distance_multiplier: float
+    status_power_bonus: float
+
+
 SCHOOL_READING_ATTRIBUTES = {
     "magic_training": "magic",
     "barrier": "magic",
@@ -37,6 +49,33 @@ SCHOOL_READING_ATTRIBUTES = {
     "necromancy": "willpower",
     "mind_control": "willpower",
     "natural_knowledge": "perception",
+}
+
+
+SPELL_DAMAGE_MULTIPLIER_KEYS = {
+    "magic": "arcane",
+    "fire": "fire",
+    "cold": "cold",
+    "lightning": "lightning",
+    "shadow": "shadow",
+    "nature": "nature",
+    "mind": "mind",
+    "hell": "hell",
+}
+
+SPELL_BASE_POWER_FLOOR = 8.0
+SPELL_MASTERY_POWER_PER_LEVEL = 1.35
+SPELL_NOVICE_POWER_BONUS = 14.0
+SPELL_NOVICE_POWER_DECAY_LEVELS = 3.5
+
+
+SPELL_SCHOOL_MULTIPLIER_KEYS = {
+    "magic_training": "arcane",
+    "barrier": "barrier",
+    "shadow_magic": "shadow",
+    "natural_knowledge": "nature",
+    "mind_control": "mind",
+    "necromancy": "hell",
 }
 
 
@@ -155,6 +194,25 @@ def spell_level_for(definition, fighter) -> int:
     return max(1, spell.level if spell else 1)
 
 
+def spell_effect_scale(definition, fighter) -> SpellEffectScale:
+    """Return smooth utility growth without a level breakpoint.
+
+    Damage and healing already use dedicated base-power curves.  This curve
+    gives barriers, control, zones, summons and movement a visible but capped
+    reward for spell mastery, so leveling them does not only raise mana cost.
+    """
+    level = spell_level_for(definition, fighter)
+    progress = 1.0 - math.exp(-max(0, level - 1) / 50.0)
+    return SpellEffectScale(
+        spell_level=level,
+        progress=progress,
+        magnitude_multiplier=1.0 + 0.35 * progress,
+        duration_multiplier=1.0 + 0.45 * progress,
+        distance_multiplier=1.0 + 0.35 * progress,
+        status_power_bonus=25.0 * progress,
+    )
+
+
 def spell_power_for(definition, fighter, spell_level: int) -> float:
     return spell_base_power(definition, fighter, spell_level) * (
         spell_multiplier_for(definition, fighter)
@@ -172,25 +230,74 @@ def _fighter_attributes(fighter) -> dict[str, float]:
 
 
 def spell_base_power(definition, fighter, spell_level: int) -> float:
+    # A newly read spell must feel like a real discovery immediately.  The
+    # temporary novice floor decays smoothly over the first few spell levels,
+    # then hands progression back to the normal mastery curve instead of
+    # becoming another permanent late-game multiplier.
+    novice_bonus = (
+        SPELL_NOVICE_POWER_BONUS
+        * math.exp(
+            -max(0, spell_level - 1) / SPELL_NOVICE_POWER_DECAY_LEVELS
+        )
+        if definition.ability_type == "spell" else 0.0
+    )
+    base_power = (
+        SPELL_BASE_POWER_FLOOR
+        + spell_level * SPELL_MASTERY_POWER_PER_LEVEL
+        + novice_bonus
+    )
+    # Equipment catalog values are fractional spell-power bonuses (0.05 =
+    # +5%), matching random affixes and the workshop's percentage display.
     equipment_power = 0.0
     if fighter.snapshot.equipment:
-        equipment_power = float(
+        equipment_bonus = float(
             fighter.snapshot.equipment.combat_effects.get("spell_power", 0.0)
         )
-    return 8 + spell_level * 1.5 + equipment_power
+        equipment_power = base_power * equipment_bonus
+    return base_power + equipment_power
 
 
 def healing_base_power(spell_level: int) -> float:
     return 10 + spell_level * 2
 
 
-def spell_multiplier_for(definition, fighter) -> float:
+def spell_multiplier_for(
+    definition,
+    fighter,
+    damage_type: str | None = None,
+) -> float:
     school_level = fighter.skill_level(definition.unlock_skill_id)
-    return spell_power_multiplier(
+    base = spell_power_multiplier(
         school_id=definition.unlock_skill_id,
         school_level=school_level,
         attributes=_fighter_attributes(fighter),
     )
+    multiplier_key = SPELL_DAMAGE_MULTIPLIER_KEYS.get(str(damage_type or ""))
+    if multiplier_key is None and damage_type is None:
+        magic_effect = next(
+            (
+                effect for effect in definition.effects
+                if effect.effect_type == "magic_damage"
+            ),
+            None,
+        )
+        if magic_effect is not None:
+            multiplier_key = SPELL_DAMAGE_MULTIPLIER_KEYS.get(
+                magic_effect.damage_type
+            )
+    if multiplier_key is None:
+        multiplier_key = SPELL_SCHOOL_MULTIPLIER_KEYS.get(
+            definition.unlock_skill_id
+        )
+    derived = fighter.current_derived
+    derived_multipliers = (
+        getattr(derived, "spell_multipliers", {}) if derived is not None else {}
+    )
+    passive_multiplier = (
+        float(derived_multipliers.get(multiplier_key, 1.0))
+        if derived is not None and multiplier_key is not None else 1.0
+    )
+    return base * max(0.0, passive_multiplier)
 
 
 def calculate_mana_cost(definition, fighter, void_embrace_active: bool) -> ManaCostBreakdown:

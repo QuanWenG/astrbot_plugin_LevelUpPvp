@@ -100,7 +100,8 @@ class PassiveTalentSystemTests(unittest.IsolatedAsyncioTestCase):
         heavy_equipment = replace(dual.equipment, weapon_weight=16.0)
         heavy = resolve_passive_bonuses({"dual_wield": 100}, heavy_equipment)
         self.assertEqual(light.style_multiplier, 1.0)
-        self.assertAlmostEqual(heavy.style_multiplier, 0.90)
+        self.assertAlmostEqual(light.dual_wield_efficiency, 0.55)
+        self.assertAlmostEqual(heavy.dual_wield_efficiency, 0.45)
 
         await self.equipment.unequip(self.user.id, "off_hand")
         solitary = await self._snapshot()
@@ -126,7 +127,7 @@ class PassiveTalentSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("throwing", usage)
         self.assertIn("tactics", usage)
         self.assertNotIn("marksmanship", usage)
-    async def test_advanced_skill_requires_permanent_level_50_and_costs_point(self):
+    async def test_advanced_skill_requires_permanent_level_35_and_costs_point(self):
         async with await connect_db(self.db_path) as db:
             await db.execute(
                 "UPDATE users SET skill_points = 2 WHERE id = ?",
@@ -134,12 +135,12 @@ class PassiveTalentSystemTests(unittest.IsolatedAsyncioTestCase):
             )
             await db.commit()
         with self.assertRaisesRegex(
-            ValueError, "长剑专精 1/50.*长枪专精 0/50"
+            ValueError, "长剑专精 1/35.*长枪专精 0/35"
         ):
             await self.skills.learn(self.user, "军官武器")
 
-        await self._set_skill("longsword", 50)
-        await self._set_skill("spear", 50)
+        await self._set_skill("longsword", 35)
+        await self._set_skill("spear", 35)
         learned = await self.skills.learn(self.user, "军官武器")
         self.assertEqual(learned.skill_id, "officer_weapon")
         refreshed = await self.users.get_user_by_pk(self.user.id)

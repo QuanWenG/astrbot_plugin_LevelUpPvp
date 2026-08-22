@@ -307,6 +307,13 @@ class AttributeService:
             weapon_weight=equipment.weapon_weight,
             style_multiplier=equipment.damage_multiplier,
         )
+        # Weapon specialisations have always produced this passive, but v10
+        # never consumed it.  Keep it in the shared offence rating so basic
+        # attacks and physical abilities receive the same bounded benefit.
+        offense_multiplier *= 1.0 + min(
+            0.35,
+            max(0.0, passives.physical_damage_bonus),
+        )
 
         base_hp = (
             50
@@ -349,6 +356,12 @@ class AttributeService:
             + equipment.armor_power * 2
             + passives.defense
         )
+        # A shield already supplies block, knockback resistance and reliable
+        # guarding.  Convert more of its defensive budget into those active
+        # tools instead of stacking raw armor with heavy gear; otherwise the
+        # sword-and-shield profile invalidates every other late-game answer.
+        if equipment.weapon_mode == "sword_shield":
+            defense *= 0.45
         evasion = (
             attributes.dexterity * 0.8
             + passives.evasion

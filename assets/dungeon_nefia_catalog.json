@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "environments": [
+    {"id": "quiet_ruins", "name": "寂静遗迹", "description": "视野开阔，适合稳妥推进。", "combat_environment_id": "calm", "threat_multiplier": 0.96, "reward_multiplier": 0.94},
+    {"id": "flooded_passage", "name": "积水回廊", "description": "雨水削弱火焰，却让雷电更难防备。", "combat_environment_id": "rain", "threat_multiplier": 1.00, "reward_multiplier": 1.02},
+    {"id": "spore_fog", "name": "孢子迷雾", "description": "浓雾遮蔽远处目标，命中更不稳定。", "combat_environment_id": "fog", "threat_multiplier": 1.04, "reward_multiplier": 1.05},
+    {"id": "wind_tunnel", "name": "风蚀长廊", "description": "乱流干扰远程武器的轨迹。", "combat_environment_id": "strong_wind", "threat_multiplier": 1.05, "reward_multiplier": 1.06},
+    {"id": "narrow_den", "name": "狭窄兽穴", "description": "双方从近距离交锋，战斗很快进入白热化。", "combat_environment_id": "close_quarters", "threat_multiplier": 1.07, "reward_multiplier": 1.07},
+    {"id": "mana_spring", "name": "魔力涌泉", "description": "法力恢复活跃，施法者能更频繁地改变战局。", "combat_environment_id": "mana_tide", "threat_multiplier": 1.06, "reward_multiplier": 1.10},
+    {"id": "ether_fault", "name": "以太裂隙", "description": "不稳定以太会反噬过度施法者，战利品也更稀有。", "combat_environment_id": "ether_disturbance", "threat_multiplier": 1.12, "reward_multiplier": 1.16}
+  ],
+  "risks": [
+    {"id": "careful_scout", "name": "谨慎侦察", "description": "绕开危险地带，敌人与战利品都略弱。", "monster_level_delta": -1, "reward_multiplier": 0.88},
+    {"id": "break_the_seal", "name": "破坏封印", "description": "放出更强的守卫，换取被封住的宝藏。", "monster_level_delta": 2, "reward_multiplier": 1.30, "entry_mp_cost_ratio": 0.08},
+    {"id": "rest_at_camp", "name": "扎营整备", "description": "放慢脚步并恢复判断力，不额外冒险。", "monster_level_delta": -1, "reward_multiplier": 0.90},
+    {"id": "blood_contract", "name": "鲜血契约", "description": "以当前生命为代价唤醒宝箱的真正价值。", "monster_level_delta": 1, "reward_multiplier": 1.38, "entry_hp_cost_ratio": 0.12},
+    {"id": "disarm_traps", "name": "拆除陷阱", "description": "安全通过机关区，但会损坏一部分宝物。", "reward_multiplier": 0.92},
+    {"id": "rush_the_traps", "name": "强闯机关", "description": "抢在机关闭合前夺取完整宝藏。", "monster_level_delta": 2, "reward_multiplier": 1.32, "entry_hp_cost_ratio": 0.07},
+    {"id": "close_the_rift", "name": "封闭裂隙", "description": "平息异常魔力，降低敌人的威胁。", "monster_level_delta": -1, "reward_multiplier": 0.90},
+    {"id": "drink_the_ether", "name": "汲取以太", "description": "让以太灌入身体，危险却可能找到魔法书。", "monster_level_delta": 3, "reward_multiplier": 1.45, "entry_mp_cost_ratio": 0.12}
+    ,{"id": "leave_camp", "name": "不惊动营地", "description": "绕开散落物资，避免引来额外守卫。", "monster_level_delta": -1, "reward_multiplier": 0.86}
+    ,{"id": "search_camp", "name": "搜刮营地", "description": "翻找残留补给，但响动会引来更强守卫。", "monster_level_delta": 2, "reward_multiplier": 1.34}
+    ,{"id": "bury_remains", "name": "掩埋遗骸", "description": "安葬无名者，获得平静而稳定的回报。", "monster_level_delta": -1, "reward_multiplier": 1.02}
+    ,{"id": "loot_remains", "name": "搜刮遗骸", "description": "夺走死者遗物，也承受萦绕其上的危险。", "monster_level_delta": 2, "reward_multiplier": 1.36, "entry_hp_cost_ratio": 0.05}
+    ,{"id": "gather_carefully", "name": "细心采集", "description": "只带走成熟材料，收获稳定且不会透支体力。", "reward_multiplier": 0.96}
+    ,{"id": "strip_the_vein", "name": "追挖富矿", "description": "深入危险裂隙追逐高品质材料。", "reward_multiplier": 1.32, "entry_hp_cost_ratio": 0.06}
+    ,{"id": "inspect_the_seal", "name": "解读封印", "description": "花费少量魔力寻找机关或法术通路。", "reward_multiplier": 1.00, "entry_mp_cost_ratio": 0.04}
+    ,{"id": "force_the_passage", "name": "强行破壁", "description": "没有合适能力也能闯入，但会付出生命与魔力。", "reward_multiplier": 1.24, "entry_hp_cost_ratio": 0.10, "entry_mp_cost_ratio": 0.06}
+    ,{"id": "open_carefully", "name": "谨慎开箱", "description": "拆掉明显机关，保住大部分收获。", "reward_multiplier": 0.96}
+    ,{"id": "spring_the_trap", "name": "硬吃机关", "description": "抢在机关闭合前拿走完整宝物。", "reward_multiplier": 1.30, "entry_hp_cost_ratio": 0.08}
+  ],
+  "risk_pairs": [
+    ["careful_scout", "break_the_seal"],
+    ["rest_at_camp", "blood_contract"],
+    ["disarm_traps", "rush_the_traps"],
+    ["close_the_rift", "drink_the_ether"],
+    ["leave_camp", "search_camp"],
+    ["bury_remains", "loot_remains"],
+    ["gather_carefully", "strip_the_vein"],
+    ["inspect_the_seal", "force_the_passage"],
+    ["open_carefully", "spring_the_trap"]
+  ],
+  "affixes": [
+    {"id": "ferocious", "name": "凶暴", "description": "更主动地压迫冒险者。", "level_delta": 1, "aggression_delta": 0.18, "reward_multiplier": 1.10},
+    {"id": "ironclad", "name": "铁壁", "description": "拥有更高阶的防护与抗性。", "level_delta": 1, "guard_delta": 0.20, "reward_multiplier": 1.12},
+    {"id": "swift", "name": "迅捷", "description": "行动果断，很少给人喘息机会。", "aggression_delta": 0.10, "guard_delta": -0.08, "reward_multiplier": 1.09},
+    {"id": "ancient", "name": "古老", "description": "历经以太侵蚀，实力与藏品一同增长。", "level_delta": 2, "reward_multiplier": 1.18},
+    {"id": "spell_hoarder", "name": "藏书者", "description": "随身保管着被抢来的魔法书。", "level_delta": 1, "reward_multiplier": 1.16}
+  ],
+  "dungeons": {
+    "verdant_wetland": {
+      "node_count_min": 3,
+      "node_count_max": 4,
+      "monster_pool": ["monster_001", "monster_002", "monster_127", "monster_139", "monster_186"],
+      "elite_pool": ["monster_127", "monster_186"],
+      "boss_pool": ["monster_187"],
+      "environment_pool": ["quiet_ruins", "flooded_passage", "spore_fog", "narrow_den", "mana_spring"],
+      "terrain_pool": ["forest", "cave"],
+      "terrain_monster_pools": {
+        "forest": {
+          "normal": ["monster_001", "monster_002", "monster_186"],
+          "elite": ["monster_186"]
+        },
+        "cave": {
+          "normal": ["monster_127", "monster_139"],
+          "elite": ["monster_127"]
+        }
+      },
+      "spellbook_pool": ["healing_rain", "regeneration", "fire_wall", "web", "poison_cure"]
+    },
+    "ember_outpost": {
+      "node_count_min": 4,
+      "node_count_max": 5,
+      "monster_pool": ["monster_068", "monster_069", "monster_070", "monster_071"],
+      "elite_pool": ["monster_071", "monster_107"],
+      "boss_pool": ["monster_069", "monster_107"],
+      "environment_pool": ["quiet_ruins", "wind_tunnel", "narrow_den", "mana_spring", "ether_fault"],
+      "terrain_pool": ["fortress", "tower", "cave"],
+      "terrain_monster_pools": {
+        "fortress": {
+          "normal": ["monster_068", "monster_069"],
+          "elite": ["monster_107"]
+        },
+        "tower": {
+          "normal": ["monster_070", "monster_071"],
+          "elite": ["monster_071", "monster_107"]
+        },
+        "cave": {
+          "normal": ["monster_068", "monster_070"],
+          "elite": ["monster_071"]
+        }
+      },
+      "spellbook_pool": ["fire_ray", "scorching_storm", "elemental_protection", "storm_strike", "hero"]
+    },
+    "sealed_archive": {
+      "node_count_min": 4,
+      "node_count_max": 4,
+      "monster_pool": ["monster_065", "monster_076", "monster_084", "monster_108", "monster_136"],
+      "elite_pool": ["monster_024", "monster_099", "monster_171"],
+      "boss_pool": ["monster_025", "monster_102"],
+      "environment_pool": ["quiet_ruins", "spore_fog", "wind_tunnel", "mana_spring", "ether_fault"],
+      "terrain_pool": ["tower", "fortress", "cave"],
+      "terrain_monster_pools": {
+        "tower": {
+          "normal": ["monster_065", "monster_084", "monster_136"],
+          "elite": ["monster_024", "monster_171"]
+        },
+        "fortress": {
+          "normal": ["monster_065", "monster_076", "monster_108"],
+          "elite": ["monster_099", "monster_171"]
+        },
+        "cave": {
+          "normal": ["monster_065", "monster_084", "monster_108"],
+          "elite": ["monster_024", "monster_099"]
+        }
+      },
+      "spellbook_pool": ["magic_arrow", "blink", "armor_spell", "dispel", "remove_curse"]
+    },
+    "moonfang_den": {
+      "node_count_min": 3,
+      "node_count_max": 5,
+      "monster_pool": ["monster_019", "monster_027", "monster_061", "monster_074", "monster_085", "monster_093"],
+      "elite_pool": ["monster_020", "monster_062", "monster_075", "monster_096"],
+      "boss_pool": ["monster_092", "monster_097", "monster_155"],
+      "environment_pool": ["flooded_passage", "spore_fog", "wind_tunnel", "narrow_den"],
+      "terrain_pool": ["forest", "cave"],
+      "terrain_monster_pools": {
+        "forest": {
+          "normal": ["monster_027", "monster_061", "monster_074", "monster_085"],
+          "elite": ["monster_062", "monster_075"]
+        },
+        "cave": {
+          "normal": ["monster_019", "monster_027", "monster_061", "monster_093"],
+          "elite": ["monster_020", "monster_096"]
+        }
+      },
+      "spellbook_pool": ["beast_claw", "tree_skin", "oak_blessing", "elm_blessing", "poison_resistance"]
+    },
+    "aberrant_rift": {
+      "node_count_min": 5,
+      "node_count_max": 5,
+      "monster_pool": ["monster_134", "monster_180", "monster_183", "monster_187", "monster_203", "monster_206"],
+      "elite_pool": ["monster_043", "monster_135", "monster_184", "monster_202", "monster_212"],
+      "boss_pool": ["monster_053", "monster_201", "monster_209"],
+      "environment_pool": ["spore_fog", "narrow_den", "mana_spring", "ether_fault"],
+      "terrain_pool": ["cave", "tower"],
+      "terrain_monster_pools": {
+        "cave": {
+          "normal": ["monster_180", "monster_183", "monster_187", "monster_206"],
+          "elite": ["monster_043", "monster_184", "monster_212"]
+        },
+        "tower": {
+          "normal": ["monster_134", "monster_180", "monster_203", "monster_206"],
+          "elite": ["monster_135", "monster_202", "monster_212"]
+        }
+      },
+      "spellbook_pool": ["confusion_spell", "teleport", "vulnerability_fog", "nightmare", "void_embrace"]
+    }
+  }
+}

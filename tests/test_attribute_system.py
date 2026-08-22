@@ -1,4 +1,5 @@
 import os
+import random
 import tempfile
 import sqlite3
 import unittest
@@ -6,7 +7,10 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from models.attributes import DAMAGE_TYPES, PrimaryAttributes
+from models.combat import FighterState
 from models.user import UserIdentity
+from services.ability_catalog import ACTIVE_ABILITY_DEFINITIONS
+from services import config
 from services.attribute_service import (
     AttributeService,
     attribute_exp_required,
@@ -22,12 +26,18 @@ from services.db import (
     ELONA_PROGRESSION_MIGRATION,
     PRIMARY_ATTRIBUTE_REBALANCE_MIGRATION,
     PRIMARY_ATTRIBUTE_REBALANCE_BACKUP_SUFFIX,
+    V11_PROGRESSION_BACKUP_SUFFIX,
+    V11_PROGRESSION_MIGRATION,
     connect_db,
     init_db,
 )
 from services.progression_rules import (
     legacy_attribute_exp_required,
+    legacy_level_exp_required,
+    migrate_level_exp_preserving_progress,
     migrate_exp_preserving_progress,
+    migrate_v10_skill_exp_preserving_progress,
+    v10_skill_exp_required,
 )
 from services.equipment_service import EquipmentService
 from services.skill_service import SkillService
@@ -269,6 +279,7 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
         handle, migration_path = tempfile.mkstemp(suffix=".db")
         os.close(handle)
         backup_path = migration_path + ELONA_PROGRESSION_BACKUP_SUFFIX
+        v11_backup_path = migration_path + V11_PROGRESSION_BACKUP_SUFFIX
         try:
             await init_db(migration_path)
             users = UserService(migration_path)
@@ -306,8 +317,11 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
                     (user.id,),
                 )
                 await db.execute(
-                    "DELETE FROM schema_migrations WHERE migration_id = ?",
-                    (ELONA_PROGRESSION_MIGRATION,),
+                    "DELETE FROM schema_migrations WHERE migration_id IN (?, ?)",
+                    (
+                        ELONA_PROGRESSION_MIGRATION,
+                        V11_PROGRESSION_MIGRATION,
+                    ),
                 )
                 await db.commit()
 
@@ -334,8 +348,9 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(progress["strength"].exp, expected_attribute)
             self.assertEqual(progress["strength"].potential, 1)
             self.assertEqual(migrated_skills["longsword"].level, 10)
-            self.assertEqual(migrated_skills["longsword"].exp, 10000)
-            self.assertEqual(migrated_skills["longsword"].potential, 400)
+            self.assertEqual(migrated_skills["longsword"].exp, 3400)
+            # v11 reads legacy stored potential through the effective 200% cap.
+            self.assertEqual(migrated_skills["longsword"].potential, 200)
             self.assertEqual(tuple(spell), (10, 11750, 75))
             self.assertEqual(
                 [item.id for item in await equipment.list_items(user.id)],
@@ -345,12 +360,164 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
             await init_db(migration_path)
             async with await connect_db(migration_path) as db:
                 migrated_again = await skills.skills_in_db(db, user.id)
-            self.assertEqual(migrated_again["longsword"].exp, 10000)
+            self.assertEqual(migrated_again["longsword"].exp, 3400)
         finally:
             if os.path.exists(migration_path):
                 os.remove(migration_path)
             if os.path.exists(backup_path):
                 os.remove(backup_path)
+            if os.path.exists(v11_backup_path):
+                os.remove(v11_backup_path)
+
+    async def test_v11_marker_supersedes_a_missing_historical_marker(self):
+        await self.skills.get_skills(self.user)
+        async with await connect_db(self.db_path) as db:
+            await self.attributes.ensure_progress_in_db(db, self.user.id)
+            await db.execute(
+                """
+                UPDATE user_skills
+                SET level = 10, exp = 1234, potential = 175
+                WHERE user_pk = ? AND skill_id = 'longsword'
+                """,
+                (self.user.id,),
+            )
+            await db.execute(
+                """
+                UPDATE user_attribute_progress
+                SET exp = 2345, potential = 180
+                WHERE user_pk = ? AND attribute_id = 'strength'
+                """,
+                (self.user.id,),
+            )
+            await db.execute(
+                "DELETE FROM schema_migrations WHERE migration_id = ?",
+                (ELONA_PROGRESSION_MIGRATION,),
+            )
+            await db.commit()
+
+        await init_db(self.db_path)
+
+        async with await connect_db(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT exp, potential FROM user_skills
+                WHERE user_pk = ? AND skill_id = 'longsword'
+                """,
+                (self.user.id,),
+            )
+            skill = await cursor.fetchone()
+            await cursor.close()
+            cursor = await db.execute(
+                """
+                SELECT exp, potential FROM user_attribute_progress
+                WHERE user_pk = ? AND attribute_id = 'strength'
+                """,
+                (self.user.id,),
+            )
+            attribute = await cursor.fetchone()
+            await cursor.close()
+            cursor = await db.execute(
+                """
+                SELECT migration_id FROM schema_migrations
+                WHERE migration_id IN (?, ?)
+                """,
+                (
+                    ELONA_PROGRESSION_MIGRATION,
+                    V11_PROGRESSION_MIGRATION,
+                ),
+            )
+            markers = {
+                row["migration_id"] for row in await cursor.fetchall()
+            }
+            await cursor.close()
+
+        self.assertEqual(tuple(skill), (1234, 175))
+        self.assertEqual(tuple(attribute), (2345, 180))
+        self.assertEqual(
+            markers,
+            {ELONA_PROGRESSION_MIGRATION, V11_PROGRESSION_MIGRATION},
+        )
+        self.assertFalse(
+            os.path.exists(
+                self.db_path + ELONA_PROGRESSION_BACKUP_SUFFIX
+            )
+        )
+
+    async def test_v10_marker_selects_exactly_one_v11_conversion(self):
+        backup_path = self.db_path + V11_PROGRESSION_BACKUP_SUFFIX
+        self.addCleanup(
+            lambda: os.path.exists(backup_path) and os.remove(backup_path)
+        )
+        await self.skills.get_skills(self.user)
+        old_level_exp = legacy_level_exp_required(10) // 2
+        old_skill_exp = v10_skill_exp_required(10) // 2
+        async with await connect_db(self.db_path) as db:
+            await db.execute(
+                "UPDATE users SET level = 10, exp = ? WHERE id = ?",
+                (old_level_exp, self.user.id),
+            )
+            await db.execute(
+                """
+                UPDATE user_skills
+                SET level = 10, exp = ?, potential = 175
+                WHERE user_pk = ? AND skill_id = 'longsword'
+                """,
+                (old_skill_exp, self.user.id),
+            )
+            await db.execute(
+                "DELETE FROM schema_migrations WHERE migration_id = ?",
+                (V11_PROGRESSION_MIGRATION,),
+            )
+            await db.commit()
+
+        await init_db(self.db_path)
+        expected_user_exp = migrate_level_exp_preserving_progress(
+            10,
+            old_level_exp,
+        )
+        expected_skill_exp = migrate_v10_skill_exp_preserving_progress(
+            10,
+            old_skill_exp,
+        )
+        async with await connect_db(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT exp FROM users WHERE id = ?",
+                (self.user.id,),
+            )
+            user_exp = int((await cursor.fetchone())["exp"])
+            await cursor.close()
+            cursor = await db.execute(
+                """
+                SELECT exp FROM user_skills
+                WHERE user_pk = ? AND skill_id = 'longsword'
+                """,
+                (self.user.id,),
+            )
+            skill_exp = int((await cursor.fetchone())["exp"])
+            await cursor.close()
+
+        self.assertEqual(user_exp, expected_user_exp)
+        self.assertEqual(skill_exp, expected_skill_exp)
+
+        await init_db(self.db_path)
+        async with await connect_db(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT exp FROM users WHERE id = ?",
+                (self.user.id,),
+            )
+            repeated_user_exp = int((await cursor.fetchone())["exp"])
+            await cursor.close()
+            cursor = await db.execute(
+                """
+                SELECT exp FROM user_skills
+                WHERE user_pk = ? AND skill_id = 'longsword'
+                """,
+                (self.user.id,),
+            )
+            repeated_skill_exp = int((await cursor.fetchone())["exp"])
+            await cursor.close()
+        self.assertEqual(repeated_user_exp, expected_user_exp)
+        self.assertEqual(repeated_skill_exp, expected_skill_exp)
 
     async def test_progression_migration_aborts_before_writes_when_backup_fails(self):
         async with await connect_db(self.db_path) as db:
@@ -364,8 +531,11 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
                 (self.user.id,),
             )
             await db.execute(
-                "DELETE FROM schema_migrations WHERE migration_id = ?",
-                (ELONA_PROGRESSION_MIGRATION,),
+                "DELETE FROM schema_migrations WHERE migration_id IN (?, ?)",
+                (
+                    ELONA_PROGRESSION_MIGRATION,
+                    V11_PROGRESSION_MIGRATION,
+                ),
             )
             await db.commit()
 
@@ -447,7 +617,11 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
                 "UPDATE users SET luck = 50 WHERE id = ?", (self.user.id,)
             )
             self.user = await self.users.get_user_by_pk_in_db(db, self.user.id)
-            leveled = await self.users.add_exp_in_db(db, self.user, 100)
+            leveled = await self.users.add_exp_in_db(
+                db,
+                self.user,
+                config.exp_required_for_next_level(self.user.level),
+            )
             downgraded = await self.users.deduct_exp_in_db(
                 db, leveled.user, 1
             )
@@ -535,6 +709,7 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
         attacker_derived = replace(
             snapshot.derived,
             elemental_damage={key: 12.0 for key in DAMAGE_TYPES},
+            critical_rate=0.0,
         )
         open_defense = replace(
             snapshot.derived,
@@ -553,30 +728,40 @@ class AttributeSystemTests(unittest.IsolatedAsyncioTestCase):
         resistant_target = replace(
             snapshot, user_pk=2, name="有耐性", derived=resistant_defense
         )
-        engine = SideviewCombatEngine()
-        profile = STRATEGY_PROFILES["全力猛攻"]
-        open_result = engine.simulate(attacker, open_target, profile, profile, 77)
-        resistant_result = engine.simulate(
-            attacker, resistant_target, profile, profile, 77
+        runtime = SideviewCombatEngine().ability_runtime
+        definition = ACTIVE_ABILITY_DEFINITIONS["power_strike"]
+        actor_state = FighterState(attacker, attacker.max_hp, 0)
+        open_state = FighterState(open_target, open_target.max_hp, 0)
+        resistant_state = FighterState(
+            resistant_target,
+            resistant_target.max_hp,
+            0,
         )
-        open_hit = next(
-            event
-            for event in open_result.events
-            if event.kind == "damage" and event.actor_pk == 1
+        open_hit = runtime.damage_result(
+            actor_state,
+            open_state,
+            definition,
+            random.Random(77),
         )
-        resistant_hit = next(
-            event
-            for event in resistant_result.events
-            if event.kind == "damage" and event.actor_pk == 1
+        resistant_hit = runtime.damage_result(
+            actor_state,
+            resistant_state,
+            definition,
+            random.Random(77),
         )
-        self.assertEqual(set(open_hit.damage_breakdown) - {"physical"}, set(DAMAGE_TYPES))
-        self.assertLess(resistant_hit.value, open_hit.value)
+        open_breakdown = open_hit[-1]
+        resistant_breakdown = resistant_hit[-1]
+        self.assertEqual(
+            set(open_breakdown) - {"physical"},
+            set(DAMAGE_TYPES),
+        )
+        self.assertLess(resistant_hit[0], open_hit[0])
         for damage_type in DAMAGE_TYPES:
             self.assertLess(
-                resistant_hit.damage_breakdown[damage_type],
-                open_hit.damage_breakdown[damage_type],
+                resistant_breakdown[damage_type],
+                open_breakdown[damage_type],
             )
-            self.assertEqual(elemental_multiplier(50, 10), 0.5)
+            self.assertEqual(elemental_multiplier(50, 10), 0.75)
 
 
 if __name__ == "__main__":

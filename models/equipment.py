@@ -14,6 +14,23 @@ SLOT_LABELS = {
 }
 
 
+ACTIVE_SOURCE_EFFECTS = frozenset({
+    "识破隐形",
+    "免疫恶劣天气",
+    "稀有装备发现率+15%",
+})
+
+SOURCE_EFFECT_CAPABILITIES = {
+    "识破隐形": "detect_invisible",
+}
+
+SOURCE_EFFECT_RARE_EQUIPMENT_FIND_BONUS = {
+    "稀有装备发现率+15%": 0.15,
+}
+
+RARE_EQUIPMENT_FIND_BONUS_CAP = 0.30
+
+
 @dataclass(frozen=True)
 class EquipmentTemplate:
     template_id: str
@@ -59,6 +76,7 @@ class EquipmentItem:
     bound: bool = True
     description: str = ""
     source_effects: tuple[str, ...] = ()
+    is_locked: bool = False
 
     def __post_init__(self) -> None:
         if not 0 <= self.item_level <= 100:
@@ -119,6 +137,10 @@ class EquipmentBuild:
     weapon_power: float = 0.0
     armor_power: float = 0.0
     weapon_weight: float = 0.0
+    main_hand_weapon_power: float = 0.0
+    off_hand_weapon_power: float = 0.0
+    dual_wield_efficiency: float = 0.0
+    dual_wield_followup_scale: float = 0.0
     action_speed: float = 100.0
     combat_effects: dict[str, float] = field(default_factory=dict)
     advanced_stat_modifiers: dict[str, int] = field(default_factory=dict)
@@ -126,6 +148,9 @@ class EquipmentBuild:
     physical_accuracy_multiplier: float = 1.0
     spell_accuracy_multiplier: float = 1.0
     equipment_procs: tuple[EquipmentProc, ...] = ()
+    exploration_capabilities: tuple[str, ...] = ()
+    adverse_weather_immunity: bool = False
+    rare_equipment_find_bonus: float = 0.0
 
     @property
     def is_ranged(self) -> bool:

@@ -4,6 +4,7 @@ import unittest
 from dataclasses import replace
 
 from models.user import UserIdentity
+from services import config
 from services.battle_service import BattleService
 from services.build_service import CombatBuildService
 from services.combat_ai import STRATEGY_PROFILES
@@ -144,7 +145,11 @@ class EquipmentSkillSystemTests(unittest.IsolatedAsyncioTestCase):
         await self.skills.get_skills(self.user)
         async with await connect_db(self.db_path) as db:
             current = await self.users.get_user_by_pk_in_db(db, self.user.id)
-            gained = await self.users.add_exp_in_db(db, current, 100)
+            gained = await self.users.add_exp_in_db(
+                db,
+                current,
+                config.exp_required_for_next_level(current.level),
+            )
             self.assertEqual(gained.user.level, 2)
             self.assertEqual(gained.user.skill_points, 1)
             self.assertEqual(gained.level_ups[0].skill_points_gain, 1)
@@ -179,6 +184,38 @@ class EquipmentSkillSystemTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertEqual(black.fusion_slot_limit, 3)
+
+    async def test_source_effects_resolve_only_from_equipped_items_and_cap(self):
+        factory = EquipmentFactory()
+        template = STARTER_BY_ID["training_longsword"]
+        base = factory.generate(self.user.id, template, 20, "epic", 5)
+        finder_a = replace(
+            base,
+            id=701,
+            source_effects=("识破隐形", "稀有装备发现率+15%"),
+        )
+        finder_b = replace(
+            base,
+            id=702,
+            source_effects=("免疫恶劣天气", "稀有装备发现率+15%"),
+        )
+        finder_c = replace(
+            base,
+            id=703,
+            source_effects=("稀有装备发现率+15%",),
+        )
+
+        build = self.builds.resolve_equipment(
+            self.user,
+            {"main_hand": 701, "off_hand": 702, "head": 703},
+            (finder_a, finder_b, finder_c),
+            {},
+        )
+
+        self.assertEqual(build.exploration_capabilities, ("detect_invisible",))
+        self.assertTrue(build.adverse_weather_immunity)
+        self.assertEqual(build.rare_equipment_find_bonus, 0.30)
+
     async def test_skill_initialization_retroactive_points_and_potential_tiers(self):
         async with await connect_db(self.db_path) as db:
             await db.execute(
@@ -192,7 +229,7 @@ class EquipmentSkillSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(slots[0], "power_strike")
 
         trained = await self.skills.train_potential(self.user, "长剑", 2)
-        self.assertEqual(trained.potential, 133)
+        self.assertEqual(trained.potential, 144)
         with self.assertRaises(ValueError):
             await self.skills.learn(self.user, "长剑")
 
@@ -223,7 +260,7 @@ class EquipmentSkillSystemTests(unittest.IsolatedAsyncioTestCase):
             self.user, (("斧头专精", 2), ("格斗技巧", 1))
         )
         self.assertEqual(
-            [skill.potential for skill in trained], [133, 118]
+            [skill.potential for skill in trained], [144, 125]
         )
 
         await self.skills.set_active_slots(
@@ -276,7 +313,7 @@ class EquipmentSkillSystemTests(unittest.IsolatedAsyncioTestCase):
             )
             await db.commit()
         self.assertEqual(growth[0].to_level, 2)
-        self.assertEqual(growth[0].potential_after, 180)
+        self.assertEqual(growth[0].potential_after, 184)
 
     async def test_dual_wield_produces_a_second_damage_segment(self):
         items = await self.equipment.list_items(self.user.id)
@@ -296,12 +333,22 @@ class EquipmentSkillSystemTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(event.kind == "followup_trigger" for event in result.events))
         self.assertTrue(any(event.kind == "followup" for event in result.events))
     async def test_battle_settlement_persists_both_sides_skill_growth(self):
+        opponent_identity = UserIdentity(
+            "test", "group", "two", "Two"
+        )
+        opponent = await self.users.get_or_create_user(opponent_identity)
+        async with await connect_db(self.db_path) as db:
+            await db.execute(
+                "UPDATE users SET level = 5 WHERE id IN (?, ?)",
+                (self.user.id, opponent.id),
+            )
+            await db.commit()
         service = BattleService(
             self.db_path, self.users, _NoopLLM(), self.equipment, self.skills
         )
         result = await service.battle(
             UserIdentity("test", "group", "one", "One"),
-            UserIdentity("test", "group", "two", "Two"),
+            opponent_identity,
             "全力猛攻",
         )
         self.assertTrue(result.skill_growths)
@@ -331,7 +378,7 @@ class EquipmentSkillSystemTests(unittest.IsolatedAsyncioTestCase):
             STRATEGY_PROFILES["全力猛攻"],
             17,
         )
-        self.assertEqual(result.engine_version, "sideview-v10")
+        self.assertEqual(result.engine_version, SideviewCombatEngine.ENGINE_VERSION)
         self.assertTrue(any(event.stamina is not None for event in result.events))
         self.assertTrue(any(event.kind == "skill_use" for event in result.events))
         usage = self.skills.usage_from_simulation(result)

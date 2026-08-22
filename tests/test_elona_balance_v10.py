@@ -54,15 +54,25 @@ class ElonaBalanceRuleTests(unittest.TestCase):
             attack_mode_attribute("two_hand_ranged", "bow", attrs), 33
         )
 
-    def test_defense_hit_and_resistance_are_natural_curves(self):
+    def test_v11_defense_hit_and_resistance_have_stable_soft_caps(self):
         self.assertGreater(
             physical_defense_multiplier(10, 20),
             physical_defense_multiplier(100, 20),
         )
-        self.assertAlmostEqual(resistance_multiplier(50, 10), 0.5)
-        self.assertEqual(hit_chance(1, 10_000, is_spell=False), 0.60)
-        self.assertEqual(hit_chance(1, 10_000, is_spell=True), 0.55)
-        self.assertLessEqual(hit_chance(10_000, 0, is_spell=False), 0.98)
+        self.assertEqual(
+            physical_defense_multiplier(100, 1),
+            physical_defense_multiplier(100, 100),
+        )
+        self.assertAlmostEqual(resistance_multiplier(50, 10), 0.75)
+        self.assertEqual(
+            resistance_multiplier(50, 1),
+            resistance_multiplier(50, 100),
+        )
+        self.assertEqual(hit_chance(1, 10_000, is_spell=False), 0.35)
+        self.assertEqual(hit_chance(1, 10_000, is_spell=True), 0.50)
+        self.assertLessEqual(hit_chance(10_000, 0, is_spell=False), 0.97)
+        self.assertLessEqual(hit_chance(10_000, 0, is_spell=True), 0.985)
+        self.assertLessEqual(resistance_multiplier(-10_000, 50), 1.35)
 
     def test_spell_schools_use_distinct_primary_attributes(self):
         magic_build = {

@@ -1,4 +1,4 @@
-"""Deterministic sideview-v10 archetype balance matrix.
+"""Deterministic archetype matrix for the current side-view combat engine.
 
 The default run executes 500 seeds for every directed matchup.  It is a
 diagnostic acceptance report: pronounced counters are allowed, while mirror
@@ -35,6 +35,11 @@ LEVELS = (1, 10, 25, 50, 100)
 AGGREGATE_TARGET = (0.30, 0.70)
 PAIR_TARGET = (0.10, 0.90)
 MIRROR_TARGET = (0.45, 0.55)
+
+
+def _is_timeout_finish_reason(finish_reason: str) -> bool:
+    """Return whether an engine finish reason belongs to the timeout family."""
+    return finish_reason == "timeout" or finish_reason.startswith("timeout_")
 
 
 @dataclass(frozen=True)
@@ -313,7 +318,9 @@ def run_benchmark(
                     games[attacker_name] += 1
                     games[defender_name] += 1
                     duration_ticks.append(result.duration_ticks)
-                    timeout_count += result.finish_reason == "timeout"
+                    timeout_count += _is_timeout_finish_reason(
+                        result.finish_reason
+                    )
                 directed_rates[
                     f"{attacker_name}_vs_{defender_name}"
                 ] = attacker_wins / seed_count

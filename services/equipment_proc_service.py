@@ -130,7 +130,9 @@ class EquipmentProcResolver:
                 self._pull_target(state, actor, target)
                 continue
             if proc.ability_id == "ragnarok":
-                self._ragnarok(state, actor, target, dealt)
+                self._ragnarok(
+                    state, actor, target, dealt, apply_damage
+                )
                 continue
 
             definition = (
@@ -158,7 +160,13 @@ class EquipmentProcResolver:
                     False,
                 )
             self.ability_runtime.apply_secondary(
-                state, actor, target, definition, proc_damage, rng
+                state,
+                actor,
+                target,
+                definition,
+                proc_damage,
+                rng,
+                apply_damage=apply_damage,
             )
 
     @staticmethod
@@ -250,22 +258,22 @@ class EquipmentProcResolver:
         )
 
     @staticmethod
-    def _ragnarok(state, actor, target, damage: int) -> None:
+    def _ragnarok(state, actor, target, damage: int, apply_damage) -> None:
         burst = max(1, round(damage * 0.60))
-        target.current_hp = max(0, target.current_hp - burst)
-        actor.damage_dealt += burst
-        state.events.append(
-            BattleEvent(
-                state.tick,
-                "equipment_proc_damage",
-                actor.snapshot.user_pk,
-                target.snapshot.user_pk,
-                value=burst,
-                remaining_hp=target.current_hp,
-                damage_type="fire",
-                skill_id="ragnarok",
-                damage_breakdown={"fire": burst},
-            )
+        apply_damage(
+            state,
+            actor,
+            target,
+            (
+                burst,
+                False,
+                False,
+                0,
+                "ragnarok",
+                {"fire": burst},
+            ),
+            "equipment_proc_damage",
+            False,
         )
         periodic = max(1, round(damage * 0.15))
         zone_id = f"ragnarok:{actor.snapshot.user_pk}:{state.tick}"

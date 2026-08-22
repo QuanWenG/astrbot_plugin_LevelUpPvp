@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import inspect
 import re
+import time
 from collections import defaultdict
 from collections.abc import AsyncGenerator
 
@@ -14,12 +16,14 @@ if "." in (__package__ or ""):
         RENDERER_REVISION,
         render_battle_report,
     )
+    from ..services.battle_report import BattleReportBuilder
     from ..services.image_renderer import render_text_card
 else:
     from services.battle_image_renderer import (
         RENDERER_REVISION,
         render_battle_report,
     )
+    from services.battle_report import BattleReportBuilder
     from services.image_renderer import render_text_card
 
 EXPECTED_RENDERER_REVISION = "astrbot-card-v3-light"
@@ -32,8 +36,10 @@ if RENDERER_REVISION != EXPECTED_RENDERER_REVISION:
     )
 
 try:
+    from ..models.chat_activity import ChatMessageContext
     from ..models.attributes import PRIMARY_ATTRIBUTE_IDS
-    from ..models.equipment import SLOT_LABELS
+    from ..models.equipment import ACTIVE_SOURCE_EFFECTS, SLOT_LABELS
+    from ..models.operation import stable_operation_seed
     from ..models.user import LevelDownEvent, LevelUpEvent, User, UserIdentity
     from ..services.attribute_service import (
         ADVANCED_ATTRIBUTE_LABELS,
@@ -57,10 +63,15 @@ try:
         ACTIVE_ABILITY_DEFINITIONS, SPELL_DEFINITIONS, TECHNIQUE_DEFINITIONS,
         ability_is_unlocked, spell_exp_required,
     )
+    from ..services.auto_equip_service import AutoEquipService
     from ..services import config
+    from ..services.chat_activity_service import format_chat_activity_settlement
+    from ..services.daily_growth_budget import daily_growth_day_window
 except ImportError:
+    from models.chat_activity import ChatMessageContext
     from models.attributes import PRIMARY_ATTRIBUTE_IDS
-    from models.equipment import SLOT_LABELS
+    from models.equipment import ACTIVE_SOURCE_EFFECTS, SLOT_LABELS
+    from models.operation import stable_operation_seed
     from models.user import LevelDownEvent, LevelUpEvent, User, UserIdentity
     from services.attribute_service import (
         ADVANCED_ATTRIBUTE_LABELS,
@@ -84,7 +95,10 @@ except ImportError:
         ACTIVE_ABILITY_DEFINITIONS, SPELL_DEFINITIONS, TECHNIQUE_DEFINITIONS,
         ability_is_unlocked, spell_exp_required,
     )
+    from services.auto_equip_service import AutoEquipService
     from services import config
+    from services.chat_activity_service import format_chat_activity_settlement
+    from services.daily_growth_budget import daily_growth_day_window
 
 
 """很不文明哦，好孩子别学"""
@@ -92,7 +106,7 @@ CHALLENGE_WAKE_WORDS = [
     "艾斯比",
     "啥比"
 ]
-MENTION_COMMAND_NAMES = ("重载装备表", "装备图鉴", "魔法书", "阅读", "法术", "战技", "修改登记", "装备详情", "训练技能", "技能栏", "签到", "面板", "加点", "排行", "登记", "挑战", "背包", "装备", "一键穿戴", "穿戴", "卸下", "技能", "学习", "给予", "副本", "副本详情")
+MENTION_COMMAND_NAMES = ("重载装备表", "装备图鉴", "魔法书", "阅读", "研制", "法术", "战技", "修改登记", "装备详情", "训练技能", "技能栏", "签到", "面板", "加点", "排行", "登记", "挑战", "战术", "复盘", "今日", "周常", "赛季", "工坊", "背包", "装备", "一键穿戴", "一键托管", "关闭托管", "穿戴", "卸下", "技能", "学习", "给予", "奈菲亚", "副本", "副本详情")
 MENTION_COMMAND_PATTERN = re.compile(
     rf"^/?({'|'.join(MENTION_COMMAND_NAMES)})(?:\s|$)"
 )
@@ -124,9 +138,17 @@ class LevelUpPvpCommandHandler:
         equipment_service=None,
         skill_service=None,
         build_service=None,
+        auto_equip_service=None,
+        auto_pilot_service=None,
         attribute_service=None,
         spell_service=None,
         dungeon_service=None,
+        operation_service=None,
+        operation_settlement_service=None,
+        workshop_service=None,
+        replay_service=None,
+        chat_activity_service=None,
+        chat_activity_settlement_service=None,
     ):
         self.context = context
         self.user_service = user_service
@@ -139,7 +161,17 @@ class LevelUpPvpCommandHandler:
         self.build_service = build_service
         self.attribute_service = attribute_service
         self.spell_service = spell_service
+        self.auto_equip_service = auto_equip_service or (
+            AutoEquipService(build_service) if build_service is not None else None
+        )
+        self.auto_pilot_service = auto_pilot_service
         self.dungeon_service = dungeon_service
+        self.operation_service = operation_service
+        self.operation_settlement_service = operation_settlement_service
+        self.workshop_service = workshop_service
+        self.replay_service = replay_service
+        self.chat_activity_service = chat_activity_service
+        self.chat_activity_settlement_service = chat_activity_settlement_service
 
     @staticmethod
     def _is_long_text(text: str) -> bool:
@@ -205,6 +237,89 @@ class LevelUpPvpCommandHandler:
             )
         except Exception:
             logger.exception("LevelUpPvp automatic check-in failed")
+
+    async def chat_activity(self, event: AstrMessageEvent) -> AsyncGenerator:
+        """Settle organic-chat growth while keeping ordinary chatter quiet."""
+
+        if (
+            self.chat_activity_service is None
+            or self.chat_activity_settlement_service is None
+        ):
+            return
+        group_id = str(event.get_group_id() or "")
+        sender_id = str(event.get_sender_id() or "")
+        if (
+            not group_id
+            or not sender_id
+            or sender_id == str(event.get_self_id() or "")
+        ):
+            return
+        try:
+            user = await self.user_service.get_or_create_user(
+                self._identity_from_event(event)
+            )
+            occurred_at_ts = self._chat_event_timestamp(event)
+            context = ChatMessageContext(
+                event_key=self._chat_event_key(event, occurred_at_ts),
+                group_id=group_id,
+                user_pk=user.id,
+                content=event.get_message_str() or "",
+                occurred_at_ts=occurred_at_ts,
+                is_bot=False,
+                is_command=self._is_chat_command(event),
+                is_group_message=True,
+            )
+            decision = await self.chat_activity_service.prepare_message(context)
+            if not decision.should_settle:
+                return
+            result = await self.chat_activity_settlement_service.settle(
+                decision.intent
+            )
+            if not result.applied:
+                return
+            # Tiny EXP gains are intentionally silent.  Drops and level-ups are
+            # the moments worth interrupting a real group conversation for.
+            if (
+                result.equipment is None
+                and result.spellbook is None
+                and not result.level_ups
+            ):
+                return
+            username = " ".join(
+                str(
+                    getattr(user, "nickname", "")
+                    or event.get_sender_name()
+                    or event.get_sender_id()
+                    or "未知用户"
+                ).split()
+            )
+            text = format_chat_activity_settlement(result, username=username)
+            if result.equipment is not None:
+                item_id = getattr(result.equipment, "id", None)
+                if item_id:
+                    text += f"\n可用 /装备详情 {item_id} 查看，或 /一键穿戴 尝试换装。"
+            if result.spellbook is not None:
+                book_id = getattr(result.spellbook, "id", None)
+                if book_id:
+                    text += f"\n可用 /阅读 {book_id} 尝试研读。"
+            if text:
+                yield await self.reply_text(event, text, "LevelUpPvp 聊天奇遇")
+        except Exception:
+            # Ambient progression must never turn a normal conversation into
+            # an error notification.  The durable intent remains retryable.
+            logger.exception("LevelUpPvp chat activity failed")
+
+    async def ambient_activity(self, event: AstrMessageEvent) -> AsyncGenerator:
+        """Settle check-in and chat growth with at most one visible response."""
+
+        checkin_replies = [item async for item in self.auto_checkin(event)]
+        chat_replies = [item async for item in self.chat_activity(event)]
+        # A player's first interaction may naturally be a command.  It still
+        # consumes today's check-in, but the command's own reply should remain
+        # the only visible response instead of producing a noisy extra card.
+        visible_checkin = [] if self._is_chat_command(event) else checkin_replies
+        for reply in chat_replies or visible_checkin:
+            yield reply
 
     async def ensure_sender_registered(self, event: AstrMessageEvent) -> bool:
         """Silently register a new group member from the platform username."""
@@ -328,9 +443,18 @@ class LevelUpPvpCommandHandler:
             _, equipped = await self.equipment_service.get_loadout(user.id)
             equipped_ids = {item.id for item in equipped}
             page = max(1, int(page or 1)); size = 10; start = (page - 1) * size
-            lines = [f"{self._display_name(user)} 的背包 第{page}页"]
+            total_pages = max(1, (len(items) + size - 1) // size)
+            lines = [
+                f"{self._display_name(user)} 的背包 · 共{len(items)}件 · "
+                f"第{page}/{total_pages}页"
+            ]
             for item in items[start:start + size]:
-                mark = "[已装备]" if item.id in equipped_ids else ""
+                marks = []
+                if item.id in equipped_ids:
+                    marks.append("已装备")
+                if bool(getattr(item, "is_locked", False)):
+                    marks.append("已收藏")
+                mark = f"[{'/'.join(marks)}]" if marks else ""
                 material = material_for(item.material)
                 resolved_weight = actual_weight(item.weight, item.material)
                 lines.append(
@@ -339,6 +463,10 @@ class LevelUpPvpCommandHandler:
                     f"重量{item.weight:g}×{material.weight_multiplier:g}={resolved_weight:.3f}{mark}"
                 )
             if len(lines) == 1: lines.append("这一页没有装备。")
+            lines.append(
+                "整理：/工坊 整理 支配（只选完全更弱）；"
+                "背包很满可 /工坊 整理 优秀（普通+优秀，二次确认）"
+            )
             yield await self.reply_text(
                 event, "\n".join(lines), "LevelUpPvp 背包"
             )
@@ -549,6 +677,8 @@ class LevelUpPvpCommandHandler:
                 if affix.get("type") == "trigger_ability"
             )
             lines = [f"#{item.id} {item.name}"]
+            if bool(getattr(item, "is_locked", False)):
+                lines.append("保护：已收藏锁定（工坊不会分解）")
             if item.description:
                 lines.append(f"介绍：{item.description}")
             lines.extend(
@@ -575,10 +705,25 @@ class LevelUpPvpCommandHandler:
             )
             source_effects = tuple(getattr(item, "source_effects", ()))
             if source_effects:
-                lines.append(
-                    "资料效果（当前未结算）："
-                    + "、".join(source_effects)
+                active_effects = tuple(
+                    effect
+                    for effect in source_effects
+                    if effect in ACTIVE_SOURCE_EFFECTS
                 )
+                reference_effects = tuple(
+                    effect
+                    for effect in source_effects
+                    if effect not in ACTIVE_SOURCE_EFFECTS
+                )
+                if active_effects:
+                    lines.append(
+                        "已生效效果：" + "、".join(active_effects)
+                    )
+                if reference_effects:
+                    lines.append(
+                        "资料效果（当前未结算）："
+                        + "、".join(reference_effects)
+                    )
             yield await self.reply_text(
                 event, "\n".join(lines), "LevelUpPvp 装备详情"
             )
@@ -637,18 +782,12 @@ class LevelUpPvpCommandHandler:
     async def auto_equip(self, event):
         try:
             user = await self._own_user(event)
-            items = await self.equipment_service.list_items(user.id)
-            if not items:
-                yield await self.reply_text(event, "背包里没有装备。")
-                return
-            skills, _ = await self.skill_service.get_skills(user)
-            attributes = self.attribute_service.attributes_for_user(user)
-            dominant = self._dominant_attribute(attributes)
-            assignments = self._select_optimal_loadout(
-                items, user, skills, dominant
+            assignments = await self.auto_equip_service.select_for_user(
+                user,
+                respect_locked=True,
             )
             if not assignments:
-                yield await self.reply_text(event, "没有可选的装备。")
+                yield await self.reply_text(event, "背包里没有可选装备。")
                 return
             results = await self.equipment_service.auto_equip(user.id, assignments)
             lines = [f"{self._display_name(user)} 已自动穿戴"]
@@ -664,230 +803,59 @@ class LevelUpPvpCommandHandler:
         except Exception as exc:
             yield await self.reply_text(event, f"一键穿戴失败：{exc}")
 
-    @staticmethod
-    def _dominant_attribute(attributes) -> str:
-        return max(PRIMARY_ATTRIBUTE_IDS, key=lambda name: attributes.get(name))
+    async def auto_pilot(self, event, enabled: bool):
+        """Toggle silent background automation for the current player."""
+        if self.auto_pilot_service is None:
+            yield await self.reply_text(event, "托管功能未启用。")
+            return
+        try:
+            user = await self._own_user(event)
+            if enabled:
+                await self.auto_pilot_service.enable(
+                    self._identity_from_event(event),
+                    origin_umo=getattr(event, "unified_msg_origin", ""),
+                )
+                yield await self.reply_text(
+                    event,
+                    "一键托管已开启，后续将静默自动运营。",
+                    "LevelUpPvp 托管",
+                )
+            else:
+                await self.auto_pilot_service.disable(user.id)
+                yield await self.reply_text(
+                    event,
+                    "一键托管已关闭。",
+                    "LevelUpPvp 托管",
+                )
+        except Exception as exc:
+            yield await self.reply_text(event, f"托管操作失败：{exc}")
+
+    def _dominant_attribute(self, attributes) -> str:
+        return self.auto_equip_service.dominant_attribute(attributes)
 
     def _score_item(self, item, user, dominant_attr: str) -> float:
-        material = material_for(item.material)
-        level_factor = max(
-            0.50, 1.0 - max(0, item.item_level - user.level) * 0.03
-        )
-        quality_factor = QUALITY_MULTIPLIERS.get(item.quality, 1.0)
-        score = 0.0
-        for stat, raw_value in item.base_stats.items():
-            raw_value = float(raw_value)
-            if stat in {"atk", "weapon_power"} and item.item_type == "weapon":
-                value = (
-                    raw_value * material.attack_factor * quality_factor
-                    + item.enhancement_level
-                    + item.item_level // 10
-                ) * level_factor
-                score += value * 3.0
-            elif stat in {"defense", "armor_power"}:
-                value = (
-                    raw_value * material.defense_factor * quality_factor
-                    + item.enhancement_level * 2
-                ) * level_factor
-                score += value * 2.0
-            elif stat == "accuracy":
-                score += (
-                    raw_value * material.accuracy_factor
-                    * quality_factor * level_factor * 0.5
-                )
-            elif stat == "evasion":
-                score += (
-                    raw_value * material.evasion_factor
-                    * quality_factor * level_factor * 0.5
-                )
-            elif stat in PRIMARY_ATTRIBUTE_IDS:
-                value = raw_value * quality_factor * level_factor
-                weight = 2.0 if stat == dominant_attr else 0.5
-                score += value * weight
-            elif stat == "hp":
-                score += raw_value * quality_factor * level_factor * 10 * 0.1
-            elif stat == "speed":
-                score += raw_value * quality_factor * level_factor * 3 * 0.2
-            elif stat == "luck":
-                score += raw_value * quality_factor * level_factor * 0.5
-        effective_inherent = effective_inherent_affixes(
-            item.inherent_affixes, user.level, item.item_level
-        )
-        for affix in (
-            effective_inherent
-            + item.random_affixes
-            + item.fusion_affixes
-        ):
-            kind = str(affix.get("type", ""))
-            value = float(affix.get("value", 0))
-            if kind == "stat_flat":
-                stat = LEGACY_ATTRIBUTE_MAP.get(
-                    str(affix.get("stat", "")),
-                    str(affix.get("stat", "")),
-                )
-                if stat in PRIMARY_ATTRIBUTE_IDS:
-                    weight = 2.0 if stat == dominant_attr else 0.5
-                    score += value * weight
-            elif kind == "advanced_stat":
-                score += value * 0.5
-            elif kind == "skill_level":
-                score += value * 5.0
-            elif kind == "trigger_ability":
-                score += value * 3.0
-            elif kind == "element_resistance":
-                score += value * 0.3
-            else:
-                score += value
-        if item.item_type == "weapon":
-            weights = WEAPON_PRIMARY_WEIGHTS.get(
-                item.weapon_type, WEAPON_PRIMARY_WEIGHTS[""]
-            )
-            match = weights.get(dominant_attr, 0)
-            score *= 0.2 + match
-        return score
+        return self.auto_equip_service.score_item(item, user, dominant_attr)
 
     def _select_optimal_loadout(self, items, user, skills, dominant_attr: str):
-        shields = []
-        weapons = []
-        rings = []
-        by_slot = defaultdict(list)
-        for item in items:
-            if item.hand_mode == "shield":
-                shields.append(item)
-            elif item.item_type == "weapon":
-                weapons.append(item)
-            elif item.equip_slot in {"left_finger", "right_finger"}:
-                rings.append(item)
-            else:
-                by_slot[item.equip_slot].append(item)
-        base_slots = {}
-        for slot in (
-            "head", "neck", "back", "body", "wrist", "waist", "feet"
-        ):
-            candidates = by_slot.get(slot)
-            if candidates:
-                best = max(
-                    candidates,
-                    key=lambda i: self._score_item(i, user, dominant_attr),
-                )
-                base_slots[slot] = best
-        scored_rings = sorted(
-            rings,
-            key=lambda i: self._score_item(i, user, dominant_attr),
-            reverse=True,
+        return self.auto_equip_service.select_optimal_loadout(
+            items,
+            user,
+            skills,
+            dominant_attr,
         )
-        for index, ring in enumerate(scored_rings[:2]):
-            base_slots[("left_finger", "right_finger")[index]] = ring
-        hand_options = self._generate_hand_options(
-            weapons, shields, user, dominant_attr
-        )
-        best_score = -1.0
-        best_slots = dict(base_slots)
-        for hand_slots, _hand_items in hand_options:
-            test_slots = dict(base_slots)
-            test_slots.update(hand_slots)
-            slot_ids = {slot: item.id for slot, item in test_slots.items()}
-            unique_items = list(
-                {item.id: item for item in test_slots.values()}.values()
-            )
-            build = self.build_service.resolve_equipment(
-                user, slot_ids, unique_items, skills
-            )
-            score = self._score_build(build, dominant_attr)
-            if score > best_score:
-                best_score = score
-                best_slots = test_slots
-        seen_ids = set()
-        assignments = []
-        for slot, item in best_slots.items():
-            if item.id in seen_ids:
-                continue
-            seen_ids.add(item.id)
-            if slot in {"main_hand", "off_hand", "left_finger", "right_finger"}:
-                assignments.append((item.id, slot))
-            else:
-                assignments.append((item.id, ""))
-        return assignments
 
     def _generate_hand_options(self, weapons, shields, user, dominant_attr):
-        options = []
-        two_hand = [
-            w for w in weapons if w.hand_mode.startswith("two_hand")
-        ]
-        one_hand = [
-            w for w in weapons if not w.hand_mode.startswith("two_hand")
-        ]
-        for w in two_hand:
-            options.append(({"main_hand": w, "off_hand": w}, [w]))
-        if one_hand and shields:
-            best_w = max(
-                one_hand,
-                key=lambda i: self._score_item(i, user, dominant_attr),
-            )
-            best_s = max(
-                shields,
-                key=lambda i: self._score_item(i, user, dominant_attr),
-            )
-            options.append(
-                ({"main_hand": best_w, "off_hand": best_s}, [best_w, best_s])
-            )
-        if len(one_hand) >= 2:
-            scored = sorted(
-                one_hand,
-                key=lambda i: self._score_item(i, user, dominant_attr),
-                reverse=True,
-            )
-            options.append(
-                (
-                    {"main_hand": scored[0], "off_hand": scored[1]},
-                    [scored[0], scored[1]],
-                )
-            )
-        if one_hand:
-            best_w = max(
-                one_hand,
-                key=lambda i: self._score_item(i, user, dominant_attr),
-            )
-            options.append(({"main_hand": best_w}, [best_w]))
-        if shields:
-            best_s = max(
-                shields,
-                key=lambda i: self._score_item(i, user, dominant_attr),
-            )
-            options.append(({"off_hand": best_s}, [best_s]))
-        return options
+        return self.auto_equip_service._generate_hand_options(
+            weapons,
+            shields,
+            user,
+            dominant_attr,
+            {"main_hand", "off_hand"},
+        )
 
     @staticmethod
     def _score_build(equipment, dominant_attr: str) -> float:
-        weapon_match = 1.0
-        if equipment.weapon_type:
-            weights = WEAPON_PRIMARY_WEIGHTS.get(
-                equipment.weapon_type, WEAPON_PRIMARY_WEIGHTS[""]
-            )
-            match = weights.get(dominant_attr, 0)
-            weapon_match = 0.3 + match * 0.7
-        score = (
-            equipment.weapon_power * 3.0
-            * equipment.damage_multiplier * weapon_match
-        )
-        score += equipment.armor_power * 2.0
-        for attr in PRIMARY_ATTRIBUTE_IDS:
-            value = equipment.stat_modifiers.get(attr, 0)
-            weight = 2.0 if attr == dominant_attr else 0.5
-            score += value * weight
-        for value in equipment.skill_modifiers.values():
-            score += value * 3.0
-        effects = equipment.combat_effects
-        score += effects.get("max_hp", 0) * 0.1
-        score += effects.get("accuracy", 0) * 0.5
-        score += effects.get("evasion", 0) * 0.5
-        score += effects.get("critical_rate", 0) * 50.0
-        score += effects.get("critical_damage", 0) * 20.0
-        score += effects.get("block_rate", 0) * 30.0
-        score += effects.get("knockback_resistance", 0) * 20.0
-        if equipment.overloaded:
-            score *= 0.5
-        return score
+        return AutoEquipService._score_build(equipment, dominant_attr)
 
     async def skills(self, event):
         try:
@@ -969,18 +937,90 @@ class LevelUpPvpCommandHandler:
     async def spellbooks(self, event, page: int = 1):
         try:
             user = await self._own_user(event)
-            books = await self.spell_service.list_books(user.id)
-            page = max(1, int(page)); page_size = 10
-            visible = books[(page - 1) * page_size:page * page_size]
-            lines = [f"{self._display_name(user)} 的魔法书（第{page}页）"]
-            if not visible:
-                lines.append("暂无魔法书。当前版本只提供内部原子发放接口。")
-            for book in visible:
-                definition = SPELL_DEFINITIONS[book.spell_id]
-                attribute = ATTRIBUTE_LABELS.get(definition.reading_attribute, definition.reading_attribute)
+            library = await self.spell_service.get_book_library(user)
+            page_size = 6
+            total_pages = max(
+                1, (len(library.entries) + page_size - 1) // page_size
+            )
+            page = min(total_pages, max(1, int(page)))
+            visible = library.entries[
+                (page - 1) * page_size:page * page_size
+            ]
+            held_count = sum(entry.quantity for entry in library.entries)
+            lines = [
+                f"{self._display_name(user)} 的魔法书（第{page}/{total_pages}页）",
+                f"法术图鉴 {library.learned_count}/{library.total_spell_count}｜"
+                f"持有 {held_count}本/{len(library.entries)}种｜"
+                f"咒文残页 {library.research_pages}张",
+            ]
+            if not library.entries:
                 lines.append(
-                    f"#{book.id} {definition.name} ×{book.quantity}"
-                    f"（难度{definition.reading_difficulty}，主属性：{attribute}）"
+                    "暂无魔法书。正常聊天中的奇遇与奈菲亚探索都有机会发现。"
+                )
+            for entry in visible:
+                definition = SPELL_DEFINITIONS[entry.spell_id]
+                attribute = ATTRIBUTE_LABELS.get(
+                    entry.reading_attribute, entry.reading_attribute
+                )
+                school = SKILL_DEFINITIONS.get(entry.school_id)
+                school_name = school.name if school else entry.school_id
+                if entry.learned_spell is None:
+                    learned = "未学"
+                else:
+                    learned = (
+                        f"已学Lv.{entry.learned_spell.level}·"
+                        f"潜力{entry.learned_spell.potential}%"
+                    )
+                references = "、".join(
+                    f"#{item.id}" + (f"×{item.quantity}" if item.quantity > 1 else "")
+                    for item in entry.items
+                )
+                lines.append(
+                    f"《{definition.name}》×{entry.quantity} [{learned}]｜"
+                    f"{school_name}·{attribute}·难度{entry.reading_difficulty}"
+                )
+                if entry.research_pages_per_book:
+                    reading_state = (
+                        f"潜力已满：每本转化+{entry.research_pages_per_book}残页"
+                    )
+                    next_step = f"/阅读 {entry.spell_name} 转化最老一本"
+                else:
+                    reading_state = (
+                        f"成功率{entry.success_chance:.1%}｜"
+                        f"研读进度{entry.study_progress:.0%}"
+                    )
+                    if entry.school_level < 1:
+                        next_step = f"/学习 {school_name} 后再阅读"
+                    elif entry.studied_today:
+                        next_step = "已研读，等待下个04:00日界线"
+                    else:
+                        next_step = f"/阅读 {entry.spell_name}（默认最老#{entry.oldest_book_id}）"
+                lines.append(
+                    f"  可用 {references}｜{reading_state}｜下一步：{next_step}"
+                )
+            affordable = [
+                option for option in library.craft_options if option.affordable
+            ]
+            if affordable:
+                suggestions = "、".join(
+                    f"{option.spell_name}({option.cost})"
+                    for option in affordable[:3]
+                )
+                lines.append(
+                    f"残页可定向研制未学书：{suggestions}；"
+                    "使用 /研制 法术名。"
+                )
+            elif library.craft_options:
+                target = library.craft_options[0]
+                missing = max(0, target.cost - library.research_pages)
+                lines.append(
+                    f"残页目标：《{target.spell_name}》需{target.cost}张，"
+                    f"还差{missing}张；成功读懂重复书会恢复潜力并抄录残页。"
+                )
+            if visible:
+                lines.append(
+                    "可用 /阅读 法术名 自动消耗最老一本，也可 /阅读 #编号；"
+                    "读失败不会损失魔法书。"
                 )
             yield await self.reply_text(
                 event, "\n".join(lines), "LevelUpPvp 魔法书"
@@ -988,24 +1028,85 @@ class LevelUpPvpCommandHandler:
         except Exception as exc:
             yield await self.reply_text(event, f"查看魔法书失败：{exc}")
 
-    async def read_spellbook(self, event, book_id: int):
+    async def read_spellbook(self, event, book_id):
         try:
             user = await self._own_user(event)
-            result = await self.spell_service.read_book(user, int(book_id))
-            outcome = "阅读成功" if result.success else "阅读失败"
-            detail = ""
-            if result.spell:
+            book_reference = str(book_id or "").strip().lstrip("#")
+            if not book_reference:
+                raise ValueError("用法：/阅读 魔法书ID或法术名")
+            result = await self.spell_service.read_book(user, book_reference)
+            if result.outcome == "research_converted":
                 definition = SPELL_DEFINITIONS[result.spell.spell_id]
-                detail = f"，{definition.name} Lv.{result.spell.level} 潜力{result.spell.potential}%"
+                yield await self.reply_text(
+                    event,
+                    f"《{definition.name}》潜力已满，重复书已化为"
+                    f"{result.research_pages_gain}张咒文残页。\n"
+                    f"当前残页：{result.research_pages_balance}张；"
+                    "用 /魔法书 查看可定向研制的未学法术。",
+                )
+                return
+            detail = ""
+            if result.success and result.spell:
+                definition = SPELL_DEFINITIONS[result.spell.spell_id]
+                if result.outcome == "learned":
+                    detail = (
+                        f"\n你永久学会了「{definition.name}」Lv.{result.spell.level}。"
+                        f"\n让它进入战斗：/技能栏 1 {definition.name}"
+                    )
+                else:
+                    detail = (
+                        f"\n「{definition.name}」潜力恢复至"
+                        f"{result.spell.potential}%（+{result.potential_gain}%）。"
+                    )
+                    if result.research_pages_gain:
+                        detail += (
+                            f"\n你同时抄录了{result.research_pages_gain}张咒文残页，"
+                            f"当前共{result.research_pages_balance}张。"
+                        )
             attribute = ATTRIBUTE_LABELS.get(result.reading_attribute, result.reading_attribute)
+            if result.success:
+                text = (
+                    f"阅读成功（阅读能力{result.reading_power:.0f}，"
+                    f"难度{result.reading_difficulty}，主属性：{attribute}，"
+                    f"成功率{result.chance:.1%}）。已消耗{result.consumed}本。"
+                    f"{detail}"
+                )
+            else:
+                text = (
+                    f"你暂时没能读懂这本书（阅读能力{result.reading_power:.0f}，"
+                    f"难度{result.reading_difficulty}，主属性：{attribute}，"
+                    f"本次成功率{result.chance:.1%}）。\n"
+                    f"魔法书完好保留；研读进度已到{result.study_progress:.0%}，"
+                    "下个04:00日界线后可继续研读，届时成功率会保留提升。"
+                )
             yield await self.reply_text(
                 event,
-                f"{outcome}（阅读能力{result.reading_power:.0f}，"
-                f"难度{result.reading_difficulty}，主属性：{attribute}，"
-                f"成功率{result.chance:.1%}，已消耗1本）{detail}"
+                text,
             )
         except Exception as exc:
-            yield await self.reply_text(event, f"阅读失败：{exc}")
+            retry = (
+                f"\n学完对应学派后继续：/阅读 {str(book_id).strip()}"
+                if "/学习" in str(exc)
+                else ""
+            )
+            yield await self.reply_text(event, f"阅读失败：{exc}{retry}")
+
+    async def craft_spellbook(self, event, spell_name: str):
+        try:
+            user = await self._own_user(event)
+            name = str(spell_name or "").strip()
+            if not name:
+                raise ValueError("用法：/研制 法术名")
+            result = await self.spell_service.craft_book(user, name)
+            yield await self.reply_text(
+                event,
+                f"定向研制完成：《{result.spell_name}》#{result.item.id}。\n"
+                f"消耗{result.pages_spent}张咒文残页，"
+                f"剩余{result.pages_balance}张。\n"
+                f"下一步：/阅读 {result.item.id}",
+            )
+        except Exception as exc:
+            yield await self.reply_text(event, f"研制失败：{exc}")
 
     async def spells(self, event):
         try:
@@ -1025,6 +1126,8 @@ class LevelUpPvpCommandHandler:
                     f"EXP {progress_percent(spell.exp, spell_exp_required(spell.level)):.1f}% "
                     f"潜力{spell.potential}%"
                 )
+            if spells:
+                lines.append("装入战斗栏：/技能栏 位置 法术名（例如 /技能栏 1 魔法箭）")
             yield await self.reply_text(
                 event, "\n".join(lines), "LevelUpPvp 法术"
             )
@@ -1455,6 +1558,585 @@ class LevelUpPvpCommandHandler:
             logger.exception("LevelUpPvp battle failed")
             yield await self.reply_text(event, f"挑战失败：{exc}")
 
+    async def tactics(
+        self,
+        event: AstrMessageEvent,
+        args: str = "",
+    ) -> AsyncGenerator:
+        """View or update the persistent opening/midgame/endgame tactic plan."""
+
+        registration_error = await self._registration_error(event)
+        if registration_error:
+            yield await self.reply_text(event, registration_error)
+            return
+        try:
+            identity = self._identity_from_event(event)
+            raw = str(args or "").strip()
+            if not raw:
+                plan = await self.battle_service.get_tactic_plan(identity)
+                summary = self.battle_service.tactic_loadout_service.format_plan(
+                    plan
+                )
+                yield await self.reply_text(
+                    event,
+                    "当前三阶段战术：\n"
+                    f"{summary}\n"
+                    "六大战术：压制、反制、游击、控制、坚守、奇策。\n"
+                    "设置：/战术 开局 中盘 终盘\n"
+                    "例：/战术 游击 控制 奇策",
+                    "LevelUpPvp 战术",
+                )
+                return
+            tokens = [
+                token
+                for token in re.split(r"[\s,/|｜]+", raw)
+                if token
+            ]
+            if len(tokens) != 3:
+                raise ValueError(
+                    "请依次填写开局、中盘、终盘三个战术，"
+                    "例如：/战术 游击 控制 奇策"
+                )
+            plan = await self.battle_service.set_tactic_plan(
+                identity,
+                tokens[0],
+                tokens[1],
+                tokens[2],
+            )
+            summary = self.battle_service.tactic_loadout_service.format_plan(
+                plan
+            )
+            yield await self.reply_text(
+                event,
+                "战术方案已保存。以后进攻未临时指定策略、以及被挑战时，"
+                "都会使用它：\n"
+                f"{summary}",
+                "LevelUpPvp 战术",
+            )
+        except Exception as exc:
+            logger.exception("LevelUpPvp tactic plan failed")
+            yield await self.reply_text(event, f"战术设置失败：{exc}")
+
+    async def operations(
+        self,
+        event: AstrMessageEvent,
+        args: str = "",
+    ) -> AsyncGenerator:
+        """Show the group's rotating v11 content or settle completed bundles."""
+
+        if self.operation_service is None:
+            yield await self.reply_text(event, "今日运营功能未启用。")
+            return
+        registration_error = await self._registration_error(event)
+        if registration_error:
+            yield await self.reply_text(event, registration_error)
+            return
+        try:
+            user = await self._own_user(event)
+            group_id = str(event.get_group_id() or user.group_id or "global")
+            action = str(args or "").strip()
+            if action in {"领取", "领奖", "claim"}:
+                lines = ["运营奖励结算："]
+                for label, claim in (
+                    (
+                        "每日",
+                        await self.operation_service.claim_daily_reward(
+                            user_pk=user.id,
+                            group_id=group_id,
+                        ),
+                    ),
+                    (
+                        "每周",
+                        await self.operation_service.claim_weekly_reward(
+                            user_pk=user.id,
+                            group_id=group_id,
+                        ),
+                    ),
+                ):
+                    if not claim.eligible:
+                        lines.append(
+                            f"{label}：进度 {claim.completed_count}/"
+                            f"{claim.required_count}，尚未完成"
+                        )
+                        continue
+                    if (
+                        claim.reward_intent is None
+                        or self.operation_settlement_service is None
+                    ):
+                        lines.append(f"{label}：奖励已预留，等待结算服务")
+                        continue
+                    settled = await self.operation_settlement_service.settle(
+                        user_pk=user.id,
+                        intent=claim.reward_intent,
+                    )
+                    if label == "每日":
+                        await self._record_daily_reward_progress(
+                            user,
+                            group_id,
+                            claim.reward_intent.reward_key,
+                        )
+                    if not settled.applied:
+                        lines.append(f"{label}：已经领取过，不会重复发放")
+                        continue
+                    reward_parts = []
+                    if settled.scrap:
+                        reward_parts.append(f"工坊碎片 +{settled.scrap}")
+                    if settled.season_tokens:
+                        reward_parts.append(f"赛季币 +{settled.season_tokens}")
+                    if settled.experience:
+                        reward_parts.append(f"经验 +{settled.experience}")
+                    if settled.equipment:
+                        reward_parts.append(
+                            "装备 "
+                            + "、".join(item.name for item in settled.equipment)
+                        )
+                    lines.append(f"{label}：" + "，".join(reward_parts))
+                yield await self.reply_text(
+                    event,
+                    "\n".join(lines),
+                    "LevelUpPvp 运营奖励",
+                )
+                return
+
+            overview = await self.operation_service.overview(
+                user_pk=user.id,
+                group_id=group_id,
+            )
+            if action in {"周常", "周", "weekly"}:
+                lines = self._format_weekly_operations(overview)
+            elif action in {"赛季", "season"}:
+                lines = self._format_season(overview)
+            else:
+                dungeon = None
+                if self.dungeon_service is not None:
+                    dungeon = self._default_nefia_dungeon(
+                        user.level,
+                        group_id,
+                        overview.periods.daily.key,
+                    )
+                lines = self._format_daily_operations(overview, dungeon)
+            yield await self.reply_text(
+                event,
+                "\n".join(lines),
+                "LevelUpPvp 今日运营",
+            )
+        except Exception as exc:
+            logger.exception("LevelUpPvp operations failed")
+            yield await self.reply_text(event, f"查看今日运营失败：{exc}")
+
+    async def replay(
+        self,
+        event: AstrMessageEvent,
+        args: str = "",
+    ) -> AsyncGenerator:
+        """Explain the latest group battle, or one explicitly numbered battle."""
+
+        if self.replay_service is None:
+            yield await self.reply_text(event, "战斗复盘功能未启用。")
+            return
+        registration_error = await self._registration_error(event)
+        if registration_error:
+            yield await self.reply_text(event, registration_error)
+            return
+        try:
+            raw = str(args or "").strip()
+            if raw and (not raw.isdigit() or int(raw) <= 0):
+                raise ValueError("用法：/复盘 [战斗ID]")
+            identity = self._identity_from_event(event)
+            battle_id = int(raw) if raw else None
+            view = await self.replay_service.get_replay(
+                identity,
+                battle_id=battle_id,
+            )
+            if view is None:
+                yield await self.reply_text(
+                    event,
+                    "没有找到可查看的战斗记录。先和群友打一场吧。",
+                )
+                return
+            view_group_id = str(
+                getattr(view, "group_id", identity.group_id) or ""
+            )
+            if view_group_id == identity.group_id:
+                user = await self.user_service.get_or_create_user(identity)
+                await self._record_replay_progress(user, view.battle_id)
+            yield await self.reply_text(
+                event,
+                self.replay_service.format_replay(view),
+                f"LevelUpPvp 复盘 #{view.battle_id}",
+            )
+        except Exception as exc:
+            logger.exception("LevelUpPvp replay failed")
+            yield await self.reply_text(event, f"查看复盘失败：{exc}")
+
+    async def workshop(
+        self,
+        event: AstrMessageEvent,
+        args: str = "",
+    ) -> AsyncGenerator:
+        """Salvage dead drops or preview/decide a directed affix rework."""
+
+        if self.workshop_service is None:
+            yield await self.reply_text(event, "工坊功能未启用。")
+            return
+        registration_error = await self._registration_error(event)
+        if registration_error:
+            yield await self.reply_text(event, registration_error)
+            return
+        try:
+            user = await self._own_user(event)
+            tokens = str(args or "").strip().split()
+            if not tokens:
+                wallet = await self.workshop_service.wallet(user.id)
+                yield await self.reply_text(
+                    event,
+                    "装备工坊\n"
+                    f"碎片：{wallet.scrap_balance}（累计获得 "
+                    f"{wallet.lifetime_earned} / 消耗 {wallet.lifetime_spent}）\n"
+                    f"赛季币：{wallet.season_tokens}\n"
+                    "分解：/工坊 分解 装备ID\n"
+                    "收藏：/工坊 收藏 装备ID；取消：/工坊 取消收藏 装备ID\n"
+                    "普通整理：/工坊 整理 普通\n"
+                    "快速整理：/工坊 整理 优秀（普通+优秀，需二次确认）\n"
+                    "安全整理：/工坊 整理 支配（同槽同方向完全更弱才入选）\n"
+                    "预览：/工坊 重铸 装备ID 力量|灵巧|射击|奥术|防御|奇运\n"
+                    "刻印：/工坊 刻印 装备ID 方向（额外20赛季币，必出目标词条）\n"
+                    "决定：/工坊 接受 装备ID  或  /工坊 放弃 装备ID\n"
+                    "重铸先扣碎片再展示候选；放弃不会返还费用。",
+                    "LevelUpPvp 工坊",
+                )
+                return
+            action = tokens[0]
+            if action == "分解" and len(tokens) == 2:
+                result = await self.workshop_service.salvage(
+                    user.id,
+                    int(tokens[1]),
+                )
+                await self._record_workshop_progress(
+                    user,
+                    f"salvage:{result.equipment_id}",
+                )
+                text = (
+                    f"已分解「{result.equipment_name}」"
+                    f"（Lv.{result.item_level} {result.quality}）\n"
+                    f"碎片 +{result.scrap_gained}，当前 {result.balance_after}"
+                )
+            elif action in {"收藏", "锁定"} and len(tokens) == 2:
+                item = await self.equipment_service.set_item_locked(
+                    user.id,
+                    int(tokens[1]),
+                    True,
+                )
+                text = (
+                    f"已收藏锁定 #{item.id}「{item.name}」。\n"
+                    "所有批量整理和单件分解都会跳过它。"
+                )
+            elif action in {"取消收藏", "解锁"} and len(tokens) == 2:
+                item = await self.equipment_service.set_item_locked(
+                    user.id,
+                    int(tokens[1]),
+                    False,
+                )
+                text = f"已取消收藏 #{item.id}「{item.name}」。"
+            elif action == "整理" and len(tokens) == 2:
+                result = await self.workshop_service.preview_bulk_salvage(
+                    user.id,
+                    tokens[1],
+                )
+                if result.policy_id == "dominated":
+                    examples = []
+                    for item in result.dominated_items[:8]:
+                        quality = QUALITY_LABELS.get(item.quality, item.quality)
+                        keeper_quality = QUALITY_LABELS.get(
+                            item.keeper_quality,
+                            item.keeper_quality,
+                        )
+                        directions = "、".join(item.direction_labels)
+                        examples.append(
+                            f"#{item.equipment_id} {quality}{item.equipment_name} "
+                            f"Lv.{item.item_level} → 保留#{item.keeper_id} "
+                            f"{keeper_quality}{item.keeper_name} Lv.{item.keeper_level}"
+                            f"〔{item.slot_label}/{directions}〕"
+                        )
+                    if result.item_count > 8:
+                        examples.append(f"……另有{result.item_count - 8}件")
+                    text = (
+                        f"安全整理预览：{result.item_count}件被完全支配装备\n"
+                        + "\n".join(examples)
+                        + f"\n预计碎片 +{result.scrap_total}\n"
+                        "仅纳入普通/优秀/精良的普通星装备；已装备、收藏锁定、"
+                        "重铸候选、史诗/神话（传说）、白星/黑星及特殊效果装备"
+                        "均受保护。\n"
+                        "优秀或精良也只会在本次清单与确认码完全一致时分解。\n"
+                        f"确认请输入 /工坊 批量分解 支配 "
+                        f"{result.confirmation_token}"
+                    )
+                elif result.policy_id == "excellent":
+                    examples = "、".join(
+                        f"#{item_id} {name} Lv.{level}"
+                        for item_id, name, level in result.items[:8]
+                    )
+                    if result.item_count > 8:
+                        examples += f"……另有{result.item_count - 8}件"
+                    equipment_ids = "、".join(
+                        f"#{item_id}"
+                        for item_id, _name, _level in result.items
+                    )
+                    text = (
+                        f"优秀及以下整理预览：{result.item_count}件普通/优秀装备\n"
+                        f"{examples}\n"
+                        f"将分解ID：{equipment_ids}\n"
+                        f"预计碎片 +{result.scrap_total}\n"
+                        "这是按品质全量清理，不比较装备数值或构筑；"
+                        "请先用 /工坊 收藏 ID 保护想保留的装备。\n"
+                        "仅纳入未穿戴、未收藏、无待定重铸、未强化、"
+                        "普通星且祝福状态普通、无特殊资料效果或触发能力的"
+                        "普通/优秀装备；精良及以上、白星/黑星均受保护。\n"
+                        "确认时会重新核对完整装备快照；任何词条、状态或背包"
+                        "变化都会使本确认码失效。\n"
+                        f"确认请输入 /工坊 批量分解 优秀 "
+                        f"{result.confirmation_token}"
+                    )
+                else:
+                    examples = "、".join(
+                        f"#{item_id} {name} Lv.{level}"
+                        for item_id, name, level in result.items[:8]
+                    )
+                    if result.item_count > 8:
+                        examples += f"……另有{result.item_count - 8}件"
+                    text = (
+                        f"整理预览：{result.item_count}件未穿戴普通装备\n"
+                        f"{examples}\n"
+                        f"预计碎片 +{result.scrap_total}\n"
+                        "不会处理新手装、已穿戴装备、收藏锁定装备、"
+                        "重铸候选、白星/黑星或优秀及以上装备。\n"
+                        f"确认请输入 /工坊 批量分解 普通 "
+                        f"{result.confirmation_token}"
+                    )
+            elif action == "批量分解" and len(tokens) == 3:
+                result = await self.workshop_service.bulk_salvage(
+                    user.id,
+                    tokens[1],
+                    tokens[2],
+                )
+                await self._record_workshop_progress(
+                    user,
+                    "bulk_salvage:"
+                    f"{result.quality}:{result.equipment_ids[0]}:"
+                    f"{result.equipment_ids[-1]}",
+                )
+                text = (
+                    f"已批量分解 {result.item_count} 件"
+                    f"{self._bulk_salvage_result_label(result.quality)}\n"
+                    f"碎片 +{result.scrap_gained}，当前 {result.balance_after}"
+                )
+            elif action == "重铸" and len(tokens) == 3:
+                result = await self.workshop_service.preview_rework(
+                    user.id,
+                    int(tokens[1]),
+                    tokens[2],
+                )
+                wallet = await self.workshop_service.wallet(user.id)
+                await self._record_workshop_progress(
+                    user,
+                    f"rework:{result.equipment_id}:{wallet.lifetime_spent}",
+                )
+                pity = "（本次触发第5次定向保底）" if result.pity_guaranteed else ""
+                text = (
+                    f"「{result.equipment_name}」{result.direction_label}重铸候选{pity}\n"
+                    f"词条：{self._format_affixes(result.candidate_affixes)}\n"
+                    f"方向匹配：{result.match_score}%\n"
+                    f"消耗：{result.cost.quality_base}+{result.cost.level_surcharge}"
+                    f"={result.cost.total} 碎片；余额 {result.balance_after}\n"
+                    f"输入 /工坊 接受 {result.equipment_id} 或 "
+                    f"/工坊 放弃 {result.equipment_id}"
+                )
+            elif action == "刻印" and len(tokens) == 3:
+                result = await self.workshop_service.preview_season_rework(
+                    user.id,
+                    int(tokens[1]),
+                    tokens[2],
+                )
+                wallet = await self.workshop_service.wallet(user.id)
+                await self._record_workshop_progress(
+                    user,
+                    f"season_imprint:{result.equipment_id}:"
+                    f"{wallet.lifetime_spent}",
+                )
+                text = (
+                    f"「{result.equipment_name}」{result.direction_label}赛季刻印候选"
+                    "（至少1条目标方向词条）\n"
+                    f"词条：{self._format_affixes(result.candidate_affixes)}\n"
+                    f"方向匹配：{result.match_score}%\n"
+                    f"消耗：{result.cost.total} 碎片 + "
+                    f"{result.cost.season_tokens} 赛季币；"
+                    f"余额 {result.balance_after} 碎片 / "
+                    f"{result.season_tokens_after} 赛季币\n"
+                    f"输入 /工坊 接受 {result.equipment_id} 或 "
+                    f"/工坊 放弃 {result.equipment_id}"
+                )
+            elif action in {"接受", "放弃"} and len(tokens) == 2:
+                accept = action == "接受"
+                result = await self.workshop_service.decide_rework(
+                    user.id,
+                    int(tokens[1]),
+                    accept,
+                )
+                text = (
+                    ("已采用新词条" if accept else "已放弃候选，原词条保持不变")
+                    + f"：{self._format_affixes(result.item.random_affixes)}\n"
+                    + f"碎片余额：{result.balance} / "
+                    + f"赛季币：{result.season_tokens_balance}"
+                )
+            else:
+                raise ValueError(
+                    "用法：/工坊 分解 ID；/工坊 收藏|取消收藏 ID；"
+                    "/工坊 整理 普通|优秀|支配；"
+                    "/工坊 批量分解 普通|优秀|支配 确认码；"
+                    "/工坊 重铸 ID 方向；"
+                    "/工坊 刻印 ID 方向；"
+                    "/工坊 接受 ID；/工坊 放弃 ID"
+                )
+            yield await self.reply_text(event, text, "LevelUpPvp 工坊")
+        except Exception as exc:
+            logger.exception("LevelUpPvp workshop failed")
+            yield await self.reply_text(event, f"工坊操作失败：{exc}")
+
+    async def _record_workshop_progress(self, user, event_key: str) -> None:
+        if self.operation_service is None:
+            return
+        try:
+            await self.operation_service.record_event(
+                user_pk=user.id,
+                group_id=user.group_id or "global",
+                event_type="workshop_action",
+                event_key=f"workshop:{event_key}",
+            )
+        except Exception:
+            logger.exception("Workshop succeeded but operation progress failed")
+
+    @staticmethod
+    def _bulk_salvage_result_label(policy_id: str) -> str:
+        return {
+            "common": "普通装备",
+            "excellent": "普通/优秀装备",
+            "dominated": "被支配装备",
+        }.get(str(policy_id), "装备")
+
+    async def _record_replay_progress(self, user, battle_id: int) -> None:
+        if self.operation_service is None:
+            return
+        try:
+            await self.operation_service.record_event(
+                user_pk=user.id,
+                group_id=user.group_id or "global",
+                event_type="battle_review",
+                event_key=f"review:{int(battle_id)}",
+            )
+        except Exception:
+            logger.exception("Replay succeeded but operation progress failed")
+
+    async def _record_daily_reward_progress(
+        self,
+        user,
+        group_id: str,
+        reward_key: str,
+    ) -> None:
+        if self.operation_service is None:
+            return
+        try:
+            await self.operation_service.record_event(
+                user_pk=user.id,
+                group_id=group_id,
+                event_type="daily_reward",
+                event_key=f"settled:{reward_key}",
+            )
+        except Exception:
+            logger.exception(
+                "Daily reward settled but weekly operation progress failed"
+            )
+
+    @staticmethod
+    def _format_effects(effects) -> str:
+        return "；".join(
+            f"{effect.label}{effect.cap_text}" for effect in effects
+        ) or "无额外修正"
+
+    def _format_daily_operations(self, overview, dungeon=None) -> list[str]:
+        progress_by_id = {
+            state.task_id: state
+            for state in getattr(overview, "daily_task_states", ())
+        }
+        theme_line = (
+            f"今日全群共享奈菲亚：「{dungeon.name}」。"
+            "敌人与奖励会按个人等级和所选难度缩放。"
+            if dungeon is not None
+            else "今日全群共享奈菲亚已经开放，敌人与奖励按个人等级缩放。"
+        )
+        lines = [
+            f"今日冒险与委托 · {overview.periods.daily.key}",
+            theme_line,
+            "输入 /奈菲亚 开始探索；每层选择路线与风险，途中可撤退并"
+            "保留已锁定收获。每日04:00更换共享主题。",
+            f"每日委托 {overview.daily_completed}/2（3项任选2项）：",
+        ]
+        for task in overview.daily_tasks:
+            state = progress_by_id.get(task.task_id)
+            progress = state.progress if state is not None else 0
+            completed = bool(state is not None and state.completed)
+            lines.append(
+                f"- {'✓' if completed else '·'} {task.name}："
+                f"{task.description}（{progress}/{task.target}）"
+            )
+        lines.extend(
+            (
+                "已领取" if overview.daily_claimed else "完成后输入 /今日 领取",
+                "查看周目标：/周常　查看赛季：/赛季",
+            )
+        )
+        return lines
+
+    @staticmethod
+    def _format_weekly_operations(overview) -> list[str]:
+        progress_by_id = {
+            state.task_id: state
+            for state in getattr(overview, "weekly_task_states", ())
+        }
+        lines = [
+            f"本周目标 · {overview.periods.weekly.key}",
+            f"完成 {overview.weekly_completed}/5（7项任选5项即拿满）：",
+        ]
+        for task in overview.weekly_tasks:
+            state = progress_by_id.get(task.task_id)
+            progress = state.progress if state is not None else 0
+            completed = bool(state is not None and state.completed)
+            lines.append(
+                f"- {'✓' if completed else '·'} {task.name}："
+                f"{task.description}（{progress}/{task.target}）"
+            )
+        simulation = overview.weekly_simulation
+        best = "、".join(map(str, simulation.best_scores)) or "暂无"
+        lines.extend(
+            (
+                f"周战斗评分：前{simulation.attempts_limit}场有效对战取最佳2场；"
+                f"已记录 {simulation.attempts_used}/{simulation.attempts_limit}，"
+                f"最佳：{best}",
+                "已领取" if overview.weekly_claimed else "完成后输入 /今日 领取",
+            )
+        )
+        return lines
+
+    @staticmethod
+    def _format_season(overview) -> list[str]:
+        season = overview.season
+        rating = "尚未定级" if season.rating is None else str(season.rating)
+        return [
+            f"赛季 {season.key}",
+            f"第 {season.day_number}/{season.total_days} 天 · 状态 {season.status}",
+            f"评级 {rating} · {season.games} 场 {season.wins}胜/{season.losses}负",
+            "评级每28天轮换；每日同一对手首战、且等级差不超过10级时计入Elo。",
+        ]
+
     async def _try_dungeon_challenge(self, event: AstrMessageEvent) -> AsyncGenerator:
         """Attempt to parse the challenge text as a dungeon name + strategy."""
         message = (event.get_message_str() or "").strip()
@@ -1481,6 +2163,548 @@ class LevelUpPvpCommandHandler:
         )
         yield await self._dungeon_result(event, result)
 
+    async def nefia(
+        self,
+        event: AstrMessageEvent,
+        args: str = "",
+    ) -> AsyncGenerator:
+        """Run one compact, persistent random-Nefia decision at a time."""
+
+        if self.dungeon_service is None:
+            yield await self.reply_text(event, "奈菲亚功能未启用。")
+            return
+        try:
+            identity = self._identity_from_event(event)
+            user = await self.user_service.get_or_create_user(identity)
+            tokens = str(args or "").strip().split()
+            action = tokens[0] if tokens else ""
+            difficulty = 1
+            strategy = "稳扎稳打"
+            cycle_key = daily_growth_day_window(
+                self._chat_event_timestamp(event)
+            )[0]
+
+            current, dungeon = await self._find_current_nefia(identity)
+            if action == "开始":
+                remaining = tokens[1:]
+                if remaining and remaining[0].isdigit():
+                    difficulty = int(remaining.pop(0))
+                if remaining:
+                    strategy = " ".join(remaining)
+                if current is None:
+                    dungeon = self._default_nefia_dungeon(
+                        user.level,
+                        identity.group_id,
+                        cycle_key,
+                    )
+                    current = await self.dungeon_service.start_nefia(
+                        identity,
+                        dungeon.dungeon_id,
+                        difficulty,
+                        strategy,
+                    )
+            elif current is None and action not in {"撤退", "战斗", "继续"}:
+                dungeon = self._default_nefia_dungeon(
+                    user.level,
+                    identity.group_id,
+                    cycle_key,
+                )
+                current = await self.dungeon_service.start_nefia(
+                    identity,
+                    dungeon.dungeon_id,
+                    difficulty,
+                    strategy,
+                )
+
+            if current is None or dungeon is None:
+                yield await self.reply_text(
+                    event,
+                    "今天尚未进入奈菲亚。输入 /奈菲亚 开始 1 开启冒险。",
+                )
+                return
+
+            if action == "撤退":
+                retreat_view = current.view
+                current = await self.dungeon_service.retreat_nefia(
+                    identity, current.view.adventure_id
+                )
+                if retreat_view.selected_risk_id:
+                    await self._record_nefia_risk_progress(
+                        user,
+                        retreat_view.adventure_id,
+                        retreat_view.floor_number,
+                        retreat_view.selected_risk_id,
+                    )
+            elif action in {"战斗", "继续"}:
+                if current.view.phase != "combat_ready":
+                    raise ValueError("当前还没有锁定路线与风险，请按页面选择 1A～2B")
+                floor_number = current.view.floor_number
+                route = self._selected_nefia_route(current.view)
+                risk = self._selected_nefia_risk(current.view, route)
+                current = await self.dungeon_service.fight_nefia(
+                    identity, current.view.adventure_id
+                )
+                await self._record_nefia_risk_progress(
+                    user,
+                    current.view.adventure_id,
+                    floor_number,
+                    risk.risk_id,
+                )
+                await self._record_nefia_fight_progress(
+                    user, current, route, risk, floor_number
+                )
+            elif action and action != "开始":
+                floor_number = current.view.floor_number
+                current, route, risk, _ = await self._advance_nefia_choice(
+                    identity, current, action
+                )
+                await self._record_nefia_risk_progress(
+                    user,
+                    current.view.adventure_id,
+                    floor_number,
+                    risk.risk_id,
+                )
+                await self._record_nefia_fight_progress(
+                    user, current, route, risk, floor_number
+                )
+
+            yield await self.reply_text(
+                event,
+                self._format_nefia_application(current, dungeon),
+                "LevelUpPvp 随机奈菲亚",
+            )
+        except Exception as exc:
+            logger.exception("LevelUpPvp Nefia command failed")
+            yield await self.reply_text(event, f"奈菲亚行动失败：{exc}")
+
+    async def _find_current_nefia(self, identity):
+        terminal = None
+        for dungeon in self.dungeon_service.list_dungeons():
+            try:
+                result = await self.dungeon_service.view_nefia(
+                    identity, dungeon_id=dungeon.dungeon_id
+                )
+            except KeyError:
+                continue
+            if not result.view.terminal:
+                return result, dungeon
+            terminal = terminal or (result, dungeon)
+        return terminal or (None, None)
+
+    def _default_nefia_dungeon(
+        self,
+        level: int,
+        group_id: str = "",
+        cycle_key: str | None = None,
+    ):
+        dungeons = tuple(self.dungeon_service.list_dungeons())
+        if not dungeons:
+            raise ValueError("随机奈菲亚目录为空")
+        activity_day = cycle_key or daily_growth_day_window()[0]
+        group_key = str(group_id or "global")
+        return max(
+            dungeons,
+            key=lambda dungeon: (
+                stable_operation_seed(
+                    "nefia-theme-v12",
+                    group_key,
+                    activity_day,
+                    dungeon.dungeon_id,
+                ),
+                str(dungeon.dungeon_id),
+            ),
+        )
+
+    async def _advance_nefia_choice(self, identity, result, token: str):
+        view = result.view
+        compact = re.fullmatch(r"([12])([AaBb])", token)
+        risk_only = re.fullmatch(r"([AaBb])", token)
+        if compact:
+            route_index = int(compact.group(1)) - 1
+            risk_index = 0 if compact.group(2).casefold() == "a" else 1
+            if route_index >= len(view.routes):
+                raise ValueError("当前层没有这条路线")
+            route = view.routes[route_index]
+        elif risk_only and view.phase == "risk_choice":
+            route = self._selected_nefia_route(view)
+            risk_index = 0 if risk_only.group(1).casefold() == "a" else 1
+        else:
+            raise ValueError("请选择 1A、1B、2A 或 2B；已选路线时也可只输入 A/B")
+
+        if risk_index >= len(route.risk_choices):
+            raise ValueError("当前路线没有这个风险选项")
+        risk = route.risk_choices[risk_index]
+        if view.phase == "route_choice":
+            result = await self.dungeon_service.choose_nefia_route(
+                identity, view.adventure_id, route.option_id
+            )
+            view = result.view
+        if view.phase == "risk_choice":
+            if view.selected_route_id != route.option_id:
+                raise ValueError("本层路线已经锁定，请按当前页面选择 A 或 B")
+            result = await self.dungeon_service.choose_nefia_risk(
+                identity, view.adventure_id, risk.risk_id
+            )
+            view = result.view
+            risk_chosen = True
+        else:
+            risk_chosen = False
+        if view.phase != "combat_ready":
+            raise ValueError("当前冒险不在可结算阶段")
+        if (
+            view.selected_route_id != route.option_id
+            or view.selected_risk_id != risk.risk_id
+        ):
+            raise ValueError("本层路线或风险已经锁定为其他选项")
+        result = await self.dungeon_service.fight_nefia(
+            identity, view.adventure_id
+        )
+        return result, route, risk, risk_chosen
+
+    @staticmethod
+    def _selected_nefia_route(view):
+        route = next(
+            (
+                item
+                for item in view.routes
+                if item.option_id == view.selected_route_id
+            ),
+            None,
+        )
+        if route is None:
+            raise ValueError("奈菲亚已选路线状态损坏")
+        return route
+
+    @staticmethod
+    def _selected_nefia_risk(view, route):
+        risk = next(
+            (
+                item
+                for item in route.risk_choices
+                if item.risk_id == view.selected_risk_id
+            ),
+            None,
+        )
+        if risk is None:
+            raise ValueError("奈菲亚已选风险状态损坏")
+        return risk
+
+    async def _record_nefia_risk_progress(
+        self,
+        user,
+        adventure_id: str,
+        floor_number: int,
+        risk_id: str,
+    ) -> None:
+        if self.operation_service is None:
+            return
+        common = {
+            "user_pk": user.id,
+            "group_id": user.group_id or "global",
+        }
+        for event_type, event_key in (
+            (
+                "risk_choice",
+                f"nefia:{adventure_id}:floor:{floor_number}:risk",
+            ),
+            ("risk_choice_unique", f"risk:{risk_id}"),
+        ):
+            try:
+                await self.operation_service.record_event(
+                    **common,
+                    event_type=event_type,
+                    event_key=event_key,
+                )
+            except Exception:
+                logger.exception(
+                    "Nefia risk succeeded but %s operation progress failed",
+                    event_type,
+                )
+
+    async def _record_nefia_fight_progress(
+        self, user, result, route, risk, floor_number: int
+    ) -> None:
+        if self.operation_service is None:
+            return
+        simulation = result.simulation
+        prefix = f"nefia:{result.view.adventure_id}:floor:{max(1, int(floor_number))}"
+        common = {
+            "user_pk": user.id,
+            "group_id": user.group_id or "global",
+        }
+        event_suffix = "fight" if simulation is not None else "event"
+        events = [("nefia_node", f"{prefix}:{event_suffix}", 1)]
+        if simulation is None:
+            events.append(("nefia_discovery", f"{prefix}:discovery", 1))
+        else:
+            if route.node_kind in {"elite", "boss"}:
+                events.append(("boss_attempt", f"{prefix}:boss-attempt", 1))
+            if route.node_kind == "boss" and simulation.winner_pk == user.id:
+                events.append(("nefia_boss_clear", f"{prefix}:boss-clear", 1))
+            active_uses = sum(
+                event.actor_pk == user.id
+                and event.kind in {"skill_use", "spell_cast_start"}
+                for event in simulation.events
+            )
+            if active_uses:
+                events.append(("active_skill", f"{prefix}:active-skill", active_uses))
+            for event_type, event_kind in (
+                ("spell_cast", "spell_cast"),
+                ("guard_action", "guard"),
+                ("fortune_trigger", "fortune_swing"),
+            ):
+                count = sum(
+                    event.actor_pk == user.id and event.kind == event_kind
+                    for event in simulation.events
+                )
+                if count:
+                    events.append((event_type, f"{prefix}:{event_type}", count))
+            tactic_events = [
+                event
+                for event in simulation.events
+                if event.actor_pk == user.id and event.kind == "strategy_trigger"
+            ]
+            if any(event.skill_id == "endgame" for event in tactic_events):
+                events.append(("combat_endgame", f"{prefix}:endgame", 1))
+            for family in {
+                event.status_id for event in tactic_events if event.status_id
+            }:
+                events.append(("stance_unique", f"stance:{family}", 1))
+            events.append(
+                (
+                    "environment_unique",
+                    f"environment:{simulation.environment_id}",
+                    1,
+                )
+            )
+            if simulation.winner_pk == user.id:
+                events.append(("battle_win", f"{prefix}:win", 1))
+        for event_type, event_key, amount in events:
+            try:
+                await self.operation_service.record_event(
+                    **common,
+                    event_type=event_type,
+                    event_key=event_key,
+                    amount=amount,
+                )
+            except Exception:
+                logger.exception(
+                    "Nefia fight succeeded but %s operation progress failed",
+                    event_type,
+                )
+
+    def _format_nefia_application(self, result, dungeon) -> str:
+        view = result.view
+        phase_labels = {
+            "route_choice": "选择路线",
+            "risk_choice": "选择风险",
+            "combat_ready": "等待结算",
+            "cleared": "通关",
+            "defeated": "战败",
+            "retreated": "已撤退",
+        }
+        lines = [
+            f"随机奈菲亚「{dungeon.name}」· {view.floor_number}/{view.floor_count}层",
+            f"难度{view.difficulty} · {phase_labels.get(view.phase, view.phase)} · "
+            f"已通过{view.completed_floors}层",
+        ]
+        if not view.terminal:
+            lines.append(
+                f"冒险资源：HP {view.hp_ratio:.0%} / MP {view.mana_ratio:.0%} / "
+                f"SP {view.stamina_ratio:.0%}"
+            )
+            equipment_pity = (
+                "下个成功节点必出"
+                if view.equipment_misses >= 2
+                else f"{view.equipment_misses}/2"
+            )
+            spellbook_pity = (
+                "下个成功节点必出"
+                if view.spellbook_misses >= 3
+                else f"{view.spellbook_misses}/3"
+            )
+            lines.append(
+                f"发现保底：装备 {equipment_pity} / 魔法书 {spellbook_pity}"
+            )
+        if result.simulation is not None:
+            lines.append("本层战报：")
+            lines.extend(
+                f"- {line}" for line in BattleReportBuilder().build(result.simulation)
+            )
+        elif result.narrative:
+            lines.append(f"本层事件：{result.narrative}")
+        if result.rewards:
+            lines.append("本层收获：")
+            for reward in result.rewards:
+                if reward.reward_type == "equipment" and reward.equipment_ids:
+                    labels = "、".join(
+                        f"#{item_id} {name}"
+                        for item_id, name in zip(
+                            reward.equipment_ids, reward.equipment_names
+                        )
+                    )
+                    lines.append(f"- 装备：{labels}")
+                else:
+                    lines.append(f"- {reward.description}")
+            if any(reward.spell_ids for reward in result.rewards):
+                lines.append("  用 /魔法书 查看编号，再用 /阅读 编号或法术名 研读。")
+            if any(reward.equipment_ids for reward in result.rewards):
+                lines.append("  可用 /一键穿戴 尝试换装，闲置装备可进工坊分解。")
+        growth = []
+        if result.skill_growth_count:
+            growth.append(f"技能{result.skill_growth_count}项")
+        if result.spell_growth_count:
+            growth.append(f"法术{result.spell_growth_count}项")
+        if result.attribute_growth_count:
+            growth.append(f"属性{result.attribute_growth_count}项")
+        if growth:
+            lines.append("行动成长：" + "、".join(growth))
+
+        if view.phase == "route_choice":
+            lines.append("选择一组路线与风险，本层会自动结算：")
+            rank_labels = {
+                "normal": "普通战斗",
+                "elite": "精英战斗",
+                "boss": "首领战斗",
+                "camp": "营地",
+                "remains": "遗骸",
+                "gathering": "采集",
+                "hidden_room": "隐藏房",
+                "treasure": "宝箱",
+            }
+            for route_index, route in enumerate(view.routes, 1):
+                affixes = "、".join(route.affix_names) or "无词缀"
+                access = (
+                    "能力解法可用"
+                    if route.discovery_accessible
+                    else "能力不足，仅基础收益"
+                )
+                if route.requires_combat:
+                    route_detail = (
+                        f"{rank_labels.get(route.node_kind, route.node_kind)} "
+                        f"{route.monster_name} Lv.{route.monster_level} / "
+                        f"{route.terrain_name}·{route.environment_name} / {affixes}"
+                    )
+                else:
+                    route_detail = (
+                        f"{rank_labels.get(route.node_kind, route.node_kind)} / "
+                        f"{route.terrain_name}·{route.environment_name} / 无需战斗"
+                    )
+                lines.append(
+                    f"{route_index}. {route.name}〔{route_detail}〕"
+                )
+                if route.discovery_name:
+                    lines.append(f"   发现：{route.discovery_name}（{access}）")
+                for risk_index, risk in enumerate(route.risk_choices):
+                    letter = "A" if risk_index == 0 else "B"
+                    lines.append(
+                        f"   {letter}. {risk.name}：{risk.description} "
+                        f"〔{self._format_nefia_risk_effect(risk)}〕"
+                    )
+            lines.append(
+                "输入 /奈菲亚 1A（或1B/2A/2B）；"
+                "想见好就收可 /奈菲亚 撤退。"
+            )
+        elif view.phase == "risk_choice":
+            route = self._selected_nefia_route(view)
+            lines.append(f"路线已锁定为「{route.name}」，请选择风险：")
+            for index, risk in enumerate(route.risk_choices):
+                letter = "A" if index == 0 else "B"
+                lines.append(
+                    f"{letter}. {risk.name}：{risk.description} "
+                    f"〔{self._format_nefia_risk_effect(risk)}〕"
+                )
+            action_name = "开战" if route.requires_combat else "处理事件"
+            lines.append(f"输入 /奈菲亚 A 或 /奈菲亚 B，随后自动{action_name}。")
+        elif view.phase == "combat_ready":
+            route = self._selected_nefia_route(view)
+            risk = self._selected_nefia_risk(view, route)
+            action_name = "战斗" if route.requires_combat else "处理事件"
+            lines.append(
+                f"已锁定「{route.name} / {risk.name}」。"
+                f"输入 /奈菲亚 继续 {action_name}。"
+            )
+        elif view.phase == "cleared":
+            lines.append("你带着终点秘藏离开；明日04:00后会生成新的路线。")
+        elif view.phase == "defeated":
+            lines.append(
+                "本次探索结束，但已锁定的收获不会丢失。"
+                "明日04:00可再出发。"
+            )
+        else:
+            lines.append(
+                "你及时收手并带走已获得的战利品。"
+                "明日04:00可再出发。"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_nefia_risk_effect(risk) -> str:
+        effects = []
+        if risk.monster_level > 0:
+            delta = int(risk.monster_level_delta)
+            suffix = f"（{delta:+d}级）" if delta else ""
+            effects.append(f"敌人Lv.{risk.monster_level}{suffix}")
+        if risk.entry_hp_cost_ratio > 0:
+            effects.append(f"HP -{risk.entry_hp_cost_ratio:.0%}")
+        if risk.entry_mp_cost_ratio > 0:
+            effects.append(f"MP -{risk.entry_mp_cost_ratio:.0%}")
+        effects.append(f"奖励 x{risk.reward_multiplier:.2f}")
+        quality_bonus = max(
+            0.0,
+            float(getattr(risk, "reward_quality_bonus", 0.0)),
+        )
+        effective_quality_bonus = max(
+            0.0,
+            float(
+                getattr(
+                    risk,
+                    "reward_effective_quality_bonus",
+                    quality_bonus,
+                )
+            ),
+        )
+        bonus_text = f"{quality_bonus:.2f}"
+        if effective_quality_bonus + 1e-9 < quality_bonus:
+            bonus_text += f"（按{effective_quality_bonus:.2f}上限结算）"
+        rare_find_bonus = max(
+            0.0,
+            float(getattr(risk, "rare_find_quality_bonus", 0.0)),
+        )
+        if rare_find_bonus > 0:
+            bonus_text += f"，含寻宝+{rare_find_bonus:.2f}"
+        guaranteed = max(
+            0,
+            int(getattr(risk, "reward_guaranteed_upgrades", 0)),
+        )
+        minimum_quality = QUALITY_LABELS.get(
+            str(getattr(risk, "reward_minimum_quality", "common")),
+            str(getattr(risk, "reward_minimum_quality", "common")),
+        )
+        maximum_quality = QUALITY_LABELS.get("mythic", "神话")
+        upgrade_chance = max(
+            0.0,
+            min(1.0, float(getattr(risk, "reward_upgrade_chance", 0.0))),
+        )
+        if guaranteed:
+            quality_effect = (
+                f"品质加值{bonus_text}→保底+{guaranteed}阶"
+                f"（最低{minimum_quality}，最高{maximum_quality}）"
+            )
+            if upgrade_chance > 0:
+                quality_effect += f"，再升1阶{upgrade_chance:.0%}"
+        elif upgrade_chance > 0:
+            quality_effect = (
+                f"品质加值{bonus_text}→升1阶{upgrade_chance:.0%}"
+                f"（最低{minimum_quality}，最高{maximum_quality}）"
+            )
+        else:
+            quality_effect = "装备品质按基础掉落"
+        effects.append(quality_effect)
+        if risk.capability_mitigated:
+            effects.append("能力已减免代价")
+        return " / ".join(effects)
+
     async def list_dungeons(self, event: AstrMessageEvent) -> AsyncGenerator:
         """列出所有可用副本。"""
         if self.dungeon_service is None:
@@ -1491,13 +2715,19 @@ class LevelUpPvpCommandHandler:
             if not dungeons:
                 yield await self.reply_text(event, "暂无可用副本。")
                 return
-            lines = ["可用副本："]
+            lines = [
+                "每日随机探索：/奈菲亚",
+                "旧版固定波次副本（兼容入口，每日合计1次）：",
+            ]
             for dungeon in dungeons:
                 lines.append(
                     f"「{dungeon.name}」 推荐等级 Lv.{dungeon.recommended_level}"
                     f"  波数 {len(dungeon.waves)}"
                 )
-            lines.append("用法：/副本 查看全部，/副本详情 副本名 查看详情，/挑战 副本名 发起挑战")
+            lines.append(
+                "推荐输入 /奈菲亚 体验随机路线；旧玩法仍可用 "
+                "/副本详情 副本名 与 /挑战 副本名，但04:00前仅结算1次。"
+            )
             yield await self.reply_text(event, "\n".join(lines))
         except Exception as exc:
             yield await self.reply_text(event, f"副本列表失败：{exc}")
@@ -1535,7 +2765,10 @@ class LevelUpPvpCommandHandler:
                 f" {pr.equipment_count}件装备"
                 f"（Lv.{pr.equipment_level_min}-{pr.equipment_level_max}）"
             )
-            lines.append("用法：/挑战 副本名 策略")
+            lines.append(
+                "旧固定波次用法：/挑战 副本名 策略（每日合计1次）；"
+                "每日随机玩法：/奈菲亚"
+            )
             yield await self.reply_text(event, "\n".join(line for line in lines if line))
         except Exception as exc:
             yield await self.reply_text(event, f"副本详情失败：{exc}")
@@ -1655,6 +2888,87 @@ class LevelUpPvpCommandHandler:
             user_id=event.get_sender_id() or event.get_session_id(),
             nickname=event.get_sender_name() or event.get_sender_id() or "未知用户",
         )
+
+    def _is_chat_command(self, event: AstrMessageEvent) -> bool:
+        message = (event.get_message_str() or "").strip()
+        if not message:
+            return False
+        if message.startswith(("/", "／", "!", "！", ".", "。")):
+            return True
+        if MENTION_COMMAND_PATTERN.match(message):
+            return True
+        return bool(
+            self.parse_mentioned_command(event)
+            or self.is_alias_challenge_event(event)
+        )
+
+    @staticmethod
+    def _chat_event_timestamp(event: AstrMessageEvent) -> int:
+        message_obj = getattr(event, "message_obj", None)
+        candidates = (
+            getattr(message_obj, "timestamp", None),
+            getattr(message_obj, "time", None),
+            getattr(event, "timestamp", None),
+        )
+        for candidate in candidates:
+            try:
+                value = int(float(candidate))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if value > 10_000_000_000:
+                value //= 1000
+            if value >= 0:
+                return value
+        return int(time.time())
+
+    @staticmethod
+    def _chat_event_key(event: AstrMessageEvent, occurred_at_ts: int) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        message_id = ""
+        getter = getattr(event, "get_message_id", None)
+        if callable(getter):
+            try:
+                message_id = str(getter() or "").strip()
+            except Exception:
+                message_id = ""
+        if not message_id:
+            for name in ("message_id", "id", "messageId"):
+                value = getattr(message_obj, name, None)
+                if value not in (None, ""):
+                    message_id = str(value).strip()
+                    break
+        if not message_id:
+            raw = getattr(message_obj, "raw_message", None)
+            if isinstance(raw, dict):
+                for name in ("message_id", "id", "messageId"):
+                    if raw.get(name) not in (None, ""):
+                        message_id = str(raw[name]).strip()
+                        break
+
+        platform = str(
+            event.get_platform_id()
+            or event.get_platform_name()
+            or "unknown"
+        )
+        group_id = str(event.get_group_id() or "")
+        sender_id = str(event.get_sender_id() or "")
+        if message_id:
+            return f"{platform}:group:{group_id}:message:{message_id}"[:240]
+
+        # Adapters are expected to expose a message id.  This content/time
+        # coordinate is a deterministic best-effort fallback for simple test
+        # adapters and still prevents duplicate processing inside one delivery.
+        payload = "\x1f".join(
+            (
+                platform,
+                group_id,
+                sender_id,
+                str(int(occurred_at_ts)),
+                event.get_message_str() or "",
+            )
+        ).encode("utf-8")
+        digest = hashlib.blake2b(payload, digest_size=12).hexdigest()
+        return f"{platform}:group:{group_id}:fallback:{digest}"[:240]
 
     def _is_bot_target_id(self, event: AstrMessageEvent, target_id: str) -> bool:
         """Account for QQ Official events that expose the target At as self_id."""
@@ -2086,16 +3400,47 @@ class LevelUpPvpCommandHandler:
         defender_name = self._display_name(result.defender)
         winner_name = self._display_name(result.winner)
         loser_name = self._display_name(result.loser)
+        battle_mode = "排位" if getattr(result, "rated", False) else "切磋"
+        loser_exp_gain = getattr(result, "loser_exp_gain", 0)
         lines = [
-            f"{attacker_name} VS {defender_name}",
+            f"{attacker_name} VS {defender_name}（{battle_mode}）",
             "策略："
             f"攻击方「{result.attacker_strategy}」"
             f"{'（随机）' if result.attacker_strategy_random else ''} / "
             f"防守方「{result.defender_strategy}」"
             f"{'（随机）' if result.defender_strategy_random else ''}",
             f"结算：{winner_name} +{result.winner_exp_gain} 经验，"
-            f"{loser_name} -{result.loser_exp_loss} 经验",
+            f"{loser_name} +{loser_exp_gain} 参与经验",
         ]
+        if getattr(result, "rated", False):
+            lines.append(
+                "评级："
+                f"{attacker_name} {result.attacker_rating_before}→"
+                f"{result.attacker_rating_after} / "
+                f"{defender_name} {result.defender_rating_before}→"
+                f"{result.defender_rating_after}"
+            )
+        elif getattr(result, "reward_reason", ""):
+            lines.append(
+                "本场为无奖励切磋：不计Elo、角色经验或技能/法术成长，"
+                "但可以验证构筑并查看复盘。"
+            )
+            reward_reasons = {
+                item
+                for item in str(result.reward_reason).split(",")
+                if item
+            }
+            if {
+                "winner_account_not_qualified",
+                "loser_account_not_qualified",
+            } & reward_reasons:
+                lines.append(
+                    "排位解锁：双方都需达到 Lv.5，或各自累计签到 3 天。"
+                )
+            elif "rated_level_gap_exceeded" in reward_reasons:
+                lines.append("排位条件：双方等级差不能超过 10 级。")
+            elif "repeat_pair_today" in reward_reasons:
+                lines.append("同一对手每天仅首场计入排位与成长奖励。")
         if result.is_counterattack:
             lines.insert(1, "反击：本次不消耗主动挑战次数")
         if result.analysis and result.simulation is None:
@@ -2107,6 +3452,8 @@ class LevelUpPvpCommandHandler:
             )
         if result.level_ups:
             lines.append(self._format_level_ups(result.level_ups))
+        if getattr(result, "loser_level_ups", None):
+            lines.append(self._format_level_ups(result.loser_level_ups))
         if result.level_downs:
             lines.append(self._format_level_downs(result.level_downs))
         skill_levelups = [item for item in (result.skill_growths or []) if item.to_level > item.from_level]

@@ -32,6 +32,17 @@ class BattleResult:
     winner_exp_gain: int
     loser_exp_loss: int
     analysis: str
+    loser_exp_gain: int = 0
+    attacker_exp_gain: int = 0
+    defender_exp_gain: int = 0
+    rated: bool = False
+    reward_reason: str = ""
+    attacker_rating_before: int = 1000
+    attacker_rating_after: int = 1000
+    defender_rating_before: int = 1000
+    defender_rating_after: int = 1000
+    winner_rating_delta: int = 0
+    loser_rating_delta: int = 0
     battle_log: list[str] = field(default_factory=list)
     level_ups: list = field(default_factory=list)
     level_downs: list = field(default_factory=list)
@@ -42,3 +53,4 @@ class BattleResult:
     skill_growths: list = field(default_factory=list)
     attribute_growths: list = field(default_factory=list)
     spell_growths: list = field(default_factory=list)
+    loser_level_ups: list = field(default_factory=list)

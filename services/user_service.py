@@ -389,7 +389,10 @@ class UserService:
         level_ups: list[LevelUpEvent] = []
         now = utc_now_text()
 
-        while exp >= config.exp_required_for_next_level(level):
+        while (
+            level < config.MAX_LEVEL
+            and exp >= config.exp_required_for_next_level(level)
+        ):
             required = config.exp_required_for_next_level(level)
             exp -= required
             from_level = level
@@ -448,6 +451,15 @@ class UserService:
                     skill_point_gain,
                     now,
                 ),
+            )
+
+        if level >= config.MAX_LEVEL:
+            # ``total_exp`` remains a lifetime counter, while the visible bar
+            # stays bounded so a future cap increase cannot cause an accidental
+            # burst of dozens of levels.
+            exp = min(
+                exp,
+                config.exp_required_for_next_level(config.MAX_LEVEL) - 1,
             )
 
         await self._update_user_progress_in_db(

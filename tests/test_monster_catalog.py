@@ -6,12 +6,14 @@ from pathlib import Path
 
 from models.combat import AIProfile, FighterSnapshot
 from models.monster import MonsterSpawnSpec
+from services.battle_report import BattleReportBuilder
 from services.combat_engine import SideviewCombatEngine
 from services.monster_build_service import MonsterBuildService
 from services.monster_catalog import (
     DEFAULT_MONSTER_CATALOG_PATH,
     MonsterCatalog,
 )
+from scripts.build_monster_catalog import monster_record
 
 
 class MonsterCatalogTests(unittest.TestCase):
@@ -234,6 +236,130 @@ class MonsterBuildTests(unittest.TestCase):
         )
         self.assertEqual(dragon.advanced_attributes.life_growth, 220)
         self.assertGreater(dragon.snapshot.derived.resistances["fire"], 0)
+
+    def test_signature_monsters_execute_split_and_temporary_corrosion(self):
+        split_ids = (
+            "monster_043", "monster_077", "monster_187", "monster_209",
+        )
+        split_builds = tuple(
+            self.service.build(
+                MonsterSpawnSpec(
+                    template_id,
+                    combatant_pk=-(4300 + index),
+                )
+            )
+            for index, template_id in enumerate(split_ids)
+        )
+        acid = self.service.build(
+            MonsterSpawnSpec("monster_139", level=20, combatant_pk=-13900)
+        )
+        target = self.service.build(
+            MonsterSpawnSpec("monster_001", level=20, combatant_pk=-9900)
+        )
+
+        self.assertTrue(
+            all("monster_split" in build.ability_ids for build in split_builds)
+        )
+        self.assertIn("monster_corrosive_splash", acid.ability_ids)
+        for template_id in split_ids + ("monster_139",):
+            self.assertFalse(
+                any(
+                    "当前引擎未结算" in text
+                    for text in self.catalog.get(template_id).source_effects
+                )
+            )
+
+        split = split_builds[0]
+        split_result = SideviewCombatEngine().simulate(
+            split.snapshot,
+            target.snapshot,
+            split.ai_profile,
+            target.ai_profile,
+            4300,
+        )
+        self.assertTrue(
+            any(
+                event.kind == "summon"
+                and event.skill_id == "monster_split"
+                for event in split_result.events
+            )
+        )
+        self.assertTrue(
+            any(
+                event.kind == "summon_strike"
+                and event.skill_id == "monster_split"
+                for event in split_result.events
+            )
+        )
+        self.assertIn(
+            "活体分裂",
+            "".join(BattleReportBuilder().build(split_result)),
+        )
+        acid_result = SideviewCombatEngine().simulate(
+            acid.snapshot,
+            target.snapshot,
+            acid.ai_profile,
+            target.ai_profile,
+            13900,
+        )
+        self.assertTrue(
+            any(
+                event.kind == "status_apply"
+                and event.status_id == "defense_down"
+                and event.skill_id == "monster_corrosive_splash"
+                for event in acid_result.events
+            )
+        )
+
+        acid_damage = next(
+            event for event in acid_result.events
+            if event.kind == "damage"
+            and event.skill_id == "monster_corrosive_splash"
+        )
+        self.assertGreater(acid_damage.damage_breakdown.get("nature", 0), 0)
+        self.assertIn(
+            "弱酸飞溅",
+            "".join(BattleReportBuilder().build(acid_result)),
+        )
+
+    def test_catalog_generator_preserves_implemented_signature_abilities(self):
+        base = {
+            "number": 43,
+            "source_name": "混沌の塊",
+            "level": 59,
+            "race": "スライム",
+            "class": "無",
+            "raw": ("〇",),
+            "raw_level": "59",
+        }
+        split = monster_record(base, {"スライム": "slime"})
+        acid = monster_record(
+            {
+                **base,
+                "number": 139,
+                "source_name": "弱酸性スライム",
+                "level": 1,
+                "raw_level": "1",
+            },
+            {"スライム": "slime"},
+        )
+
+        self.assertIn(
+            "monster_split",
+            {item["ability_id"] for item in split["abilities"]},
+        )
+        self.assertEqual(
+            split["source_effects"],
+            ["分出短命复制体协同攻击"],
+        )
+        self.assertIn(
+            "monster_corrosive_splash",
+            {item["ability_id"] for item in acid["abilities"]},
+        )
+        self.assertEqual(
+            acid["source_effects"],
+            ["弱酸会暂时降低护甲，不损坏装备"],
+        )
 
     def test_all_templates_build_and_simulate(self):
         engine = SideviewCombatEngine()

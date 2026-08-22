@@ -120,7 +120,7 @@ SKILL_DEFINITIONS = {
             _effect("critical_rate", 0.001),
             _effect("critical_damage", 0.002),
         )),
-        _passive("concealment", "隐蔽", "perception", ("perception",), "降低未来PVE模式中的敌人发现率。", (_effect("pve_stealth", 0.005, 0.50, pve_only=True),), future_system="pve"),
+        _passive("concealment", "隐蔽", "perception", ("perception",), "在奈菲亚中利用地形避开视线，有机会抢到两拍先手；精英与首领更难伏击。", (_effect("pve_stealth", 0.005, 0.50, pve_only=True),)),
         _passive("natural_knowledge", "自然学识", "perception", ("perception",), "自然系魔法的基础技能。", (
             _effect("spell_nature", 0.004),
             _effect("healing_power_bonus", 0.002),
@@ -152,16 +152,16 @@ SKILL_DEFINITIONS = {
         # 进阶武器技能
         _passive("noble_weapon", "贵族武器", "advanced", ("dexterity", "constitution"), "提高短剑和法杖的基础物理伤害。", (
             _effect("physical_damage_bonus", 0.002, weapon_types=("shortsword", "staff")),
-        ), (("shortsword", 50), ("staff", 50))),
+        ), (("shortsword", 35), ("staff", 35))),
         _passive("cleric_weapon", "神官武器", "advanced", ("strength", "constitution"), "提高镰刀和钝器的基础物理伤害。", (
             _effect("physical_damage_bonus", 0.002, weapon_types=("scythe", "blunt")),
-        ), (("scythe", 50), ("blunt", 50))),
+        ), (("scythe", 35), ("blunt", 35))),
         _passive("officer_weapon", "军官武器", "advanced", ("strength", "constitution"), "提高长剑和长枪的基础物理伤害。", (
             _effect("physical_damage_bonus", 0.002, weapon_types=("longsword", "spear")),
-        ), (("longsword", 50), ("spear", 50))),
+        ), (("longsword", 35), ("spear", 35))),
         _passive("hero_weapon", "勇者武器", "advanced", ("strength",), "提高斧头和格斗攻击的基础物理伤害。", (
             _effect("physical_damage_bonus", 0.002, weapon_types=("axe", "unarmed")),
-        ), (("axe", 50), ("unarmed", 50))),
+        ), (("axe", 35), ("unarmed", 35))),
 
         SkillDefinition(
             skill_id="power_strike",

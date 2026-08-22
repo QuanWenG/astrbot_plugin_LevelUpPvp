@@ -7,24 +7,32 @@ try:
         LEGACY_RULESET_ID,
         attribute_exp_required,
         clamp_potential,
+        clamp_skill_potential,
         legacy_attribute_exp_required,
         legacy_skill_exp_required,
         legacy_spell_exp_required,
         migrate_exp_preserving_progress,
+        migrate_level_exp_preserving_progress,
+        migrate_v10_skill_exp_preserving_progress,
         skill_exp_required,
         spell_exp_required,
+        v10_skill_exp_required,
     )
 except ImportError:
     from services.progression_rules import (
         LEGACY_RULESET_ID,
         attribute_exp_required,
         clamp_potential,
+        clamp_skill_potential,
         legacy_attribute_exp_required,
         legacy_skill_exp_required,
         legacy_spell_exp_required,
         migrate_exp_preserving_progress,
+        migrate_level_exp_preserving_progress,
+        migrate_v10_skill_exp_preserving_progress,
         skill_exp_required,
         spell_exp_required,
+        v10_skill_exp_required,
     )
 
 try:
@@ -41,6 +49,8 @@ CLASSIC_BLACK_STAR_LEVEL_MIGRATION = "2026-07-classic-black-stars-level-40-v1"
 CLASSIC_BLACK_STAR_EFFECTS_MIGRATION = "2026-07-classic-black-stars-effects-v2"
 ELONA_PROGRESSION_MIGRATION = "elona-progression-v2"
 ELONA_PROGRESSION_BACKUP_SUFFIX = ".pre-elona-progression-v2.bak"
+V11_PROGRESSION_MIGRATION = "2026-08-qq-daily-budget-v11"
+V11_PROGRESSION_BACKUP_SUFFIX = ".pre-qq-daily-budget-v11.bak"
 CLASSIC_BLACK_STAR_TEMPLATE_IDS = (
     "black_star_ether_dagger",
     "black_star_lucky_dagger",
@@ -192,6 +202,7 @@ async def init_db(db_path: str) -> None:
                 roll_value REAL NOT NULL,
                 strategy TEXT NOT NULL DEFAULT '',
                 winner_exp_gain INTEGER NOT NULL,
+                loser_exp_gain INTEGER NOT NULL DEFAULT 0,
                 loser_exp_loss INTEGER NOT NULL,
                 analysis TEXT NOT NULL DEFAULT '',
                 battle_log TEXT NOT NULL DEFAULT '[]',
@@ -205,6 +216,16 @@ async def init_db(db_path: str) -> None:
                 duration_ticks INTEGER NOT NULL DEFAULT 0,
                 finish_reason TEXT NOT NULL DEFAULT '',
                 simulation_json TEXT NOT NULL DEFAULT '{}',
+                ruleset_id TEXT NOT NULL DEFAULT 'legacy-v1',
+                environment_id TEXT NOT NULL DEFAULT '',
+                attacker_rating_before REAL,
+                attacker_rating_after REAL,
+                defender_rating_before REAL,
+                defender_rating_after REAL,
+                rated INTEGER NOT NULL DEFAULT 0 CHECK(rated IN (0, 1)),
+                reward_reason TEXT NOT NULL DEFAULT '',
+                attacker_tactic_plan_json TEXT NOT NULL DEFAULT '{}',
+                defender_tactic_plan_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 created_at_ts INTEGER NOT NULL,
                 FOREIGN KEY(attacker_pk) REFERENCES users(id) ON DELETE CASCADE,
@@ -229,6 +250,7 @@ async def init_db(db_path: str) -> None:
                 recovery_ticks INTEGER NOT NULL DEFAULT 0,
                 hitstun_ticks INTEGER NOT NULL DEFAULT 0,
                 counter_cooldown INTEGER NOT NULL DEFAULT 0,
+                hard_control_immunity_ticks INTEGER NOT NULL DEFAULT 0,
                 stance_id TEXT,
                 frozen_mana_ratio REAL NOT NULL DEFAULT 0,
                 frozen_mana_capacity_ratio REAL NOT NULL DEFAULT 0,
@@ -302,6 +324,7 @@ async def init_db(db_path: str) -> None:
                 fusion_affixes_json TEXT NOT NULL DEFAULT '[]', bound INTEGER NOT NULL DEFAULT 1,
                 description TEXT NOT NULL DEFAULT '',
                 source_effects_json TEXT NOT NULL DEFAULT '[]',
+                is_locked INTEGER NOT NULL DEFAULT 0 CHECK(is_locked IN (0, 1)),
                 created_at TEXT NOT NULL, FOREIGN KEY(owner_pk) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS equipment_loadout (
@@ -339,6 +362,27 @@ async def init_db(db_path: str) -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(owner_pk) REFERENCES users(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS spell_research_balances (
+                user_pk INTEGER PRIMARY KEY,
+                pages INTEGER NOT NULL DEFAULT 0 CHECK(pages >= 0),
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS spell_research_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_pk INTEGER NOT NULL,
+                spell_id TEXT NOT NULL DEFAULT '',
+                school_id TEXT NOT NULL DEFAULT '',
+                delta INTEGER NOT NULL,
+                balance_after INTEGER NOT NULL CHECK(balance_after >= 0),
+                reason TEXT NOT NULL,
+                operation_key TEXT NOT NULL UNIQUE,
+                source_book_id INTEGER,
+                source_seed INTEGER,
+                result_book_id INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS user_spells (
                 user_pk INTEGER NOT NULL, spell_id TEXT NOT NULL,
                 level INTEGER NOT NULL DEFAULT 1, exp INTEGER NOT NULL DEFAULT 0,
@@ -356,6 +400,7 @@ async def init_db(db_path: str) -> None:
                 reading_difficulty INTEGER NOT NULL DEFAULT 0,
                 reading_power REAL NOT NULL DEFAULT 0,
                 reading_attribute TEXT NOT NULL DEFAULT '',
+                activity_day_key TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
             );
@@ -421,8 +466,196 @@ async def init_db(db_path: str) -> None:
                 created_at_ts INTEGER NOT NULL,
                 FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS dungeon_adventures (
+                adventure_id TEXT PRIMARY KEY,
+                owner_pk INTEGER NOT NULL,
+                owner_key TEXT NOT NULL,
+                group_key TEXT NOT NULL,
+                dungeon_id TEXT NOT NULL,
+                cycle_key TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                floor_index INTEGER NOT NULL DEFAULT 0,
+                version INTEGER NOT NULL DEFAULT 0,
+                snapshot_json TEXT NOT NULL,
+                created_at_ts INTEGER NOT NULL,
+                updated_at_ts INTEGER NOT NULL,
+                UNIQUE(owner_key, dungeon_id, cycle_key),
+                FOREIGN KEY(owner_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS combat_loadouts (
+                user_pk INTEGER PRIMARY KEY,
+                opening_family TEXT NOT NULL DEFAULT 'sustain',
+                midgame_family TEXT NOT NULL DEFAULT 'sustain',
+                endgame_family TEXT NOT NULL DEFAULT 'sustain',
+                active_slots_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS auto_pilot_state (
+                user_pk INTEGER PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+                origin_umo TEXT NOT NULL DEFAULT '',
+                origin_group_id TEXT NOT NULL DEFAULT '',
+                started_at_ts INTEGER NOT NULL DEFAULT 0,
+                last_tick_ts INTEGER NOT NULL DEFAULT 0,
+                next_tick_ts INTEGER NOT NULL DEFAULT 0,
+                cursor_json TEXT NOT NULL DEFAULT '{}',
+                consecutive_errors INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                updated_at_ts INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_auto_pilot_due
+                ON auto_pilot_state(enabled, next_tick_ts, user_pk);
+
+            CREATE TABLE IF NOT EXISTS seasons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id TEXT NOT NULL DEFAULT '',
+                season_key TEXT NOT NULL,
+                ruleset_id TEXT NOT NULL,
+                start_at_ts INTEGER NOT NULL,
+                end_at_ts INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'scheduled',
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT '',
+                UNIQUE(group_id, season_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS season_users (
+                season_id INTEGER NOT NULL,
+                user_pk INTEGER NOT NULL,
+                rating REAL NOT NULL DEFAULT 1000,
+                games INTEGER NOT NULL DEFAULT 0,
+                wins INTEGER NOT NULL DEFAULT 0,
+                losses INTEGER NOT NULL DEFAULT 0,
+                provisional_games INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(season_id, user_pk),
+                FOREIGN KEY(season_id) REFERENCES seasons(id) ON DELETE CASCADE,
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS reward_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reward_key TEXT NOT NULL UNIQUE,
+                user_pk INTEGER NOT NULL,
+                battle_id INTEGER,
+                source TEXT NOT NULL,
+                exp_gain INTEGER NOT NULL DEFAULT 0,
+                currency_gain INTEGER NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at_ts INTEGER NOT NULL,
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(battle_id) REFERENCES battles(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS operation_progress (
+                user_pk INTEGER NOT NULL,
+                group_id TEXT NOT NULL DEFAULT '',
+                period_kind TEXT NOT NULL,
+                period_key TEXT NOT NULL,
+                operation_key TEXT NOT NULL,
+                progress INTEGER NOT NULL DEFAULT 0,
+                target INTEGER NOT NULL DEFAULT 1,
+                completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+                claimed INTEGER NOT NULL DEFAULT 0 CHECK(claimed IN (0, 1)),
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                updated_at_ts INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(
+                    user_pk, group_id, period_kind, period_key, operation_key
+                ),
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS loot_pity (
+                user_pk INTEGER NOT NULL,
+                pool_id TEXT NOT NULL,
+                epic_misses INTEGER NOT NULL DEFAULT 0,
+                legendary_misses INTEGER NOT NULL DEFAULT 0,
+                total_draws INTEGER NOT NULL DEFAULT 0,
+                updated_at_ts INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_pk, pool_id),
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS equipment_rework_state (
+                equipment_id INTEGER NOT NULL,
+                ruleset_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                original_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                reworked_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                updated_at_ts INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(equipment_id, ruleset_id),
+                FOREIGN KEY(equipment_id) REFERENCES equipment_items(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS workshop_wallet (
+                user_pk INTEGER PRIMARY KEY,
+                scrap_balance INTEGER NOT NULL DEFAULT 0,
+                season_tokens INTEGER NOT NULL DEFAULT 0,
+                lifetime_earned INTEGER NOT NULL DEFAULT 0,
+                lifetime_spent INTEGER NOT NULL DEFAULT 0,
+                updated_at_ts INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_activity_daily (
+                user_pk INTEGER NOT NULL,
+                group_id TEXT NOT NULL,
+                day_key TEXT NOT NULL,
+                valid_messages INTEGER NOT NULL DEFAULT 0,
+                reward_rolls INTEGER NOT NULL DEFAULT 0,
+                exp_events INTEGER NOT NULL DEFAULT 0,
+                reserved_exp INTEGER NOT NULL DEFAULT 0,
+                awarded_exp INTEGER NOT NULL DEFAULT 0,
+                equipment_drops INTEGER NOT NULL DEFAULT 0,
+                spellbook_drops INTEGER NOT NULL DEFAULT 0,
+                last_reward_roll_ts INTEGER NOT NULL DEFAULT 0,
+                updated_at_ts INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_pk, group_id, day_key),
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_activity_pity (
+                user_pk INTEGER PRIMARY KEY,
+                equipment_misses INTEGER NOT NULL DEFAULT 0,
+                spellbook_misses INTEGER NOT NULL DEFAULT 0,
+                equipment_drops_total INTEGER NOT NULL DEFAULT 0,
+                spellbook_drops_total INTEGER NOT NULL DEFAULT 0,
+                updated_at_ts INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_activity_events (
+                event_key TEXT PRIMARY KEY,
+                user_pk INTEGER NOT NULL,
+                group_id TEXT NOT NULL,
+                occurred_at_ts INTEGER NOT NULL,
+                content_fingerprint TEXT NOT NULL DEFAULT '',
+                accepted INTEGER NOT NULL DEFAULT 0 CHECK(accepted IN (0, 1)),
+                decision_reason TEXT NOT NULL DEFAULT '',
+                day_key TEXT NOT NULL DEFAULT '',
+                valid_message_index INTEGER,
+                reward_roll_index INTEGER,
+                reward_key TEXT NOT NULL DEFAULT '',
+                intent_json TEXT NOT NULL DEFAULT '{}',
+                equipment_probability REAL NOT NULL DEFAULT 0,
+                spellbook_probability REAL NOT NULL DEFAULT 0,
+                settled INTEGER NOT NULL DEFAULT 0 CHECK(settled IN (0, 1)),
+                actual_exp INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(user_pk) REFERENCES users(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_dungeon_runs_user
                 ON dungeon_runs(user_pk);
+            CREATE INDEX IF NOT EXISTS idx_dungeon_adventures_owner_cycle
+                ON dungeon_adventures(owner_pk, cycle_key, dungeon_id);
+            CREATE INDEX IF NOT EXISTS idx_dungeon_adventures_group_cycle
+                ON dungeon_adventures(group_key, cycle_key, dungeon_id);
             CREATE INDEX IF NOT EXISTS idx_checkins_user_date
                 ON checkins(user_pk, checkin_date);
             CREATE INDEX IF NOT EXISTS idx_battles_attacker
@@ -451,8 +684,36 @@ async def init_db(db_path: str) -> None:
                 ON skill_growth_logs(user_pk, battle_id);
             CREATE INDEX IF NOT EXISTS idx_spellbooks_owner
                 ON spellbook_items(owner_pk, spell_id);
+            CREATE INDEX IF NOT EXISTS idx_spell_research_user_created
+                ON spell_research_logs(user_pk, id);
             CREATE INDEX IF NOT EXISTS idx_spell_growth_user
                 ON spell_growth_logs(user_pk, battle_id);
+            CREATE INDEX IF NOT EXISTS idx_seasons_group_status
+                ON seasons(group_id, status, start_at_ts, end_at_ts);
+            CREATE INDEX IF NOT EXISTS idx_season_users_rating
+                ON season_users(season_id, rating DESC);
+            CREATE INDEX IF NOT EXISTS idx_reward_ledger_user_created
+                ON reward_ledger(user_pk, created_at_ts);
+            CREATE INDEX IF NOT EXISTS idx_reward_ledger_battle
+                ON reward_ledger(battle_id);
+            CREATE INDEX IF NOT EXISTS idx_operation_progress_period
+                ON operation_progress(group_id, period_kind, period_key);
+            CREATE INDEX IF NOT EXISTS idx_equipment_rework_status
+                ON equipment_rework_state(ruleset_id, status);
+            CREATE INDEX IF NOT EXISTS idx_chat_activity_events_antispam
+                ON chat_activity_events(
+                    user_pk, group_id, occurred_at_ts, accepted
+                );
+            CREATE INDEX IF NOT EXISTS idx_chat_activity_events_fingerprint
+                ON chat_activity_events(
+                    user_pk, group_id, content_fingerprint, occurred_at_ts
+                );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_activity_reward_key
+                ON chat_activity_events(reward_key)
+                WHERE reward_key <> '';
+            CREATE INDEX IF NOT EXISTS idx_chat_activity_pending
+                ON chat_activity_events(settled, occurred_at_ts)
+                WHERE reward_key <> '';
             """
         )
         await _ensure_column(
@@ -478,9 +739,60 @@ async def init_db(db_path: str) -> None:
         await _ensure_column(
             db, "battles", "simulation_json", "TEXT NOT NULL DEFAULT '{}'"
         )
+        await _ensure_column(
+            db, "battles", "loser_exp_gain", "INTEGER NOT NULL DEFAULT 0"
+        )
+        await _ensure_column(
+            db, "battles", "ruleset_id", "TEXT NOT NULL DEFAULT 'legacy-v1'"
+        )
+        await _ensure_column(
+            db, "battles", "environment_id", "TEXT NOT NULL DEFAULT ''"
+        )
+        await _ensure_column(db, "battles", "attacker_rating_before", "REAL")
+        await _ensure_column(db, "battles", "attacker_rating_after", "REAL")
+        await _ensure_column(db, "battles", "defender_rating_before", "REAL")
+        await _ensure_column(db, "battles", "defender_rating_after", "REAL")
+        await _ensure_column(
+            db, "battles", "rated", "INTEGER NOT NULL DEFAULT 0 CHECK(rated IN (0, 1))"
+        )
+        await _ensure_column(
+            db, "battles", "reward_reason", "TEXT NOT NULL DEFAULT ''"
+        )
+        await _ensure_column(
+            db,
+            "battles",
+            "attacker_tactic_plan_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
+        await _ensure_column(
+            db,
+            "battles",
+            "defender_tactic_plan_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
+        await _ensure_column(
+            db,
+            "workshop_wallet",
+            "season_tokens",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
         await _ensure_column(db, "spell_read_logs", "reading_difficulty", "INTEGER NOT NULL DEFAULT 0")
         await _ensure_column(db, "spell_read_logs", "reading_power", "REAL NOT NULL DEFAULT 0")
         await _ensure_column(db, "spell_read_logs", "reading_attribute", "TEXT NOT NULL DEFAULT ''")
+        await _ensure_column(db, "spell_read_logs", "activity_day_key", "TEXT NOT NULL DEFAULT ''")
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_spell_read_progress
+                ON spell_read_logs(user_pk, spell_id, success, id)
+            """
+        )
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_spell_read_daily_failure
+                ON spell_read_logs(user_pk, spell_id, activity_day_key)
+                WHERE success = 0
+            """
+        )
         await _ensure_column(db, "users", "life_growth", "INTEGER NOT NULL DEFAULT 100")
         await _ensure_column(db, "users", "mana_growth", "INTEGER NOT NULL DEFAULT 100")
         await _ensure_column(db, "users", "advanced_speed", "INTEGER NOT NULL DEFAULT 100")
@@ -490,6 +802,12 @@ async def init_db(db_path: str) -> None:
             db,
             "combat_states",
             "recovery_turn_phase",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        await _ensure_column(
+            db,
+            "combat_states",
+            "hard_control_immunity_ticks",
             "INTEGER NOT NULL DEFAULT 0",
         )
         await _ensure_column(db, "users", "willpower", "INTEGER NOT NULL DEFAULT 1")
@@ -505,6 +823,12 @@ async def init_db(db_path: str) -> None:
             "source_effects_json",
             "TEXT NOT NULL DEFAULT '[]'",
         )
+        await _ensure_column(
+            db,
+            "equipment_items",
+            "is_locked",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(is_locked IN (0, 1))",
+        )
         await _ensure_column(db, "level_up_logs", "skill_points_gain", "INTEGER NOT NULL DEFAULT 0")
         await _ensure_column(db, "level_freezes", "frozen_skill_points", "INTEGER NOT NULL DEFAULT 0")
         await db.execute(
@@ -513,12 +837,31 @@ async def init_db(db_path: str) -> None:
                 ON battles(countered_battle_id)
             """
         )
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_battles_ruleset_created
+                ON battles(ruleset_id, created_at_ts)
+            """
+        )
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_battles_environment_created
+                ON battles(environment_id, created_at_ts)
+            """
+        )
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_battles_rated_created
+                ON battles(rated, created_at_ts)
+            """
+        )
         await db.commit()
         await _apply_primary_attribute_rebalance(db, db_path)
         await _apply_elona_balance_reset(db, db_path)
         await _apply_classic_black_star_level_migration(db)
         await _apply_classic_black_star_effects_migration(db)
         await _apply_elona_progression_migration(db, db_path)
+        await _apply_v11_progression_migration(db, db_path)
 
 
 async def _ensure_column(db, table_name: str, column_name: str, definition: str) -> None:
@@ -733,12 +1076,35 @@ async def _apply_elona_balance_reset(db, db_path: str) -> None:
 
 async def _apply_elona_progression_migration(db, db_path: str) -> None:
     cursor = await db.execute(
-        "SELECT 1 FROM schema_migrations WHERE migration_id = ?",
-        (ELONA_PROGRESSION_MIGRATION,),
+        """
+        SELECT migration_id
+        FROM schema_migrations
+        WHERE migration_id IN (?, ?)
+        """,
+        (ELONA_PROGRESSION_MIGRATION, V11_PROGRESSION_MIGRATION),
     )
-    already_applied = await cursor.fetchone()
+    applied_migrations = {
+        str(row["migration_id"])
+        for row in await cursor.fetchall()
+    }
     await cursor.close()
-    if already_applied:
+    if ELONA_PROGRESSION_MIGRATION in applied_migrations:
+        return
+
+    # A later migration marker proves that this database has already crossed
+    # the v2 progression boundary.  Replaying the predecessor after its marker
+    # was lost would reinterpret current v11 skill XP as legacy XP and convert
+    # it a second time.  Heal the missing historical marker without touching
+    # player data so repeated startup remains idempotent.
+    if V11_PROGRESSION_MIGRATION in applied_migrations:
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at)
+            VALUES (?, datetime('now'))
+            """,
+            (ELONA_PROGRESSION_MIGRATION,),
+        )
+        await db.commit()
         return
 
     cursor = await db.execute("SELECT COUNT(*) AS count FROM users")
@@ -817,7 +1183,7 @@ async def _apply_elona_progression_migration(db, db_path: str) -> None:
             converted = migrate_exp_preserving_progress(
                 int(row["exp"]),
                 legacy_skill_exp_required(level),
-                skill_exp_required(level),
+                v10_skill_exp_required(level),
             )
             await db.execute(
                 """
@@ -871,6 +1237,92 @@ async def _apply_elona_progression_migration(db, db_path: str) -> None:
         await cursor.close()
         if not integrity or integrity[0] != "ok":
             raise RuntimeError("成长系统迁移后的数据库完整性检查失败")
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+
+async def _apply_v11_progression_migration(db, db_path: str) -> None:
+    """Preserve level and current-bar percentage while adopting v11 pacing."""
+    cursor = await db.execute(
+        "SELECT 1 FROM schema_migrations WHERE migration_id = ?",
+        (V11_PROGRESSION_MIGRATION,),
+    )
+    already_applied = await cursor.fetchone()
+    await cursor.close()
+    if already_applied:
+        return
+
+    cursor = await db.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM users)
+          + (SELECT COUNT(*) FROM user_skills) AS count
+        """
+    )
+    row_count = int((await cursor.fetchone())["count"])
+    await cursor.close()
+    if row_count:
+        backup_path = _backup_database_with_suffix(
+            db_path,
+            V11_PROGRESSION_BACKUP_SUFFIX,
+        )
+        if db_path != ":memory:" and backup_path is None:
+            raise RuntimeError("无法创建 v11 成长系统迁移备份")
+
+    await db.execute("BEGIN")
+    try:
+        cursor = await db.execute("SELECT id, level, exp FROM users")
+        users = await cursor.fetchall()
+        await cursor.close()
+        for row in users:
+            await db.execute(
+                "UPDATE users SET exp = ? WHERE id = ?",
+                (
+                    migrate_level_exp_preserving_progress(
+                        int(row["level"]),
+                        int(row["exp"]),
+                    ),
+                    int(row["id"]),
+                ),
+            )
+
+        cursor = await db.execute(
+            "SELECT user_pk, skill_id, level, exp, potential FROM user_skills"
+        )
+        skills = await cursor.fetchall()
+        await cursor.close()
+        for row in skills:
+            await db.execute(
+                """
+                UPDATE user_skills
+                SET exp = ?, potential = ?
+                WHERE user_pk = ? AND skill_id = ?
+                """,
+                (
+                    migrate_v10_skill_exp_preserving_progress(
+                        int(row["level"]),
+                        int(row["exp"]),
+                    ),
+                    clamp_skill_potential(int(row["potential"])),
+                    int(row["user_pk"]),
+                    row["skill_id"],
+                ),
+            )
+
+        await db.execute(
+            """
+            INSERT INTO schema_migrations (migration_id, applied_at)
+            VALUES (?, datetime('now'))
+            """,
+            (V11_PROGRESSION_MIGRATION,),
+        )
+        cursor = await db.execute("PRAGMA quick_check")
+        integrity = await cursor.fetchone()
+        await cursor.close()
+        if not integrity or integrity[0] != "ok":
+            raise RuntimeError("v11 成长迁移后的数据库完整性检查失败")
         await db.commit()
     except Exception:
         await db.rollback()

@@ -28,6 +28,7 @@ class PassiveBonuses:
     magic_potential_bonus: float = 0.0
     mana_overcast_reduction: float = 0.0
     pve_stealth: float = 0.0
+    dual_wield_efficiency: float = 0.0
     spell_bonuses: dict[str, float] = field(default_factory=dict)
     style_multiplier: float = 1.0
 
@@ -42,9 +43,9 @@ def resolve_passive_bonuses(
     """Resolve learned passive levels against one immutable equipment build."""
     result = PassiveBonuses()
     if equipment.weapon_mode == "dual_wield":
-        result.style_multiplier = max(
-            0.65,
-            0.80 - max(0.0, equipment.weapon_weight - 6.0) * 0.01,
+        result.dual_wield_efficiency = max(
+            0.25,
+            0.35 - max(0.0, equipment.weapon_weight - 6.0) * 0.01,
         )
     elif equipment.weapon_mode in {
         "one_hand", "two_hand_melee", "two_hand_heavy",
@@ -69,10 +70,9 @@ def resolve_passive_bonuses(
                 school = effect.effect_id[len(SPELL_EFFECT_PREFIX):]
                 result.spell_bonuses[school] = result.spell_bonuses.get(school, 0.0) + bonus
             elif effect.effect_id == "dual_wield_style":
-                weight_penalty = max(0.0, equipment.weapon_weight - 6.0) * 0.01
-                result.style_multiplier = max(
+                result.dual_wield_efficiency = min(
                     0.65,
-                    min(1.0, 0.80 + bonus - weight_penalty),
+                    result.dual_wield_efficiency + bonus,
                 )
             elif effect.effect_id == "two_handed_style":
                 result.style_multiplier = min(1.10, 0.80 + bonus)

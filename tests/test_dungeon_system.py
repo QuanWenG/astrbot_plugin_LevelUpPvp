@@ -65,11 +65,20 @@ class DungeonServiceTests(unittest.IsolatedAsyncioTestCase):
             await db.commit()
         self.user = await self.users.get_user_by_pk(self.user.id)
 
-    async def test_catalog_loads_two_dungeons(self):
+    async def test_catalog_loads_all_nefia_themes(self):
         dungeons = self.dungeon_catalog.list()
-        self.assertEqual(len(dungeons), 2)
+        self.assertEqual(len(dungeons), 5)
         ids = {d.dungeon_id for d in dungeons}
-        self.assertEqual(ids, {"verdant_wetland", "ember_outpost"})
+        self.assertEqual(
+            ids,
+            {
+                "verdant_wetland",
+                "ember_outpost",
+                "sealed_archive",
+                "moonfang_den",
+                "aberrant_rift",
+            },
+        )
         for dungeon in dungeons:
             self.assertGreaterEqual(len(dungeon.waves), 5)
             self.assertGreater(dungeon.clear_rewards.equipment_count, 0)
@@ -83,6 +92,19 @@ class DungeonServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(result.exp_gain, 0)
         self.assertEqual(len(result.rewards), 2)
         self.assertFalse(result.player_defeated)
+        async with await connect_db(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT source, exp_gain FROM reward_ledger
+                WHERE user_pk = ? AND source = 'dungeon_growth'
+                """,
+                (self.user.id,),
+            )
+            audit = await cursor.fetchone()
+            await cursor.close()
+        self.assertIsNotNone(audit)
+        self.assertEqual(audit["source"], "dungeon_growth")
+        self.assertEqual(int(audit["exp_gain"]), result.exp_gain)
 
     async def test_fail_ember_outpost_with_low_level_player(self):
         result = await self.service.run_dungeon(self.user, "ember_outpost", "")
@@ -107,12 +129,11 @@ class DungeonServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertAlmostEqual(exp, round(pvp_exp * discount), delta=2)
 
-    async def test_combat_state_shared_not_recovered(self):
-        # Use a level 3 player: strong enough to clear slimes but will
-        # take some damage, proving state is saved and shared with PvP.
+    async def test_dungeon_continuation_does_not_leak_into_pvp(self):
+        # State carries between waves inside the run, but a dungeon must never
+        # leave HP/MP/status damage in the global PvP continuation table.
         await self._set_user_level(3)
         await self.service.run_dungeon(self.user, "verdant_wetland", "")
-        # Verify a combat_states record was persisted for this user.
         async with await connect_db(self.db_path) as db:
             cursor = await db.execute(
                 "SELECT hp_ratio, version, defeated FROM combat_states WHERE user_pk = ?",
@@ -120,38 +141,51 @@ class DungeonServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             row = await cursor.fetchone()
             await cursor.close()
-        self.assertIsNotNone(row, "combat state should be persisted")
-        self.assertGreaterEqual(int(row["version"]), 1)
-        # If the player took damage, hp_ratio < 1.0. If they happened to
-        # end at full HP, that is also acceptable; the key invariant is
-        # that a state record exists (shared with PvP, not recovered).
+        self.assertIsNone(row)
 
     async def test_partial_kill_reward_on_failure(self):
-        await self._set_user_level(8)
-        # Run many times to statistically verify partial rewards can occur.
-        got_reward_at_least_once = False
-        for _ in range(30):
-            # Re-create the user state for each attempt is impractical;
-            # instead just verify the service runs without error.
-            try:
-                result = await self.service.run_dungeon(
-                    self.user, "ember_outpost", ""
-                )
-                if not result.cleared and result.rewards:
-                    got_reward_at_least_once = True
-                    break
-                if result.cleared:
-                    break
-            except Exception:
-                pass
-        # We don't strictly assert (random), but the service should not crash.
+        class FixedRng:
+            def __init__(self, reward_roll: float):
+                self.reward_roll = reward_roll
+
+            def random(self) -> float:
+                return self.reward_roll
+
+            def randrange(self, *_args) -> int:
+                return 123_456
+
+        spec = self.dungeon_catalog.get(
+            "ember_outpost"
+        ).partial_kill_rewards
+        self.assertGreater(spec.chance, 0.0)
+        async with await connect_db(self.db_path) as db:
+            awarded = await self.service._grant_partial_rewards_in_db(
+                db, self.user.id, spec, FixedRng(spec.chance / 2)
+            )
+            denied = await self.service._grant_partial_rewards_in_db(
+                db, self.user.id, spec, FixedRng(spec.chance)
+            )
+            await db.commit()
+
+            cursor = await db.execute(
+                "SELECT COUNT(*) AS count FROM equipment_items "
+                "WHERE owner_pk = ?",
+                (self.user.id,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+
+        self.assertEqual(len(awarded), spec.equipment_count)
+        self.assertTrue(all(item.owner_pk == self.user.id for item in awarded))
+        self.assertEqual(denied, [])
+        self.assertEqual(int(row["count"]), spec.equipment_count)
 
     async def test_unknown_dungeon_raises(self):
         with self.assertRaises(KeyError):
             await self.service.run_dungeon(self.user, "nonexistent", "")
 
-    async def test_defeat_restores_state_to_full(self):
-        """Defeated players should have their combat state reset, not left defeated."""
+    async def test_defeat_does_not_create_global_combat_state(self):
+        """Defeat is terminal to the run and cannot poison later PvP state."""
         result = await self.service.run_dungeon(self.user, "ember_outpost", "")
         self.assertTrue(result.player_defeated)
         async with await connect_db(self.db_path) as db:
@@ -161,19 +195,15 @@ class DungeonServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             row = await cursor.fetchone()
             await cursor.close()
-        self.assertIsNotNone(row)
-        self.assertEqual(int(row["defeated"]), 0)
-        self.assertAlmostEqual(float(row["hp_ratio"]), 1.0)
+        self.assertIsNone(row)
 
-    async def test_challenge_cooldown_shared_with_pvp(self):
-        """Three dungeon runs within 10 minutes should block a fourth."""
+    async def test_legacy_gauntlet_is_limited_to_one_rewarded_run_per_day(self):
         await self._set_user_level(50)
-        for _ in range(3):
-            await self.service.run_dungeon(self.user, "verdant_wetland", "")
+        await self.service.run_dungeon(self.user, "verdant_wetland", "")
         with self.assertRaises(ValueError) as ctx:
-            await self.service.run_dungeon(self.user, "verdant_wetland", "")
-        self.assertIn("3", str(ctx.exception))
-        self.assertIn("分钟", str(ctx.exception))
+            await self.service.run_dungeon(self.user, "ember_outpost", "")
+        self.assertIn("每天仅可结算1次", str(ctx.exception))
+        self.assertIn("/奈菲亚", str(ctx.exception))
 
 
 class DungeonCommandParsingTests(unittest.IsolatedAsyncioTestCase):

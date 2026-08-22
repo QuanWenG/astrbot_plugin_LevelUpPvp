@@ -4001,12 +4001,18 @@
       "capturable": true,
       "attribute_weights": {},
       "skills": {},
-      "abilities": [],
+      "abilities": [
+        {
+          "ability_id": "monster_split",
+          "min_level": 1,
+          "priority": 100
+        }
+      ],
       "removed_ability_ids": [],
       "combat": {},
       "resistances": {},
       "source_effects": [
-        "分裂（当前引擎未结算）"
+        "分出短命复制体协同攻击"
       ],
       "source_stats": {},
       "provenance": {
@@ -5087,12 +5093,18 @@
       "capturable": true,
       "attribute_weights": {},
       "skills": {},
-      "abilities": [],
+      "abilities": [
+        {
+          "ability_id": "monster_split",
+          "min_level": 1,
+          "priority": 100
+        }
+      ],
       "removed_ability_ids": [],
       "combat": {},
       "resistances": {},
       "source_effects": [
-        "分裂（当前引擎未结算）"
+        "分出短命复制体协同攻击"
       ],
       "source_stats": {},
       "provenance": {
@@ -7129,12 +7141,18 @@
       "capturable": true,
       "attribute_weights": {},
       "skills": {},
-      "abilities": [],
+      "abilities": [
+        {
+          "ability_id": "monster_corrosive_splash",
+          "min_level": 1,
+          "priority": 100
+        }
+      ],
       "removed_ability_ids": [],
       "combat": {},
       "resistances": {},
       "source_effects": [
-        "腐蚀装备（当前引擎未结算）"
+        "弱酸会暂时降低护甲，不损坏装备"
       ],
       "source_stats": {},
       "provenance": {
@@ -8583,12 +8601,18 @@
       "capturable": true,
       "attribute_weights": {},
       "skills": {},
-      "abilities": [],
+      "abilities": [
+        {
+          "ability_id": "monster_split",
+          "min_level": 1,
+          "priority": 100
+        }
+      ],
       "removed_ability_ids": [],
       "combat": {},
       "resistances": {},
       "source_effects": [
-        "分裂（当前引擎未结算）"
+        "分出短命复制体协同攻击"
       ],
       "source_stats": {},
       "provenance": {
@@ -9269,12 +9293,18 @@
       "capturable": true,
       "attribute_weights": {},
       "skills": {},
-      "abilities": [],
+      "abilities": [
+        {
+          "ability_id": "monster_split",
+          "min_level": 1,
+          "priority": 100
+        }
+      ],
       "removed_ability_ids": [],
       "combat": {},
       "resistances": {},
       "source_effects": [
-        "分裂（当前引擎未结算）"
+        "分出短命复制体协同攻击"
       ],
       "source_stats": {},
       "provenance": {

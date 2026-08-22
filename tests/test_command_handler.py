@@ -67,8 +67,29 @@ _install_dependency_stubs()
 
 from astrbot.api.message_components import At
 from handles.command_handler import LevelUpPvpCommandHandler
+from models.ability import (
+    SpellBookCollectionEntry,
+    SpellBookCraftResult,
+    SpellBookItem,
+    SpellBookLibrary,
+    SpellReadResult,
+    SpellResearchCraftOption,
+    UserSpell,
+)
+from models.chat_activity import (
+    CHAT_ACTIVITY_RULESET_ID,
+    ChatActivityDecision,
+    ChatActivitySettlementResult,
+    ChatRewardIntent,
+)
 from models.user import CheckinResult, User, UserIdentity
+from models.workshop import (
+    BulkSalvagePreview,
+    BulkSalvageResult,
+    DominatedSalvageItem,
+)
 from services.db import connect_db, init_db
+from services.progression_rules import level_exp_required
 from services.skill_service import SkillService
 from services.user_service import UserService
 
@@ -227,6 +248,42 @@ class AutoCheckinHandlerTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    def test_commands_are_auto_checkin_candidates_but_explicit_sign_is_not(self):
+        handler = self._handler()
+        self.assertTrue(handler.is_auto_checkin_event(FakeEvent(message="/面板")))
+        self.assertTrue(
+            handler.is_auto_checkin_event(
+                FakeEvent(
+                    message="<@bot-1> 面板",
+                    messages=[At("bot-1", "机器人")],
+                )
+            )
+        )
+        self.assertTrue(
+            handler.is_auto_checkin_event(
+                FakeEvent(
+                    message="艾斯比 <@user-2>",
+                    messages=[At("user-2", "对手")],
+                )
+            )
+        )
+        self.assertTrue(
+            handler.is_auto_checkin_event(FakeEvent(message="今天去哪里探险？"))
+        )
+
+    async def test_first_command_settles_checkin_without_extra_reply(self):
+        handler = self._handler(_result())
+
+        replies = [
+            item
+            async for item in handler.ambient_activity(
+                FakeEvent(message="/面板")
+            )
+        ]
+
+        self.assertEqual(handler.checkin_service.calls, 1)
+        self.assertEqual(replies, [])
+
     async def test_auto_checkin_replies_once_then_stays_silent(self):
         handler = self._handler(_result(), _result(already_checked=True))
         event = FakeEvent(messages=[object()])
@@ -237,6 +294,23 @@ class AutoCheckinHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(first), 1)
         self.assertIn("签到成功", first[0])
         self.assertEqual(second, [])
+
+    async def test_ambient_activity_prefers_discovery_over_checkin_reply(self):
+        handler = self._handler(_result())
+        handler.chat_activity = mock.Mock(
+            return_value=self._async_items("发现了一本魔法书")
+        )
+
+        replies = [
+            item async for item in handler.ambient_activity(FakeEvent())
+        ]
+
+        self.assertEqual(replies, ["发现了一本魔法书"])
+
+    @staticmethod
+    async def _async_items(*items):
+        for item in items:
+            yield item
 
     async def test_explicit_checkin_does_not_require_registration(self):
         handler = self._handler(_result())
@@ -253,7 +327,135 @@ class AutoCheckinHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("今天已经签到过了", replies[0])
         self.assertIn("今日签到经验：20", replies[0])
         self.assertIn("连续签到：1 天", replies[0])
-        self.assertIn("等级：Lv.1 经验：20/100", replies[0])
+        self.assertIn(
+            f"等级：Lv.1 经验：20/{level_exp_required(1)}",
+            replies[0],
+        )
+
+
+class ChatActivityHandlerTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _intent():
+        return ChatRewardIntent(
+            reward_key="chat:2026-08-11:user-1:1",
+            ruleset_id=CHAT_ACTIVITY_RULESET_ID,
+            group_id="group-1",
+            day_key="2026-08-11",
+            user_pk=1,
+            valid_message_index=1,
+            experience=3,
+            equipment_seed=7,
+            spell_id="magic_arrow",
+            spell_name="魔法箭",
+            spellbook_seed=8,
+            story_id="test",
+            story_text="一阵风把两个包裹吹到了你脚边。",
+        )
+
+    def _handler(self, settlement):
+        intent = self._intent()
+
+        class Activity:
+            context = None
+
+            async def prepare_message(inner_self, context):
+                inner_self.context = context
+                return ChatActivityDecision(
+                    context.event_key,
+                    True,
+                    "reward_reserved",
+                    intent.day_key,
+                    1,
+                    1,
+                    intent,
+                )
+
+        class Settlement:
+            calls = 0
+
+            async def settle(inner_self, value):
+                inner_self.calls += 1
+                self.assertEqual(value, intent)
+                return settlement
+
+        activity = Activity()
+        settlement_service = Settlement()
+        user_service = types.SimpleNamespace(
+            get_or_create_user=mock.AsyncMock(return_value=_user())
+        )
+        handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=user_service,
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+            chat_activity_service=activity,
+            chat_activity_settlement_service=settlement_service,
+        )
+        return handler, activity, settlement_service
+
+    async def test_drop_is_announced_with_actionable_ids(self):
+        result = ChatActivitySettlementResult(
+            reward_key=self._intent().reward_key,
+            applied=True,
+            experience=3,
+            equipment=types.SimpleNamespace(
+                id=21,
+                name="旅人短剑",
+                quality="excellent",
+                item_level=4,
+            ),
+            spellbook=types.SimpleNamespace(id=22),
+            spell_name="魔法箭",
+            story_text="一阵风把两个包裹吹到了你脚边。",
+        )
+        handler, activity, settlement = self._handler(result)
+        event = FakeEvent(message="今天去哪里冒险？")
+
+        replies = [item async for item in handler.chat_activity(event)]
+
+        self.assertEqual(len(replies), 1)
+        self.assertIn("旅人短剑", replies[0])
+        self.assertIn("魔法箭", replies[0])
+        self.assertIn("/装备详情 21", replies[0])
+        self.assertIn("/阅读 22", replies[0])
+        self.assertFalse(activity.context.is_command)
+        self.assertEqual(settlement.calls, 1)
+
+    async def test_xp_only_growth_stays_silent(self):
+        result = ChatActivitySettlementResult(
+            reward_key=self._intent().reward_key,
+            applied=True,
+            experience=3,
+            story_text="你从闲谈里悟到一点心得。",
+        )
+        handler, _, settlement = self._handler(result)
+
+        replies = [
+            item
+            async for item in handler.chat_activity(
+                FakeEvent(message="普通而自然的一句话")
+            )
+        ]
+
+        self.assertEqual(replies, [])
+        self.assertEqual(settlement.calls, 1)
+
+    async def test_commands_are_marked_for_domain_rejection(self):
+        result = ChatActivitySettlementResult(
+            reward_key=self._intent().reward_key,
+            applied=False,
+        )
+        handler, activity, _ = self._handler(result)
+
+        _ = [
+            item
+            async for item in handler.chat_activity(
+                FakeEvent(message="/面板")
+            )
+        ]
+
+        self.assertTrue(activity.context.is_command)
 
 
 class BatchCommandParsingTests(unittest.TestCase):
@@ -659,6 +861,37 @@ class EquipmentGrantCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["只有 AstrBot 管理员可以使用该指令。"], replies)
         equipment_service.grant_catalog_item.assert_not_awaited()
 
+    async def test_inventory_shows_total_pages_and_safe_cleanup_entry(self):
+        items = [
+            types.SimpleNamespace(
+                id=index,
+                name=f"测试装备{index}",
+                quality="common",
+                item_level=1,
+                material="iron",
+                weight=1.0,
+                is_locked=False,
+            )
+            for index in range(1, 13)
+        ]
+        equipment_service = types.SimpleNamespace(
+            list_items=mock.AsyncMock(return_value=items),
+            get_loadout=mock.AsyncMock(return_value=({}, [])),
+        )
+        handler = self._handler(equipment_service=equipment_service)
+        handler._own_user = mock.AsyncMock(return_value=_user())
+        handler.reply_text = mock.AsyncMock(
+            side_effect=lambda event, text, *args: text
+        )
+
+        reply = [
+            value async for value in handler.inventory(FakeEvent(), page=2)
+        ][0]
+
+        self.assertIn("共12件 · 第2/2页", reply)
+        self.assertIn("No.11", reply)
+        self.assertIn("/工坊 整理 支配", reply)
+
     async def test_equipment_catalog_is_paginated_and_filterable(self):
         from services.equipment_catalog import DEFAULT_EQUIPMENT_CATALOG
 
@@ -948,7 +1181,7 @@ class EquipmentGrantCommandTests(unittest.IsolatedAsyncioTestCase):
             ),
             random_affixes=(),
             fusion_affixes=(),
-            source_effects=("识破隐形",),
+            source_effects=("识破隐形", "防止物品被盗"),
         )
         equipment_service = types.SimpleNamespace(
             item_detail=mock.AsyncMock(return_value=item)
@@ -977,7 +1210,148 @@ class EquipmentGrantCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("触发能力（原始）：时间停止 10.0%", reply)
         self.assertIn("触发能力（当前有效）：时间停止 5.0%", reply)
-        self.assertIn("资料效果（当前未结算）：识破隐形", reply)
+        self.assertIn("已生效效果：识破隐形", reply)
+        self.assertIn("资料效果（当前未结算）：防止物品被盗", reply)
+
+
+class WorkshopCommandUiTests(unittest.IsolatedAsyncioTestCase):
+    def _handler(self, workshop_service, equipment_service=None):
+        handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=types.SimpleNamespace(),
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+            equipment_service=equipment_service or types.SimpleNamespace(),
+            workshop_service=workshop_service,
+        )
+        handler._registration_error = mock.AsyncMock(return_value="")
+        handler._own_user = mock.AsyncMock(
+            return_value=types.SimpleNamespace(
+                id=1,
+                group_id="group-1",
+            )
+        )
+        handler.reply_text = mock.AsyncMock(
+            side_effect=lambda event, text, *args: text
+        )
+        return handler
+
+    async def test_dominated_preview_explains_keeper_and_exact_confirmation(self):
+        reason = DominatedSalvageItem(
+            equipment_id=11,
+            equipment_name="旧短剑",
+            quality="excellent",
+            item_level=20,
+            slot_label="主手",
+            direction_labels=("灵巧",),
+            keeper_id=19,
+            keeper_name="迅捷短剑",
+            keeper_quality="rare",
+            keeper_level=25,
+        )
+        preview = BulkSalvagePreview(
+            user_pk=1,
+            quality="dominated",
+            quality_label="同槽同方向被完全支配的装备",
+            items=((11, "旧短剑", 20),),
+            scrap_total=13,
+            confirmation_token="a1b2c3d4e5",
+            policy_id="dominated",
+            dominated_items=(reason,),
+        )
+        workshop = types.SimpleNamespace(
+            preview_bulk_salvage=mock.AsyncMock(return_value=preview)
+        )
+        handler = self._handler(workshop)
+
+        reply = [
+            item async for item in handler.workshop(FakeEvent(), "整理 支配")
+        ][0]
+
+        self.assertIn("安全整理预览：1件被完全支配装备", reply)
+        self.assertIn("#11 优秀旧短剑 Lv.20 → 保留#19 精良迅捷短剑", reply)
+        self.assertIn("〔主手/灵巧〕", reply)
+        self.assertIn("已装备、收藏锁定", reply)
+        self.assertIn("史诗/神话（传说）、白星/黑星", reply)
+        self.assertIn("/工坊 批量分解 支配 a1b2c3d4e5", reply)
+
+    async def test_excellent_preview_lists_every_id_and_safety_boundary(self):
+        preview = BulkSalvagePreview(
+            user_pk=1,
+            quality="excellent",
+            quality_label="未穿戴普通与优秀装备",
+            items=(
+                (11, "旧短剑", 20),
+                (14, "旧斗篷", 22),
+            ),
+            scrap_total=27,
+            confirmation_token="f1e2d3c4b5",
+            policy_id="excellent",
+        )
+        workshop = types.SimpleNamespace(
+            preview_bulk_salvage=mock.AsyncMock(return_value=preview)
+        )
+        handler = self._handler(workshop)
+
+        reply = [
+            item async for item in handler.workshop(FakeEvent(), "整理 优秀")
+        ][0]
+
+        workshop.preview_bulk_salvage.assert_awaited_once_with(1, "优秀")
+        self.assertIn("优秀及以下整理预览：2件普通/优秀装备", reply)
+        self.assertIn("将分解ID：#11、#14", reply)
+        self.assertIn("预计碎片 +27", reply)
+        self.assertIn("不比较装备数值或构筑", reply)
+        self.assertIn("/工坊 收藏 ID", reply)
+        self.assertIn("精良及以上、白星/黑星均受保护", reply)
+        self.assertIn("重新核对完整装备快照", reply)
+        self.assertIn("/工坊 批量分解 优秀 f1e2d3c4b5", reply)
+
+    async def test_excellent_confirmation_uses_distinct_result_label(self):
+        result = BulkSalvageResult(
+            user_pk=1,
+            quality="excellent",
+            item_count=2,
+            equipment_ids=(11, 14),
+            scrap_gained=27,
+            balance_after=35,
+        )
+        workshop = types.SimpleNamespace(
+            bulk_salvage=mock.AsyncMock(return_value=result)
+        )
+        handler = self._handler(workshop)
+
+        reply = [
+            item
+            async for item in handler.workshop(
+                FakeEvent(),
+                "批量分解 优秀 f1e2d3c4b5",
+            )
+        ][0]
+
+        workshop.bulk_salvage.assert_awaited_once_with(
+            1,
+            "优秀",
+            "f1e2d3c4b5",
+        )
+        self.assertIn("已批量分解 2 件普通/优秀装备", reply)
+        self.assertIn("碎片 +27，当前 35", reply)
+
+    async def test_collection_command_persists_protection(self):
+        item = types.SimpleNamespace(id=77, name="纪念指环", is_locked=True)
+        equipment = types.SimpleNamespace(
+            set_item_locked=mock.AsyncMock(return_value=item)
+        )
+        handler = self._handler(types.SimpleNamespace(), equipment)
+
+        reply = [
+            value async for value in handler.workshop(FakeEvent(), "收藏 77")
+        ][0]
+
+        equipment.set_item_locked.assert_awaited_once_with(1, 77, True)
+        self.assertIn("已收藏锁定 #77", reply)
+        self.assertIn("单件分解都会跳过", reply)
 
 
 class QQOfficialChallengeDispatchTests(unittest.IsolatedAsyncioTestCase):
@@ -1094,3 +1468,152 @@ class LearnSkillRangeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(replies2), 1)
         self.assertIn("学习失败", replies2[0])
         self.assertIn("已经学会", replies2[0])
+
+
+class SpellBookCommandHandlerTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    async def _plain_reply(event, text, title="LevelUpPvp"):
+        return event.plain_result(text)
+
+    def _handler(self, spell_service):
+        handler = LevelUpPvpCommandHandler(
+            context=None,
+            user_service=types.SimpleNamespace(
+                get_or_create_user=mock.AsyncMock(return_value=_user()),
+                has_registered_nickname=mock.AsyncMock(return_value=True),
+                register_nickname=mock.AsyncMock(),
+            ),
+            checkin_service=None,
+            stat_service=None,
+            battle_service=None,
+            spell_service=spell_service,
+        )
+        handler.reply_text = self._plain_reply
+        return handler
+
+    async def test_spellbook_page_is_grouped_and_shows_collection_actions(self):
+        item1 = SpellBookItem(11, 1, "magic_arrow", 2, "chat", 101, True)
+        item2 = SpellBookItem(19, 1, "magic_arrow", 1, "dungeon", 202, True)
+        entry = SpellBookCollectionEntry(
+            spell_id="magic_arrow",
+            spell_name="魔法箭",
+            school_id="magic_training",
+            items=(item1, item2),
+            quantity=3,
+            learned_spell=UserSpell("magic_arrow", 4, 12, 180),
+            success_chance=0.735,
+            reading_power=355,
+            reading_difficulty=120,
+            reading_attribute="magic",
+            study_progress=0.20,
+            studied_today=False,
+            school_level=8,
+        )
+        library = SpellBookLibrary(
+            entries=(entry,),
+            learned_count=1,
+            total_spell_count=84,
+            research_pages=15,
+            craft_options=(
+                SpellResearchCraftOption(
+                    "armor_spell", "护甲术", "barrier", 12, True
+                ),
+            ),
+        )
+        service = types.SimpleNamespace(
+            get_book_library=mock.AsyncMock(return_value=library)
+        )
+        handler = self._handler(service)
+
+        replies = [
+            reply async for reply in handler.spellbooks(FakeEvent(), page=99)
+        ]
+
+        self.assertEqual(len(replies), 1)
+        text = replies[0]
+        self.assertIn("第1/1页", text)
+        self.assertIn("法术图鉴 1/84", text)
+        self.assertIn("持有 3本/1种", text)
+        self.assertIn("咒文残页 15张", text)
+        self.assertIn("《魔法箭》×3 [已学Lv.4·潜力180%]", text)
+        self.assertIn("#11×2、#19", text)
+        self.assertIn("成功率73.5%", text)
+        self.assertIn("研读进度20%", text)
+        self.assertIn("默认最老#11", text)
+        self.assertIn("护甲术(12)", text)
+        self.assertIn("/研制 法术名", text)
+
+    async def test_read_by_name_reports_max_potential_conversion(self):
+        result = SpellReadResult(
+            spell=UserSpell("magic_arrow", 8, 0, 400),
+            success=True,
+            chance=1.0,
+            random_seed=777,
+            consumed=1,
+            outcome="research_converted",
+            research_pages_gain=3,
+            research_pages_balance=18,
+        )
+        service = types.SimpleNamespace(
+            read_book=mock.AsyncMock(return_value=result)
+        )
+        handler = self._handler(service)
+
+        replies = [
+            reply
+            async for reply in handler.read_spellbook(FakeEvent(), "魔法箭")
+        ]
+
+        service.read_book.assert_awaited_once()
+        self.assertEqual(service.read_book.await_args.args[1], "魔法箭")
+        self.assertIn("重复书已化为3张咒文残页", replies[0])
+        self.assertIn("当前残页：18张", replies[0])
+
+    async def test_repeat_read_reports_potential_and_annotated_page(self):
+        result = SpellReadResult(
+            spell=UserSpell("magic_arrow", 3, 0, 118),
+            success=True,
+            chance=0.8,
+            random_seed=778,
+            consumed=1,
+            potential_gain=18,
+            reading_power=300,
+            reading_difficulty=120,
+            reading_attribute="magic",
+            outcome="potential_restored",
+            research_pages_gain=1,
+            research_pages_balance=7,
+        )
+        service = types.SimpleNamespace(
+            read_book=mock.AsyncMock(return_value=result)
+        )
+        handler = self._handler(service)
+
+        reply = [
+            value
+            async for value in handler.read_spellbook(FakeEvent(), "魔法箭")
+        ][0]
+
+        self.assertIn("潜力恢复至118%（+18%）", reply)
+        self.assertIn("同时抄录了1张咒文残页", reply)
+        self.assertIn("当前共7张", reply)
+
+    async def test_targeted_craft_returns_actionable_book_id(self):
+        item = SpellBookItem(
+            23, 1, "armor_spell", 1, "spell_research", 909, True
+        )
+        service = types.SimpleNamespace(
+            craft_book=mock.AsyncMock(
+                return_value=SpellBookCraftResult(item, "护甲术", 12, 4)
+            )
+        )
+        handler = self._handler(service)
+
+        replies = [
+            reply
+            async for reply in handler.craft_spellbook(FakeEvent(), "护甲术")
+        ]
+
+        self.assertIn("《护甲术》#23", replies[0])
+        self.assertIn("消耗12张", replies[0])
+        self.assertIn("/阅读 23", replies[0])

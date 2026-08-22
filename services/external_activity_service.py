@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import random
+import time
 from dataclasses import asdict
 from typing import ClassVar
 
 try:
     from ..models.user import UserIdentity
     from .attribute_service import attribute_exp_required, training_efficiency
+    from .daily_growth_budget import allocate_daily_growth_in_db
     from .db import connect_db
     from .progression_rules import (
         RULESET_ID,
@@ -21,6 +24,7 @@ except ImportError:
         attribute_exp_required,
         training_efficiency,
     )
+    from services.daily_growth_budget import allocate_daily_growth_in_db
     from services.db import connect_db
     from services.progression_rules import (
         RULESET_ID,
@@ -83,7 +87,7 @@ class ExternalActivityService:
             raise ValueError("source 和 reward_key 不能为空")
 
         async with await connect_db(self.db_path) as db:
-            await db.execute("BEGIN")
+            await db.execute("BEGIN IMMEDIATE")
             try:
                 user, _ = await self.user_service.get_or_create_user_in_db(
                     db, identity
@@ -126,16 +130,26 @@ class ExternalActivityService:
                     )
 
                 level_exp = 0
+                requested_level_exp = 0
+                growth_now_ts = int(time.time())
                 level_ups = []
                 if "correct" in components:
                     roll_count = max(
                         1,
                         int(user.perception) + int(user.magic),
                     )
-                    level_exp = sum(
+                    requested_level_exp = sum(
                         self.randint(*self.LEVEL_EXP_ROLL_RANGE)
                         for _ in range(roll_count)
                     )
+                    allocation = await allocate_daily_growth_in_db(
+                        db,
+                        user_pk=user.id,
+                        level=user.level,
+                        requested_exp=requested_level_exp,
+                        at=growth_now_ts,
+                    )
+                    level_exp = allocation.granted
                     exp_result = await self.user_service.add_exp_in_db(
                         db, user, level_exp
                     )
@@ -212,6 +226,44 @@ class ExternalActivityService:
                             display_exp(per_component["perception"]),
                             display_exp(per_component["magic"]),
                             now,
+                        ),
+                    )
+                if "correct" in components:
+                    cursor = await db.execute(
+                        """
+                        SELECT id FROM external_activity_rewards
+                        WHERE user_pk = ? AND source = ? AND reward_key = ?
+                          AND component = 'correct'
+                        """,
+                        (user.id, source, reward_key),
+                    )
+                    correct_row = await cursor.fetchone()
+                    await cursor.close()
+                    if correct_row is None:
+                        raise RuntimeError("external correct reward audit row is missing")
+                    await db.execute(
+                        """
+                        INSERT INTO reward_ledger (
+                            reward_key, user_pk, battle_id, source, exp_gain,
+                            currency_gain, reason, created_at_ts
+                        ) VALUES (?, ?, NULL, ?, ?, 0, ?, ?)
+                        """,
+                        (
+                            f"external-growth:{int(correct_row['id'])}",
+                            user.id,
+                            f"external_activity:{source}",
+                            level_exp,
+                            json.dumps(
+                                {
+                                    "caller_source": source,
+                                    "caller_reward_key": reward_key,
+                                    "requested_experience": requested_level_exp,
+                                    "granted_experience": level_exp,
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                            growth_now_ts,
                         ),
                     )
                 await db.commit()

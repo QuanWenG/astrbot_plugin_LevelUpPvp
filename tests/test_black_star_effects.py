@@ -139,7 +139,18 @@ class EquipmentProcCombatTests(unittest.TestCase):
             self.engine._apply_damage,
         )
 
-        self.assertEqual(target.statuses["stun"].remaining_ticks, 20)
+        # Equipment procs share the active ruleset's hard-control contract.
+        status_rules = self.engine.ruleset.status
+        self.assertEqual(
+            target.statuses["stun"].remaining_ticks,
+            status_rules.hard_control_duration_cap_ticks,
+        )
+        self.assertEqual(
+            target.hard_control_immunity_until,
+            state.tick
+            + status_rules.hard_control_duration_cap_ticks
+            + status_rules.post_control_immunity_ticks,
+        )
         self.assertTrue(
             any(
                 event.kind == "equipment_proc"

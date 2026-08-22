@@ -1,7 +1,9 @@
+import hashlib
 import json
+import math
 import random
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 try:
     from ..models.equipment import EQUIPMENT_SLOTS, EquipmentItem
@@ -31,6 +33,98 @@ class EquipmentGrantResult:
     equipment_name: str
     granted: int
     skipped: int
+
+
+REWARD_QUALITY_ORDER = ("common", "excellent", "rare", "epic", "mythic")
+MAX_REWARD_QUALITY_BONUS = 4.0
+REWARD_QUALITY_BONUS_PER_TIER = 2.0
+
+
+@dataclass(frozen=True)
+class RewardQualityPolicy:
+    """Transparent conversion from Nefia reward multiplier to item quality.
+
+    ``quality_bonus`` is the route multiplier in excess of one.  Every two
+    points fill one complete quality tier.  Fractional progress is the exact
+    chance to advance one more tier; completed tiers become guaranteed
+    upgrades and a matching minimum quality.  Crossing a whole tier therefore
+    changes ``99% excellent`` into ``guaranteed excellent`` instead of jumping
+    from a tiny chance to a hidden rarity floor.
+    """
+
+    requested_bonus: float
+    effective_bonus: float
+    quality_progress: float
+    minimum_quality: str
+    guaranteed_upgrades: int
+    upgrade_chance: float
+
+
+def reward_quality_policy(quality_bonus: float = 0.0) -> RewardQualityPolicy:
+    """Return the bounded, player-explainable quality policy for one reward."""
+
+    if isinstance(quality_bonus, bool):
+        raise TypeError("quality_bonus must be a finite non-negative number")
+    try:
+        requested = float(quality_bonus)
+    except (TypeError, ValueError) as error:
+        raise TypeError(
+            "quality_bonus must be a finite non-negative number"
+        ) from error
+    if not math.isfinite(requested) or requested < 0:
+        raise ValueError("quality_bonus must be a finite non-negative number")
+    effective = min(MAX_REWARD_QUALITY_BONUS, requested)
+    quality_progress = effective / REWARD_QUALITY_BONUS_PER_TIER
+    guaranteed_upgrades = min(
+        len(REWARD_QUALITY_ORDER) - 1,
+        int(math.floor(quality_progress + 1e-12)),
+    )
+    fractional_progress = max(0.0, quality_progress - guaranteed_upgrades)
+    return RewardQualityPolicy(
+        requested_bonus=requested,
+        effective_bonus=effective,
+        quality_progress=quality_progress,
+        minimum_quality=REWARD_QUALITY_ORDER[guaranteed_upgrades],
+        guaranteed_upgrades=guaranteed_upgrades,
+        upgrade_chance=min(1.0, fractional_progress),
+    )
+
+
+def apply_reward_quality_bonus(
+    base_quality: str,
+    quality_bonus: float,
+    *,
+    seed: int,
+) -> str:
+    """Apply continuous quality progress with deterministic fractional rolls.
+
+    A zero bonus is exactly backward compatible.  The named child seed keeps
+    the quality decision independent from template, level, material and affix
+    random draws, so retries and future call-order changes cannot reroll loot.
+    """
+
+    if base_quality not in REWARD_QUALITY_ORDER:
+        return str(base_quality)
+    policy = reward_quality_policy(quality_bonus)
+    base_index = REWARD_QUALITY_ORDER.index(base_quality)
+    floor_index = REWARD_QUALITY_ORDER.index(policy.minimum_quality)
+    quality_index = max(
+        base_index + policy.guaranteed_upgrades,
+        floor_index,
+    )
+    quality_index = min(len(REWARD_QUALITY_ORDER) - 1, quality_index)
+    if quality_index >= len(REWARD_QUALITY_ORDER) - 1 or policy.upgrade_chance <= 0:
+        return REWARD_QUALITY_ORDER[quality_index]
+    child_seed = int.from_bytes(
+        hashlib.blake2b(
+            f"{int(seed)}\0nefia-quality-v2".encode("ascii"),
+            digest_size=8,
+        ).digest(),
+        "big",
+    )
+    if random.Random(child_seed).random() < policy.upgrade_chance:
+        quality_index += 1
+    return REWARD_QUALITY_ORDER[quality_index]
 
 
 class EquipmentService:
@@ -194,6 +288,8 @@ class EquipmentService:
         level_min: int,
         level_max: int,
         seed: int | None = None,
+        *,
+        quality_bonus: float = 0.0,
     ) -> EquipmentItem:
         """Generate a single random equipment reward within a catalog-ID range.
 
@@ -213,7 +309,8 @@ class EquipmentService:
             raise ValueError(
                 f"装备目录中不存在ID范围[{catalog_id_min},{catalog_id_max})的可生成装备"
             )
-        rng = random.Random(seed if seed is not None else self._seed_source())
+        root_seed = seed if seed is not None else self._seed_source()
+        rng = random.Random(root_seed)
         entry: EquipmentCatalogEntry = rng.choice(candidates)
         generation = entry.generation
         item_level = rng.randint(
@@ -229,6 +326,11 @@ class EquipmentService:
             )[0]
         else:
             quality = "common"
+        quality = apply_reward_quality_bonus(
+            quality,
+            quality_bonus,
+            seed=int(root_seed),
+        )
         materials = generation.get("materials", ())
         if materials:
             material = rng.choices(
@@ -258,6 +360,8 @@ class EquipmentService:
         level_min: int,
         level_max: int,
         seed: int | None = None,
+        *,
+        quality_bonus: float = 0.0,
     ) -> EquipmentItem:
         """Generate a reward and persist it within an existing transaction."""
         item = self.generate_reward(
@@ -267,6 +371,7 @@ class EquipmentService:
             level_min,
             level_max,
             seed,
+            quality_bonus=quality_bonus,
         )
         await self._insert_item_in_db(db, item)
         return item
@@ -281,8 +386,8 @@ class EquipmentService:
                 enchant_capacity, used_capacity, base_stats_json,
                 inherent_affixes_json, random_affixes_json,
                 fusion_affixes_json, bound, description, source_effects_json,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                is_locked, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._insert_values(item),
         )
@@ -291,6 +396,17 @@ class EquipmentService:
         row = await cursor.fetchone()
         await cursor.close()
         return int(row["id"])
+
+    async def insert_item_in_db(self, db, item: EquipmentItem) -> int:
+        """Persist ``item`` inside the caller-owned transaction.
+
+        Application services such as dungeon rewards and the workshop need to
+        compose equipment persistence with their own atomic settlement.  This
+        narrow public wrapper keeps the SQL representation owned by
+        ``EquipmentService`` without taking over commit/rollback responsibility.
+        """
+        return await self._insert_item_in_db(db, item)
+
     async def list_items(self, user_pk: int) -> list[EquipmentItem]:
         async with await connect_db(self.db_path) as db:
             await self.ensure_starter_in_db(db, user_pk)
@@ -502,6 +618,31 @@ class EquipmentService:
         async with await connect_db(self.db_path) as db:
             return await self._get_owned_item_in_db(db, user_pk, equipment_id)
 
+    async def set_item_locked(
+        self,
+        user_pk: int,
+        equipment_id: int,
+        locked: bool,
+    ) -> EquipmentItem:
+        """Persist a player's explicit protection flag for one owned item."""
+
+        async with await connect_db(self.db_path) as db:
+            try:
+                await db.execute("BEGIN IMMEDIATE")
+                item = await self._get_owned_item_in_db(
+                    db, int(user_pk), int(equipment_id)
+                )
+                await db.execute(
+                    "UPDATE equipment_items SET is_locked = ? "
+                    "WHERE id = ? AND owner_pk = ?",
+                    (1 if locked else 0, int(item.id), int(user_pk)),
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+        return replace(item, is_locked=bool(locked))
+
     async def _get_owned_item_in_db(self, db, user_pk, equipment_id):
         cursor = await db.execute(
             "SELECT * FROM equipment_items WHERE id = ? AND owner_pk = ?",
@@ -512,6 +653,15 @@ class EquipmentService:
         if not row:
             raise ValueError("装备不存在或不属于你")
         return self._row_to_item(row)
+
+    async def get_owned_item_in_db(
+        self,
+        db,
+        user_pk: int,
+        equipment_id: int,
+    ) -> EquipmentItem:
+        """Load an owned item inside the caller-owned transaction."""
+        return await self._get_owned_item_in_db(db, user_pk, equipment_id)
 
     def _target_slots(self, item: EquipmentItem, requested: str) -> tuple[str, ...]:
         if item.hand_mode in {"two_hand_heavy", "two_hand_melee", "two_hand_ranged"}:
@@ -543,6 +693,7 @@ class EquipmentService:
             json.dumps(item.fusion_affixes, ensure_ascii=False),
             1 if item.bound else 0, item.description,
             json.dumps(item.source_effects, ensure_ascii=False),
+            1 if item.is_locked else 0,
             utc_now_text(),
         )
 
@@ -559,4 +710,5 @@ class EquipmentService:
             tuple(json.loads(row["fusion_affixes_json"] or "[]")), bool(row["bound"]),
             row["description"] or "",
             tuple(json.loads(row["source_effects_json"] or "[]")),
+            bool(row["is_locked"]),
         )

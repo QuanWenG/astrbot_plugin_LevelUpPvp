@@ -14,7 +14,7 @@ from services.ability_catalog import (
 )
 from services.ability_runtime import AbilityRuntime
 from services.attribute_service import AttributeService
-from services.balance_rules import spell_damage_amount
+from services.balance_rules import spell_damage_amount, triangular_variance
 from services.combat_engine import SideviewCombatEngine
 from services.skill_service import SkillService
 from services.spell_rules import spell_base_power, spell_multiplier_for
@@ -153,10 +153,21 @@ class SpellMultiplierTests(unittest.TestCase):
                     base = spell_base_power(
                         definition, actor, spell_level
                     )
-                    variance = random.Random(91).uniform(0.90, 1.10)
+                    variance_rng = random.Random(91)
+                    variance = triangular_variance(
+                        variance_rng.random(), variance_rng.random()
+                    )
                     expected = spell_damage_amount(
                         base_power=base,
-                        effect_multiplier=effect.value,
+                        effect_multiplier=min(
+                            effect.params.get("mastery_multiplier_cap", effect.value),
+                            max(
+                                effect.params.get("mastery_multiplier_floor", effect.value),
+                                effect.params.get("mastery_multiplier_floor", effect.value)
+                                + effect.params.get("mastery_multiplier_growth", 0.0)
+                                * max(0, spell_level - 1),
+                            ),
+                        ),
                         spell_multiplier=spell_multiplier_for(
                             definition, actor
                         ),
@@ -281,7 +292,8 @@ class RegisteredEffectTests(unittest.TestCase):
             random.Random(2),
         )
         self.assertAlmostEqual(
-            actor.statuses["warrior_totem"].params["physical_damage"], 0.38
+            actor.statuses["warrior_totem_aura"].params["physical_damage"],
+            0.38,
         )
         self.assertEqual(state.entities[0].aura_radius, 250)
         self.assertEqual(state.entities[0].remaining_ticks, 40)

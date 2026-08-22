@@ -1,4 +1,4 @@
-﻿import os
+import os
 import shutil
 import unittest
 import uuid
@@ -202,6 +202,22 @@ class AutoEquipTests(unittest.IsolatedAsyncioTestCase):
         # Old item should be gone if we equipped a different one
         if len(items) > 1:
             self.assertNotIn(items[0].id, new_slots.values())
+
+    async def test_locked_offhand_survives_automatic_loadout_selection(self):
+        items = await self.equipment.list_items(self.user.id)
+        shield = next(item for item in items if item.hand_mode == "shield")
+        await self.equipment.set_item_locked(self.user.id, shield.id, True)
+        await self.equipment.unequip(self.user.id, "main_hand")
+        await self._grant(3018)  # 双手重斧
+
+        await self.handler.auto_equip_service.auto_equip_user(
+            self.user,
+            respect_locked=True,
+        )
+        slots, _ = await self.equipment.get_loadout(self.user.id)
+
+        self.assertEqual(slots.get("off_hand"), shield.id)
+        self.assertNotEqual(slots.get("main_hand"), shield.id)
 
 
 if __name__ == "__main__":

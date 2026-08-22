@@ -84,6 +84,7 @@ class CombatStateRecoveryTests(unittest.TestCase):
             recovery_ticks=2,
             hitstun_ticks=1,
             counter_cooldown=4,
+            hard_control_immunity_ticks=5,
             lethal_survival_used=True,
         )
         fighter = self.engine._fighter_from_initial(
@@ -102,9 +103,22 @@ class CombatStateRecoveryTests(unittest.TestCase):
         self.assertEqual(restored.skill_cooldowns["spell_fire"], 7)
         self.assertIn("insight", restored.statuses)
         self.assertTrue(restored.lethal_survival_used)
+        self.assertEqual(restored.hard_control_immunity_until, 5)
         self.assertFalse(restored.attack_pending)
         self.assertIsNone(restored.pending_skill_id)
         self.assertEqual(restored.position, 800)
+
+    def test_offline_recovery_expires_hard_control_immunity(self):
+        initial = FighterContinuationState(
+            hard_control_immunity_ticks=3,
+            updated_at_ts=100,
+        )
+
+        after_one_turn = self.service.advance(self.snapshot, initial, 130)
+        after_three_turns = self.service.advance(self.snapshot, initial, 190)
+
+        self.assertEqual(after_one_turn.hard_control_immunity_ticks, 2)
+        self.assertEqual(after_three_turns.hard_control_immunity_ticks, 0)
 
     def test_periodic_damage_defeat_immediately_restores_full_state(self):
         initial = FighterContinuationState(
@@ -181,6 +195,20 @@ class CombatStatePersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(battle_state.hp_ratio, 1)
         self.assertEqual(battle_state.mana_ratio, 1)
         self.assertEqual(battle_state.stamina_ratio, 1)
+
+    async def test_hard_control_immunity_round_trips_through_database(self):
+        state = FighterContinuationState(
+            hard_control_immunity_ticks=4,
+            updated_at_ts=100,
+        )
+        async with await connect_db(self.db_path) as db:
+            await self.service.save_in_db(db, 1, state, 100)
+            await db.commit()
+            restored = await self.service.load_in_db(
+                db, self.snapshot, 100
+            )
+
+        self.assertEqual(restored.hard_control_immunity_ticks, 4)
 
 
 if __name__ == "__main__":

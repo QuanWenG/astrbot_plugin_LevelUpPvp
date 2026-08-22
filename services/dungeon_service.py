@@ -12,8 +12,13 @@ try:
     from .combat_ai import profile_for_strategy
     from .combat_engine import SideviewCombatEngine
     from .combat_state_service import CombatStateService
+    from .daily_growth_budget import (
+        allocate_daily_growth_in_db,
+        daily_growth_day_window,
+    )
     from .db import connect_db
     from .dungeon_catalog import DungeonCatalog, DungeonDefinition
+    from .dungeon_application_service import DungeonAdventureApplicationService
     from .equipment_service import EquipmentService
     from .monster_build_service import MonsterBuildService
     from .skill_service import SkillService
@@ -30,8 +35,13 @@ except ImportError:
     from services.combat_ai import profile_for_strategy
     from services.combat_engine import SideviewCombatEngine
     from services.combat_state_service import CombatStateService
+    from services.daily_growth_budget import (
+        allocate_daily_growth_in_db,
+        daily_growth_day_window,
+    )
     from services.db import connect_db
     from services.dungeon_catalog import DungeonCatalog, DungeonDefinition
+    from services.dungeon_application_service import DungeonAdventureApplicationService
     from services.equipment_service import EquipmentService
     from services.monster_build_service import MonsterBuildService
     from services.skill_service import SkillService
@@ -61,8 +71,8 @@ class DungeonRunResult:
 class DungeonService:
     """PvE dungeon runs reusing the sideview combat engine.
 
-    The player fights monsters one by one in a gauntlet. HP/MP/stamina carry
-    over between waves (shared with PvP combat state -- no recovery). Killing a
+    The legacy command fights monsters one by one in a gauntlet. HP/MP/stamina
+    carry over between its waves but never leak into PvP. Killing a
     monster grants skill/attribute growth and a discounted chunk of level EXP.
     """
 
@@ -95,6 +105,21 @@ class DungeonService:
         self.dungeon_catalog = dungeon_catalog or DungeonCatalog(
             monster_catalog=monster_build_service.catalog,
         )
+        # Handler-facing persistent application facade for the interactive
+        # 3--5 node Nefia.  The legacy one-shot ``run_dungeon`` stays available
+        # so old /挑战 副本名 integrations do not break during migration.
+        self.adventures = DungeonAdventureApplicationService(
+            db_path,
+            user_service,
+            build_service,
+            monster_build_service,
+            equipment_service,
+            skill_service,
+            attribute_service,
+            spell_service,
+            combat_engine=self.combat_engine,
+            dungeon_catalog=self.dungeon_catalog,
+        )
 
     def list_dungeons(self) -> tuple[DungeonDefinition, ...]:
         return self.dungeon_catalog.list()
@@ -104,6 +129,85 @@ class DungeonService:
 
     def get_dungeon_by_name(self, name: str) -> DungeonDefinition | None:
         return self.dungeon_catalog.get_by_name(name)
+
+    async def start_nefia(
+        self,
+        identity: UserIdentity,
+        dungeon_id: str,
+        difficulty: int = 1,
+        strategy: str = "",
+        *,
+        now_ts: int | None = None,
+    ):
+        return await self.adventures.start_or_resume(
+            identity,
+            dungeon_id,
+            difficulty,
+            strategy,
+            now_ts=now_ts,
+        )
+
+    async def view_nefia(
+        self,
+        identity: UserIdentity,
+        adventure_id: str = "",
+        *,
+        dungeon_id: str = "",
+        now_ts: int | None = None,
+    ):
+        return await self.adventures.view(
+            identity,
+            adventure_id,
+            dungeon_id=dungeon_id,
+            now_ts=now_ts,
+        )
+
+    async def choose_nefia_route(
+        self,
+        identity: UserIdentity,
+        adventure_id: str,
+        option_id: str,
+        *,
+        now_ts: int | None = None,
+    ):
+        return await self.adventures.choose_route(
+            identity, adventure_id, option_id, now_ts=now_ts
+        )
+
+    async def choose_nefia_risk(
+        self,
+        identity: UserIdentity,
+        adventure_id: str,
+        risk_id: str,
+        *,
+        now_ts: int | None = None,
+    ):
+        return await self.adventures.choose_risk(
+            identity, adventure_id, risk_id, now_ts=now_ts
+        )
+
+    async def fight_nefia(
+        self,
+        identity: UserIdentity,
+        adventure_id: str,
+        strategy: str = "",
+        *,
+        now_ts: int | None = None,
+    ):
+        return await self.adventures.fight(
+            identity, adventure_id, strategy, now_ts=now_ts
+        )
+
+    async def retreat_nefia(
+        self,
+        identity: UserIdentity,
+        adventure_id: str,
+        *,
+        now_ts: int | None = None,
+    ):
+        return await self.adventures.retreat(
+            identity, adventure_id, now_ts=now_ts
+        )
 
     async def run_dungeon(
         self,
@@ -115,7 +219,7 @@ class DungeonService:
         strategy = (strategy or "").strip()
         async with await connect_db(self.db_path) as db:
             try:
-                await db.execute("BEGIN")
+                await db.execute("BEGIN IMMEDIATE")
                 result = await self._run_locked(db, identity, dungeon, strategy)
                 await db.commit()
                 return result
@@ -132,11 +236,13 @@ class DungeonService:
     ) -> DungeonRunResult:
         user, _ = await self.user_service.get_or_create_user_in_db(db, identity)
         now_ts = int(time.time())
+        await self._check_legacy_daily_limit(db, user.id, now_ts)
         await self._check_challenge_limit(db, user.id, now_ts)
         player_snapshot = await self.build_service.snapshot_in_db(db, user, strategy)
-        player_state = await self.combat_state_service.load_in_db(
-            db, player_snapshot, now_ts
-        )
+        # A dungeon owns its continuation state.  Starting a PvE run is always
+        # pristine and the carried state is discarded at the terminal result,
+        # preventing dungeon damage/statuses from contaminating PvP.
+        player_state = self.combat_state_service.pristine(now_ts)
         # Record the run up-front to obtain a stable id for growth logs.
         now_text = utc_now_text()
         cursor = await db.execute(
@@ -160,12 +266,37 @@ class DungeonService:
         run_row = await cursor.fetchone()
         await cursor.close()
         run_id = int(run_row["id"])
+        growth_reward_key = f"dungeon-growth:{run_id}"
+        await db.execute(
+            """
+            INSERT INTO reward_ledger (
+                reward_key, user_pk, battle_id, source, exp_gain,
+                currency_gain, reason, created_at_ts
+            ) VALUES (?, ?, NULL, 'dungeon_growth', 0, 0, ?, ?)
+            """,
+            (
+                growth_reward_key,
+                user.id,
+                json.dumps(
+                    {
+                        "dungeon_id": dungeon.dungeon_id,
+                        "run_id": run_id,
+                        "requested_experience": 0,
+                        "granted_experience": 0,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                now_ts,
+            ),
+        )
 
         player_ai = profile_for_strategy(strategy)
         rng = random.SystemRandom()
         simulations: list[SimulationResult] = []
         monsters_killed = 0
         total_exp_gain = 0
+        total_requested_exp = 0
         all_skill_growths: list = []
         all_spell_growths: list = []
         all_attribute_growths: list = []
@@ -192,6 +323,9 @@ class DungeonService:
                 seed,
                 player_state,
                 None,
+                random_environment_pool=(
+                    SideviewCombatEngine.SUPPORTED_ENVIRONMENTS
+                ),
             )
             simulations.append(simulation)
             player_won = simulation.winner_pk == player_snapshot.user_pk
@@ -229,29 +363,37 @@ class DungeonService:
                 monsters_killed += 1
                 player_state = simulation.attacker_final_state
                 # Discounted level EXP for this kill.
-                exp_gain = self._pve_exp_gain(
+                proposed_exp = self._pve_exp_gain(
                     user.level, wave.level, dungeon.exp_discount_rate, rng
                 )
+                total_requested_exp += proposed_exp
+                allocation = await allocate_daily_growth_in_db(
+                    db,
+                    user_pk=user.id,
+                    level=user.level,
+                    requested_exp=proposed_exp,
+                    at=now_ts,
+                )
+                exp_gain = allocation.granted
                 if exp_gain > 0:
                     exp_result = await self.user_service.add_exp_in_db(
                         db, user, exp_gain
                     )
                     total_exp_gain += exp_gain
+                    await db.execute(
+                        """
+                        UPDATE reward_ledger
+                        SET exp_gain = exp_gain + ?
+                        WHERE reward_key = ?
+                        """,
+                        (exp_gain, growth_reward_key),
+                    )
                     all_level_ups.extend(exp_result.level_ups)
                     user = exp_result.user
             else:
                 player_state = simulation.attacker_final_state
                 player_defeated = True
                 break
-
-        # On defeat, immediately restore the player to full state so they
-        # are not stuck defeated. On clear, the carried-over state persists
-        # (shared with PvP combat state).
-        if player_defeated:
-            player_state = self.combat_state_service.pristine(int(time.time()))
-        await self.combat_state_service.save_in_db(
-            db, user.id, player_state, int(time.time())
-        )
 
         cleared = monsters_killed >= len(dungeon.waves)
 
@@ -283,6 +425,25 @@ class DungeonService:
                 for item in rewards
             ],
             ensure_ascii=False,
+        )
+        await db.execute(
+            """
+            UPDATE reward_ledger SET reason = ? WHERE reward_key = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "dungeon_id": dungeon.dungeon_id,
+                        "run_id": run_id,
+                        "monsters_killed": monsters_killed,
+                        "requested_experience": total_requested_exp,
+                        "granted_experience": total_exp_gain,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                growth_reward_key,
+            ),
         )
         await db.execute(
             """
@@ -381,6 +542,26 @@ class DungeonService:
             raise ValueError(
                 "10 分钟内最多挑战 3 次，"
                 f"约 {max(1, (remain + 59) // 60)} 分钟后再试"
+            )
+
+    @staticmethod
+    async def _check_legacy_daily_limit(db, user_pk: int, now_ts: int) -> None:
+        """Keep the compatibility gauntlet from becoming an item printer."""
+        _, start_ts, end_ts = daily_growth_day_window(now_ts)
+        cursor = await db.execute(
+            """
+            SELECT 1 FROM dungeon_runs
+            WHERE user_pk = ? AND created_at_ts >= ? AND created_at_ts < ?
+            LIMIT 1
+            """,
+            (int(user_pk), int(start_ts), int(end_ts)),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is not None:
+            raise ValueError(
+                "旧固定波次副本每天仅可结算1次（04:00刷新）；"
+                "请用 /奈菲亚 继续探索随机路线"
             )
 
     @staticmethod

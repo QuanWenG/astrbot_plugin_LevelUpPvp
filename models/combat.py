@@ -107,6 +107,12 @@ class AIProfile:
     preferred_range: int = 90
     retreat_tendency: float = 0.15
     low_hp_risk: float = 0.5
+    strategy_name: str = "稳扎稳打"
+    tactic_plan: tuple[str, str, str] = (
+        "sustain",
+        "sustain",
+        "sustain",
+    )
 
 
 @dataclass(frozen=True)
@@ -132,6 +138,7 @@ class FighterContinuationState:
     recovery_ticks: int = 0
     hitstun_ticks: int = 0
     counter_cooldown: int = 0
+    hard_control_immunity_ticks: int = 0
     stance_id: str | None = None
     frozen_mana_ratio: float = 0.0
     frozen_mana_capacity_ratio: float = 0.0
@@ -180,6 +187,11 @@ class FighterState:
     current_attributes: PrimaryAttributes | None = None
     current_derived: DerivedStats | None = None
     runtime_effective_skills: dict[str, int] = field(default_factory=dict)
+    fortune_charges: int = 0
+    fortune_cooldown: int = 0
+    hard_control_immunity_until: int = 0
+    tactic_initiative: float = 0.0
+    tactic_counter_sp_cost: float = 0.0
 
     def __post_init__(self) -> None:
         if self.current_attributes is None:
@@ -273,6 +285,9 @@ class BattleState:
     finish_reason: str = ""
     entities: list[BattleEntity] = field(default_factory=list)
     zones: list[BattleZone] = field(default_factory=list)
+    ruleset_id: str = "sideview-v11"
+    environment_id: str = "calm"
+    tactic_phase: str = ""
 
 
 @dataclass(frozen=True)
@@ -302,10 +317,14 @@ class SimulationResult:
     final_zones: tuple[dict, ...] = ()
     attacker_final_state: FighterContinuationState | None = None
     defender_final_state: FighterContinuationState | None = None
+    ruleset_id: str = "sideview-v11"
+    environment_id: str = "calm"
 
     def to_dict(self) -> dict:
         return {
             "engine_version": self.engine_version,
+            "ruleset_id": self.ruleset_id,
+            "environment_id": self.environment_id,
             "random_seed": self.random_seed,
             "duration_ticks": self.duration_ticks,
             "finish_reason": self.finish_reason,

@@ -10,11 +10,12 @@ try:
     from .attribute_service import skill_level_cap, training_efficiency
     from .db import connect_db
     from .progression_rules import (
-        RULESET_ID,
+        SKILL_RULESET_ID,
+        clamp_skill_potential,
         decay_skill_potential,
         display_exp,
-        recover_potential,
-        scaled_exp_gain,
+        recover_skill_potential,
+        scaled_skill_exp_gain,
     )
     from .skill_catalog import INITIAL_SKILLS, SKILL_DEFINITIONS, skill_exp_required, skill_id_for
     from .user_service import utc_now_text
@@ -28,11 +29,12 @@ except ImportError:
     from services.attribute_service import skill_level_cap, training_efficiency
     from services.db import connect_db
     from services.progression_rules import (
-        RULESET_ID,
+        SKILL_RULESET_ID,
+        clamp_skill_potential,
         decay_skill_potential,
         display_exp,
-        recover_potential,
-        scaled_exp_gain,
+        recover_skill_potential,
+        scaled_skill_exp_gain,
     )
     from services.skill_catalog import INITIAL_SKILLS, SKILL_DEFINITIONS, skill_exp_required, skill_id_for
     from services.user_service import utc_now_text
@@ -41,7 +43,7 @@ except ImportError:
 class SkillService:
     MAX_LEVEL = 100
     MAX_EFFECTIVE_LEVEL = 150
-    MAX_POTENTIAL = 400
+    MAX_POTENTIAL = 200
     RAW_XP_CAP = 20
 
     def __init__(self, db_path: str):
@@ -83,7 +85,15 @@ class SkillService:
         )
         rows = await cursor.fetchall()
         await cursor.close()
-        return {row["skill_id"]: UserSkill(row["skill_id"], int(row["level"]), int(row["exp"]), int(row["potential"])) for row in rows}
+        return {
+            row["skill_id"]: UserSkill(
+                row["skill_id"],
+                int(row["level"]),
+                int(row["exp"]),
+                clamp_skill_potential(int(row["potential"])),
+            )
+            for row in rows
+        }
 
     async def active_slots_in_db(self, db, user_pk: int) -> tuple[str, ...]:
         cursor = await db.execute(
@@ -214,7 +224,7 @@ class SkillService:
                     for _ in range(int(requested)):
                         if potential >= self.MAX_POTENTIAL:
                             break
-                        potential = recover_potential(potential)
+                        potential = recover_skill_potential(potential)
                         spent += 1
                     if not spent:
                         raise ValueError(
@@ -407,7 +417,7 @@ class SkillService:
             )
             if skill.level >= min(self.MAX_LEVEL, level_cap):
                 continue
-            gain = scaled_exp_gain(
+            gain = scaled_skill_exp_gain(
                 min(self.RAW_XP_CAP, raw),
                 skill.potential,
                 will_efficiency,
@@ -429,7 +439,10 @@ class SkillService:
                 "rules_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     user_pk, battle_id, skill_id, gain, old_level, level,
-                    old_potential, potential, utc_now_text(), RULESET_ID,
+                    old_potential,
+                    potential,
+                    utc_now_text(),
+                    SKILL_RULESET_ID,
                 ),
             )
             growths.append(

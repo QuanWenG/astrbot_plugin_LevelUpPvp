@@ -3,6 +3,7 @@ import os
 import shutil
 import unittest
 import uuid
+from unittest.mock import AsyncMock
 
 from tests.test_battle_exp_balance import _install_dependency_stubs
 
@@ -46,7 +47,14 @@ class SideviewBattleServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNotNone(result.simulation)
-        self.assertEqual(result.simulation.engine_version, "sideview-v10")
+        self.assertEqual(
+            result.simulation.engine_version,
+            result.simulation.ruleset_id,
+        )
+        self.assertEqual(
+            result.simulation.engine_version,
+            self.service.combat_engine.ENGINE_VERSION,
+        )
         self.assertEqual(result.winner.id, result.simulation.winner_pk)
         self.assertGreaterEqual(len(result.battle_log), 6)
         self.assertLessEqual(len(result.battle_log), 10)
@@ -64,12 +72,28 @@ class SideviewBattleServiceTests(unittest.IsolatedAsyncioTestCase):
 
         payload = json.loads(row["simulation_json"])
         self.assertEqual(row["battle_mode"], "sideview")
-        self.assertEqual(row["engine_version"], "sideview-v10")
+        self.assertEqual(
+            row["engine_version"],
+            self.service.combat_engine.ENGINE_VERSION,
+        )
         self.assertEqual(row["random_seed"], result.simulation.random_seed)
         self.assertEqual(row["duration_ticks"], result.simulation.duration_ticks)
         self.assertEqual(row["finish_reason"], result.simulation.finish_reason)
         self.assertEqual(payload["winner_pk"], result.winner.id)
         self.assertTrue(payload["events"])
+
+    async def test_unqualified_spar_cannot_farm_operation_progress(self):
+        operations = AsyncMock()
+        self.service.operation_service = operations
+
+        result = await self.service.battle(
+            UserIdentity("test", "group", "new-a", "新手甲"),
+            UserIdentity("test", "group", "new-b", "新手乙"),
+            "稳扎稳打",
+        )
+
+        self.assertEqual(result.winner_exp_gain, 0)
+        operations.record_event.assert_not_awaited()
 
     async def test_qq_official_uses_image_report(self):
         class Event:

@@ -1,5 +1,4 @@
 import asyncio
-import math
 import os
 import unittest
 from datetime import date, datetime
@@ -29,65 +28,64 @@ class CheckinRewardTests(unittest.TestCase):
     def setUp(self):
         self.service = CheckinService(":memory:", UserService(":memory:"))
 
-    def test_rolls_once_per_level_and_caps_base_reward(self):
+    def test_reward_spends_a_fixed_share_of_the_daily_budget(self):
         with patch(
-            "services.checkin_service.random.randint",
-            side_effect=[50, 50, 50, 0],
-        ) as mocked_randint:
+            "services.checkin_service.random.uniform", return_value=1.0
+        ) as mocked_uniform:
             result = self.service._roll_exp(level=3, streak_days=1)
 
-        required = config.exp_required_for_next_level(3)
-        self.assertEqual(result, math.floor(required * 0.60))
-        self.assertEqual(mocked_randint.call_count, 4)
+        self.assertEqual(result, 65)
+        mocked_uniform.assert_called_once_with(0.90, 1.10)
 
-    def test_exact_ten_percent_does_not_trigger_fallback(self):
-        with (
-            patch(
-                "services.checkin_service.random.randint",
-                side_effect=[10, 0],
-            ),
-            patch("services.checkin_service.random.uniform") as mocked_uniform,
-        ):
-            result = self.service._roll_exp(level=1, streak_days=1)
-
-        self.assertEqual(result, 10)
-        mocked_uniform.assert_not_called()
-
-    def test_fallback_directly_replaces_a_higher_raw_roll(self):
-        with (
-            patch(
-                "services.checkin_service.random.randint",
-                side_effect=[9, 0],
-            ),
-            patch(
-                "services.checkin_service.random.uniform",
-                return_value=0.08,
-            ),
-        ):
-            result = self.service._roll_exp(level=1, streak_days=1)
-
-        self.assertEqual(result, 8)
-
-    def test_streak_bonus_is_added_after_base_cap(self):
+    def test_reward_no_longer_reads_a_percentage_of_the_level_bar(self):
         with patch(
-            "services.checkin_service.random.randint",
-            side_effect=[100, 35],
+            "services.checkin_service.config.exp_required_for_next_level",
+            side_effect=AssertionError("check-in must not read the level bar"),
+        ), patch(
+            "services.checkin_service.random.uniform", return_value=1.0
+        ):
+            result = self.service._roll_exp(level=1, streak_days=1)
+
+        self.assertEqual(result, 58)
+
+    def test_variance_is_small_and_symmetric_around_the_budget(self):
+        with patch(
+            "services.checkin_service.random.uniform", return_value=0.90
+        ):
+            low = self.service._roll_exp(level=20, streak_days=1)
+        with patch(
+            "services.checkin_service.random.uniform", return_value=1.10
+        ):
+            high = self.service._roll_exp(level=20, streak_days=1)
+
+        self.assertEqual(low, 109)
+        self.assertEqual(high, 133)
+
+    def test_streak_and_catchup_are_bounded_multipliers(self):
+        with patch(
+            "services.checkin_service.random.uniform", return_value=1.0
         ):
             result = self.service._roll_exp(level=1, streak_days=8)
+            caught_up = self.service._roll_exp(
+                level=10,
+                streak_days=1,
+                reference_level=40,
+            )
 
-        self.assertEqual(result, 95)
+        self.assertEqual(result, 66)
+        self.assertEqual(caught_up, 141)
 
 
 class CheckinDateBoundaryTests(unittest.TestCase):
-    def test_before_five_am_belongs_to_previous_checkin_day(self):
+    def test_before_four_am_belongs_to_previous_checkin_day(self):
         self.assertEqual(
-            current_checkin_date(datetime(2026, 7, 3, 4, 59, 59)),
+            current_checkin_date(datetime(2026, 7, 3, 3, 59, 59)),
             date(2026, 7, 2),
         )
 
-    def test_five_am_starts_new_checkin_day(self):
+    def test_four_am_starts_new_checkin_day(self):
         self.assertEqual(
-            current_checkin_date(datetime(2026, 7, 3, 5, 0, 0)),
+            current_checkin_date(datetime(2026, 7, 3, 4, 0, 0)),
             date(2026, 7, 3),
         )
 
@@ -122,6 +120,7 @@ class CheckinPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self._count_checkins(), 1)
 
     async def test_checkin_preserves_overflow_and_returns_level_up(self):
+        required = config.exp_required_for_next_level(1)
         async with await connect_db(self.db_path) as db:
             user, _ = await self.user_service.get_or_create_user_in_db(
                 db,
@@ -129,7 +128,7 @@ class CheckinPersistenceTests(unittest.IsolatedAsyncioTestCase):
             )
             await db.execute(
                 "UPDATE users SET exp = ?, total_exp = ? WHERE id = ?",
-                (90, 90, user.id),
+                (required - 10, required - 10, user.id),
             )
             await db.commit()
 
@@ -138,8 +137,31 @@ class CheckinPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.user.level, 2)
         self.assertEqual(result.user.exp, 10)
-        self.assertEqual(result.user.total_exp, 110)
+        self.assertEqual(result.user.total_exp, required + 10)
         self.assertEqual(len(result.level_ups), 1)
+
+    async def test_level_one_hundred_respects_shared_daily_budget(self):
+        async with await connect_db(self.db_path) as db:
+            user, _ = await self.user_service.get_or_create_user_in_db(
+                db,
+                self.identity,
+            )
+            await db.execute(
+                "UPDATE users SET level = 100, exp = 0, total_exp = 0 "
+                "WHERE id = ?",
+                (user.id,),
+            )
+            await db.commit()
+
+        with patch.object(self.service, "_roll_exp", return_value=999999):
+            result = await self.service.checkin(self.identity)
+
+        self.assertEqual(result.user.level, 100)
+        budget = config.exp_daily_budget(100)
+        self.assertEqual(result.user.exp, budget)
+        self.assertEqual(result.user.total_exp, budget)
+        self.assertEqual(result.exp_gain, budget)
+        self.assertEqual(result.level_ups, [])
 
     async def test_concurrent_first_messages_create_one_checkin(self):
         identity = UserIdentity(

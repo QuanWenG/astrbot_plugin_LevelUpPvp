@@ -162,6 +162,8 @@ def render_battle_report(result, max_log_lines: int = 8):
     level_items = []
     for item in result.level_ups or []:
         level_items.append((f"升级 Lv.{item.from_level} → Lv.{item.to_level}", COLORS["positive"]))
+    for item in getattr(result, "loser_level_ups", []) or []:
+        level_items.append((f"参与升级 Lv.{item.from_level} → Lv.{item.to_level}", COLORS["positive"]))
     for item in result.level_downs or []:
         level_items.append((f"冻结 Lv.{item.from_level} → Lv.{item.to_level}", COLORS["negative"]))
 
@@ -380,7 +382,7 @@ def render_battle_report(result, max_log_lines: int = 8):
         fill=COLORS["winner"],
     )
     winner_exp = f"{winner_name}  +{result.winner_exp_gain} 经验"
-    loser_exp = f"{loser_name}  -{result.loser_exp_loss} 经验"
+    loser_exp = f"{loser_name}  +{getattr(result, 'loser_exp_gain', 0)} 参与经验"
     draw.text(
         (PAGE_PADDING + CARD_PADDING, y + 93),
         winner_exp,
@@ -392,7 +394,7 @@ def render_battle_report(result, max_log_lines: int = 8):
         (WIDTH - PAGE_PADDING - CARD_PADDING - loser_exp_width, y + 93),
         loser_exp,
         font=font_small,
-        fill=COLORS["negative"],
+        fill=COLORS["positive"],
     )
     result_y = y + 119
     if getattr(result, "is_counterattack", False):

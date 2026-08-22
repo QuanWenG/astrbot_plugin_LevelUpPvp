@@ -12,12 +12,24 @@ except ImportError:
     from services.spell_rules import SPELL_RULES
 
 
+# Four technique milestones should be reachable during a normal level-100
+# career.  The old 10/20/50/80 labels left the last two tiers permanently
+# locked because production skill caps top out around 40-46.  Keep the legacy
+# input labels as aliases below so old catalog declarations remain readable,
+# while the exposed definition uses an early ranged primer at 4 plus the
+# reachable 10/20/35/40 progression for the rest of the weapon kit.
 TECHNIQUE_TIERS = {
+    4: (8, 8, 1, 1),
     10: (15, 10, 1, 2),
     20: (20, 12, 2, 2),
-    50: (30, 20, 2, 3),
-    80: (40, 30, 3, 4),
+    35: (26, 16, 2, 3),
+    40: (34, 24, 3, 4),
+    # Compatibility aliases for tools that still describe the old milestone
+    # names.  Definitions normalize these to 35/40 below.
+    50: (26, 16, 2, 3),
+    80: (34, 24, 3, 4),
 }
+_LEGACY_TECHNIQUE_UNLOCKS = {50: 35, 80: 40}
 SPELL_THRESHOLDS = (1, 20, 50, 80)
 SPELL_COSTS = (10, 18, 30, 45)
 SPELL_COOLDOWNS = (8, 12, 20, 30)
@@ -118,13 +130,21 @@ def technique(
     description: str = "",
     ai_tags: tuple[str, ...] = ("damage",),
 ) -> ActiveAbilityDefinition:
-    sp, cooldown, windup, recovery = TECHNIQUE_TIERS[unlock_level]
+    normalized_unlock = _LEGACY_TECHNIQUE_UNLOCKS.get(
+        int(unlock_level), int(unlock_level)
+    )
+    try:
+        sp, cooldown, windup, recovery = TECHNIQUE_TIERS[normalized_unlock]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported technique unlock tier: {unlock_level}"
+        ) from exc
     return ActiveAbilityDefinition(
         ability_id,
         name,
         ability_type,
         unlock_skill_id,
-        unlock_level,
+        normalized_unlock,
         "sp",
         sp,
         cooldown,
@@ -145,6 +165,9 @@ def technique(
 TECHNIQUE_DEFINITIONS = {
     item.ability_id: item
     for item in (
+        technique("closing_assault", "踏步突击", "tactics", 4, (
+            physical(0.80, params={"flat_attack_power": 4.0}),
+        ), weapon_modes=("one_hand", "sword_shield", "two_hand_melee", "two_hand_heavy"), cast_range=220, targeting="line"),
         technique("whirlwind_slash", "旋风斩", "tactics", 10, (physical(1.0),), cast_range=150, targeting="self_aoe"),
         technique("warrior_totem", "勇士图腾", "tactics", 50, (
             effect("summon", target="self", duration_ticks=40, radius=250, params={"entity_id": "warrior_totem", "aura_status": "warrior_totem_aura", "physical_damage": 0.20}),
@@ -161,6 +184,10 @@ TECHNIQUE_DEFINITIONS = {
             physical(1.80, params={"bonus_if_stance": 1.60}),
         ), weapon_types=("longsword",)),
 
+        technique("feint_stab", "佯攻刺", "shortsword", 4, (
+            physical(0.75, params={"flat_attack_power": 4.0}),
+            status("haze", 10, 0.35),
+        ), weapon_types=("shortsword",), cast_range=110),
         technique("disrupting_strike", "扰乱打击", "shortsword", 20, (
             physical(1.25), status("haze", 20, 0.60),
         ), weapon_types=("shortsword",)),
@@ -195,27 +222,33 @@ TECHNIQUE_DEFINITIONS = {
             status("hunting_moment", 30, magnitude=0.20, target="self", beneficial=True, params={"ranged_followup": 0.15, "penetration": 0.20, "dexterity_damage_cap": 0.20}),
         ), cast_range=0, targeting="self", ai_tags=("buff",)),
 
-        technique("split_arrow", "分裂箭", "bow", 20, (
+        technique("split_arrow", "分裂箭", "bow", 4, (
+            # The primer must feel useful with a training bow without turning
+            # its flat term into a second weapon at low levels.  Its lasting
+            # value is the split stance; later bow power supplies the scale.
+            physical(0.60, params={"flat_attack_power": 12.0}),
             stance("split_arrow", params={"splash_radius": 120, "splash_scale": 0.35}),
-        ), weapon_types=("bow",), cast_range=0, targeting="self", ability_type="stance", exclusive_group="combat_stance", freezes_mana=True, ai_tags=("stance", "buff")),
+        ), weapon_types=("bow",), cast_range=450, ability_type="stance", exclusive_group="combat_stance", freezes_mana=True, ai_tags=("stance", "buff")),
         technique("thorn_arrow", "荆棘箭", "bow", 50, (
             stance("thorn_arrow", params={"on_hit_status": "bleed", "status_chance": 1.0}),
         ), weapon_types=("bow",), cast_range=0, targeting="self", ability_type="stance", exclusive_group="combat_stance", freezes_mana=True, ai_tags=("stance", "buff")),
-        technique("prepared_shot", "预备射击", "bow", 80, (
+        technique("prepared_shot", "预备射击", "bow", 20, (
             physical(1.80, params={"bonus_above_hp": 0.50, "bonus_multiplier": 1.40}),
         ), weapon_types=("bow",), cast_range=450),
 
-        technique("destructive_shot", "破坏射击", "crossbow", 20, (
-            physical(1.30), status("accuracy_down", 25, magnitude=0.25),
-        ), weapon_types=("crossbow",), cast_range=450),
+        replace(technique("destructive_shot", "破坏射击", "crossbow", 4, (
+            physical(0.85, params={"flat_attack_power": 4.0}),
+            status("accuracy_down", 12, 0.55, magnitude=0.15),
+        ), weapon_types=("crossbow",), cast_range=450), resource_cost=8, windup_ticks=1, recovery_ticks=1),
         technique("single_breakthrough", "一点突破", "crossbow", 50, (
             physical(1.55), status("bleed", 30, 1.0, magnitude=0.12),
         ), weapon_types=("crossbow",), cast_range=450),
 
-        technique("ferocious_shot", "凶暴射击", "firearm", 20, (
-            physical(1.30), status("haze", 20, 0.70),
-        ), weapon_types=("firearm",), cast_range=500),
-        technique("armor_piercing_shot", "穿甲射击", "firearm", 50, (
+        replace(technique("ferocious_shot", "凶暴射击", "firearm", 4, (
+            physical(0.85, params={"flat_attack_power": 4.0}),
+            status("haze", 12, 0.50),
+        ), weapon_types=("firearm",), cast_range=500), resource_cost=8, windup_ticks=1, recovery_ticks=1),
+        technique("armor_piercing_shot", "穿甲射击", "firearm", 20, (
             physical(1.55), status("defense_down", 30, magnitude=0.30),
         ), weapon_types=("firearm",), cast_range=500),
 
@@ -294,7 +327,26 @@ def spell_group(school: str, specs: tuple[dict, ...]) -> tuple[ActiveAbilityDefi
 
 SPELL_GROUPS = {
     "magic_training": (
-        dict(ability_id="magic_arrow", name="魔法箭", effects=(magic_damage("magic", 0.85, params={"high_accuracy": True}),)),
+        # A dependable novice spell should not erase every other build before
+        # the caster has actually trained it.  The runtime raises this floor
+        # with spell mastery, preserving the late-game identity of a reliable
+        # arcane projectile.
+        dict(
+            ability_id="magic_arrow",
+            name="魔法箭",
+            effects=(
+                magic_damage(
+                    "magic",
+                    0.55,
+                    params={
+                        "high_accuracy": True,
+                        "mastery_multiplier_floor": 0.55,
+                        "mastery_multiplier_growth": 0.02,
+                        "mastery_multiplier_cap": 0.85,
+                    },
+                ),
+            ),
+        ),
         dict(ability_id="mana_ray", name="聚魔射线", effects=(magic_damage("magic", 0.80),), targeting="line"),
         dict(ability_id="mana_storm", name="魔力风暴", effects=(magic_damage("magic", 0.80),), targeting="self_aoe", cast_range=150),
         dict(ability_id="mana_scar", name="魔力伤痕", effects=(status("resistance_magic_down", 30, magnitude=25),), ai_tags=("debuff",)),
@@ -305,7 +357,7 @@ SPELL_GROUPS = {
         dict(ability_id="teleport", name="瞬间移动", effects=(effect("teleport", target="self", value=500, params={"mode": "random_long"}),), targeting="self", cast_range=0, ai_tags=("mobility",)),
     ),
     "barrier": (
-        dict(ability_id="armor_spell", name="护甲术", effects=(status("armor_spell", 40, magnitude=0.20, target="self", beneficial=True, params={"defense": 0.25, "evasion": 0.15, "physical_reduction": 0.15}),), targeting="self", cast_range=0, exclusive_group="defense_barrier", ai_tags=("defense",)),
+        dict(ability_id="armor_spell", name="护甲术", effects=(status("armor_spell", 40, magnitude=0.20, target="self", beneficial=True, params={"defense": 0.18, "evasion": 0.05, "physical_reduction": 0.06, "mana_shield_ratio": 0.12}),), targeting="self", cast_range=0, exclusive_group="defense_barrier", ai_tags=("defense",)),
         dict(ability_id="holy_shield", name="神圣之盾", effects=(status("holy_shield", 40, magnitude=0.35, target="self", beneficial=True, params={"defense": 0.35}),), targeting="self", cast_range=0, exclusive_group="defense_barrier", ai_tags=("defense",)),
         dict(ability_id="mana_barrier", name="魔力结界", effects=(status("mana_barrier", 40, magnitude=0.30, target="self", beneficial=True, params={"resistance_magic": 30}),), targeting="self", cast_range=0, ai_tags=("defense",)),
         dict(ability_id="shining_word", name="闪耀圣言", effects=(status("paralysis", 12, 0.65),), targeting="self_aoe", cast_range=150, ai_tags=("control",)),
@@ -389,7 +441,44 @@ SPELL_GROUPS = {
         dict(ability_id="beast_claw", name="野兽之爪", effects=(status("beast_claw", 50, magnitude=0.25, target="self", beneficial=True, params={"physical_damage": 0.25}),), targeting="self", cast_range=0, exclusive_group="physical_blessing", ai_tags=("buff",)),
         dict(ability_id="tree_skin", name="树肤术", effects=(status("tree_skin", 40, magnitude=0.25, target="self", beneficial=True, params={"defense": 0.25, "resistance_cold": 25, "bleed_resistance": 0.50}),), targeting="self", cast_range=0, ai_tags=("defense",)),
         dict(ability_id="oak_blessing", name="橡树祝福", effects=(status("oak_blessing", 40, magnitude=0.20, target="self", beneficial=True, params={"dexterity": 0.20, "constitution": 0.20, "perception": 0.20}),), targeting="self", cast_range=0, exclusive_group="body_blessing", ai_tags=("buff",)),
-        dict(ability_id="elm_blessing", name="榆树祝福", effects=(status("elm_blessing", 40, magnitude=0.20, target="self", beneficial=True, params={"perception": 0.20, "magic": 0.20, "willpower": 0.20}),), targeting="self", cast_range=0, exclusive_group="wisdom_blessing", ai_tags=("buff",)),
+        dict(
+            ability_id="elm_blessing",
+            name="榆树祝福",
+            effects=(
+                status(
+                    "elm_blessing",
+                    40,
+                    magnitude=0.20,
+                    target="self",
+                    beneficial=True,
+                    params={
+                        "perception": 0.20,
+                        "magic": 0.20,
+                        "willpower": 0.20,
+                    },
+                ),
+                effect(
+                    "summon",
+                    target="self",
+                    duration_ticks=40,
+                    radius=450,
+                    damage_type="nature",
+                    params={
+                        "entity_id": "elm_guardian",
+                        "aura_status": "elm_guardian_aura",
+                        "periodic_damage": 0.32,
+                        "attack_interval": 5,
+                        "attack_status": "slow",
+                        "status_chance": 0.25,
+                    },
+                ),
+            ),
+            targeting="self",
+            cast_range=0,
+            exclusive_group="wisdom_blessing",
+            description="召来榆树守卫赐福施法者，并周期性发射自然荆棘。",
+            ai_tags=("buff", "summon", "damage"),
+        ),
         dict(ability_id="poison_resistance", name="毒液抵抗", effects=(status("poison_resistance", 40, magnitude=0.35, target="self", beneficial=True, params={"resistance_nature": 35}),), targeting="self", cast_range=0, ai_tags=("defense",)),
         dict(ability_id="earthquake", name="地震", effects=(physical(0.80, params={"self_damage_ratio": 0.25}), status("confusion", 20, 0.55)), targeting="self_aoe", cast_range=180),
         dict(ability_id="poison_cure", name="中毒治疗", effects=(effect("cleanse", target="self", params={"mode": "poison"}),), targeting="self", cast_range=0, ai_tags=("cleanse",)),
@@ -437,9 +526,71 @@ POWER_STRIKE = ActiveAbilityDefinition(
     ai_tags=("damage",),
 )
 
+# Monster signatures use the same runtime contract as player techniques, but
+# they are catalog-only actions: no player skill or spellbook can unlock them.
+MONSTER_ABILITY_DEFINITIONS = {
+    "monster_split": ActiveAbilityDefinition(
+        "monster_split",
+        "活体分裂",
+        "monster",
+        resource_type="sp",
+        resource_cost=10,
+        cooldown_ticks=36,
+        windup_ticks=2,
+        recovery_ticks=2,
+        cast_range=0,
+        targeting="self",
+        effects=(
+            effect(
+                "summon",
+                target="self",
+                duration_ticks=18,
+                radius=450,
+                damage_type="nature",
+                params={
+                    "entity_id": "split_echo",
+                    "aura_status": "split_echo_aura",
+                    "periodic_damage": 0.16,
+                    "attack_interval": 6,
+                },
+            ),
+        ),
+        description="分出一团短命复制体，进行三次可见追击后消散。",
+        ai_tags=("summon", "damage"),
+    ),
+    "monster_corrosive_splash": ActiveAbilityDefinition(
+        "monster_corrosive_splash",
+        "弱酸飞溅",
+        "monster",
+        resource_type="sp",
+        resource_cost=8,
+        cooldown_ticks=24,
+        windup_ticks=1,
+        recovery_ticks=2,
+        cast_range=120,
+        targeting="single",
+        effects=(
+            magic_damage("nature", 0.42),
+            status(
+                "defense_down",
+                12,
+                1.0,
+                magnitude=0.15,
+                params={
+                    "status_power": 25.0,
+                    "source_ability_id": "monster_corrosive_splash",
+                },
+            ),
+        ),
+        description="以弱酸暂时腐蚀护甲，不会损坏或删除玩家装备。",
+        ai_tags=("damage", "debuff"),
+    ),
+}
+
 ACTIVE_ABILITY_DEFINITIONS = {
     **TECHNIQUE_DEFINITIONS,
     **SPELL_DEFINITIONS,
+    **MONSTER_ABILITY_DEFINITIONS,
     POWER_STRIKE.ability_id: POWER_STRIKE,
 }
 ABILITY_NAME_TO_ID = {

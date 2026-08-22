@@ -81,8 +81,12 @@ class WorkspaceTemporaryDirectory:
 from models.battle import BattleResult
 from models.user import LevelDownEvent, LevelUpEvent, User, UserIdentity
 from services import config
-from services.battle_service import BattleService
 from services.db import connect_db, init_db
+from services.pvp_economy import (
+    RewardContext,
+    character_daily_budget,
+    decide_pvp_economy,
+)
 from services.user_service import UserService
 
 
@@ -110,118 +114,77 @@ def _user(*, user_id="user", level=1, exp=0, stat_points=0, hp=10, atk=5):
     )
 
 
+def _reward_context(**overrides):
+    values = {
+        "group_id": "group-1",
+        "battle_date": "2026-08-10",
+        "winner_id": "winner",
+        "loser_id": "loser",
+        "winner_level": 15,
+        "loser_level": 15,
+        "winner_checkin_days": 3,
+        "loser_checkin_days": 3,
+    }
+    values.update(overrides)
+    return RewardContext(**values)
+
+
 class BattleExpFormulaTests(unittest.TestCase):
-    def setUp(self):
-        self.service = BattleService(":memory:", None, None)
+    def test_first_qualified_duel_uses_zero_sum_rating(self):
+        decision = decide_pvp_economy(_reward_context())
 
-    def test_same_level_exp_is_a_single_transfer(self):
-        winner = _user(level=15)
-        loser = _user(user_id="loser", level=15)
-        required = config.exp_required_for_next_level(15)
-
-        with patch("services.battle_service.random.uniform", return_value=0):
-            loss = self.service._roll_loser_exp_loss(winner, loser)
-        gain = self.service._winner_exp_gain_from_loss(winner, loser, loss)
-
-        self.assertEqual(loss, round(required * 0.24))
-        self.assertEqual(gain, loss)
-
-    def test_high_level_beating_low_level_uses_mixed_reward_floor(self):
-        high = _user(level=20)
-        low = _user(user_id="low", level=10)
-
-        with patch("services.battle_service.random.uniform", return_value=-0.04):
-            loss = self.service._roll_loser_exp_loss(high, low)
-        gain = self.service._winner_exp_gain_from_loss(high, low, loss)
-
-        self.assertEqual(loss, round(config.exp_required_for_next_level(10) * 0.02))
+        self.assertTrue(decision.rated)
+        self.assertEqual(decision.mode, "rated")
+        self.assertEqual(decision.winner_rating_delta, 16)
         self.assertEqual(
-            gain,
-            round(config.exp_required_for_next_level(10) * 0.05),
-        )
-        self.assertGreater(gain, loss)
-
-    def test_level_twenty_beating_level_eleven_has_useful_floor(self):
-        high = _user(level=20)
-        low = _user(user_id="low", level=11)
-        required = config.exp_required_for_next_level(11)
-
-        with patch("services.battle_service.random.uniform", return_value=-0.04):
-            worst_loss = self.service._roll_loser_exp_loss(high, low)
-        worst_gain = self.service._winner_exp_gain_from_loss(
-            high,
-            low,
-            worst_loss,
-        )
-        with patch("services.battle_service.random.uniform", return_value=0):
-            normal_loss = self.service._roll_loser_exp_loss(high, low)
-        normal_gain = self.service._winner_exp_gain_from_loss(
-            high,
-            low,
-            normal_loss,
+            decision.winner_rating_delta,
+            -decision.loser_rating_delta,
         )
 
-        self.assertEqual(worst_loss, round(required * 0.02))
-        self.assertEqual(worst_gain, round(required * 0.05))
-        self.assertEqual(normal_loss, round(required * 0.06))
-        self.assertEqual(normal_gain, normal_loss)
+    def test_loser_gains_participation_exp_and_never_loses_a_level(self):
+        decision = decide_pvp_economy(_reward_context())
 
-    def test_five_level_gap_uses_two_percent_step_without_clamping(self):
-        high = _user(level=20)
-        low = _user(user_id="low", level=15)
-        required = config.exp_required_for_next_level(15)
+        self.assertGreater(decision.winner_exp_gain, 0)
+        self.assertGreater(decision.loser_exp_gain, 0)
+        self.assertEqual(decision.loser_exp_loss, 0)
 
-        with patch("services.battle_service.random.uniform", return_value=-0.04):
-            minimum = self.service._roll_loser_exp_loss(high, low)
-        with patch("services.battle_service.random.uniform", return_value=0.06):
-            maximum = self.service._roll_loser_exp_loss(high, low)
-
-        self.assertEqual(minimum, round(required * 0.10))
-        self.assertEqual(maximum, round(required * 0.20))
-
-    def test_level_one_opponent_gives_at_least_five_exp(self):
-        high = _user(level=20)
-        low = _user(user_id="low", level=1)
-
-        with patch("services.battle_service.random.uniform", return_value=-0.04):
-            loss = self.service._roll_loser_exp_loss(high, low)
-        gain = self.service._winner_exp_gain_from_loss(high, low, loss)
-
-        self.assertEqual(loss, 2)
-        self.assertEqual(gain, 5)
-
-    def test_low_level_beating_high_level_can_fill_one_level(self):
-        low = _user(level=10)
-        high = _user(user_id="high", level=20)
-
-        with patch("services.battle_service.random.uniform", return_value=0):
-            loss = self.service._roll_loser_exp_loss(low, high)
-        gain = self.service._winner_exp_gain_from_loss(low, high, loss)
-
-        self.assertEqual(loss, round(config.exp_required_for_next_level(20) * 0.84))
-        self.assertEqual(gain, config.exp_required_for_next_level(10))
-
-    def test_winner_floor_and_level_cap_are_enforced(self):
-        winner = _user(level=15)
-        loser = _user(user_id="loser", level=15)
-
-        floor = round(config.exp_required_for_next_level(15) * 0.05)
-        self.assertEqual(
-            self.service._winner_exp_gain_from_loss(winner, loser, 0),
-            floor,
+    def test_repeat_pair_today_is_spar_without_rating_or_growth(self):
+        decision = decide_pvp_economy(
+            _reward_context(pair_battles_today=1)
         )
-        self.assertEqual(
-            self.service._winner_exp_gain_from_loss(winner, loser, 80),
-            80,
+
+        self.assertFalse(decision.rated)
+        self.assertEqual(decision.mode, "spar")
+        self.assertEqual(decision.winner_rating_delta, 0)
+        self.assertEqual(decision.loser_rating_delta, 0)
+        self.assertEqual(decision.winner_exp_gain, 0)
+        self.assertEqual(decision.loser_exp_gain, 0)
+        self.assertEqual(decision.loser_exp_loss, 0)
+
+    def test_daily_opponent_limit_stops_growth_but_not_rating(self):
+        decision = decide_pvp_economy(
+            _reward_context(
+                winner_growth_opponents_today=3,
+                loser_growth_opponents_today=3,
+            )
         )
-        self.assertEqual(
-            self.service._winner_exp_gain_from_loss(
-                winner,
-                loser,
-                999999,
-            ),
-            config.exp_required_for_next_level(15),
+
+        self.assertTrue(decision.rated)
+        self.assertEqual(decision.winner_exp_gain, 0)
+        self.assertEqual(decision.loser_exp_gain, 0)
+
+    def test_daily_budget_caps_each_side_independently(self):
+        budget = character_daily_budget(15)
+        decision = decide_pvp_economy(
+            _reward_context(
+                winner_daily_exp_earned=budget - 2,
+                loser_daily_exp_earned=budget,
+            )
         )
+
+        self.assertEqual(decision.winner_exp_gain, 2)
+        self.assertEqual(decision.loser_exp_gain, 0)
+        self.assertEqual(decision.loser_exp_loss, 0)
 
 
 class UserExpDowngradeTests(unittest.IsolatedAsyncioTestCase):
@@ -427,6 +390,9 @@ class BattleResultFormattingTests(unittest.TestCase):
             winner_exp_gain=100,
             loser_exp_loss=80,
             analysis="",
+            reward_reason=(
+                "winner_account_not_qualified,spar_no_rating_or_growth"
+            ),
             level_ups=[
                 LevelUpEvent(
                     from_level=2,
@@ -452,3 +418,4 @@ class BattleResultFormattingTests(unittest.TestCase):
         self.assertIn("\u964d\u7ea7\u51bb\u7ed3", text)
         self.assertIn("\u611f\u77e5 -2", text)
         self.assertIn("\u81ea\u5b9a\u4e49\u5c5e\u6027\u70b9 -1", text)
+        self.assertIn("双方都需达到 Lv.5，或各自累计签到 3 天", text)

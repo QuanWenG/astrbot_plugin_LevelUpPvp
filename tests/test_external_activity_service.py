@@ -87,6 +87,19 @@ class ExternalActivityServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["level_exp"], 20)
 
+        async with await connect_db(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                SELECT source, exp_gain FROM reward_ledger
+                WHERE source = 'external_activity:guess'
+                """
+            )
+            audit = await cursor.fetchone()
+            await cursor.close()
+        self.assertIsNotNone(audit)
+        self.assertEqual(audit["source"], "external_activity:guess")
+        self.assertEqual(int(audit["exp_gain"]), result["level_exp"])
+
     async def test_potential_is_a_percentage_multiplier(self):
         user = await self.users.get_or_create_user(self.identity)
         async with await connect_db(self.db_path) as db:

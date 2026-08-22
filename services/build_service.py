@@ -3,7 +3,12 @@ from dataclasses import replace
 
 try:
     from ..models.attributes import PRIMARY_ATTRIBUTE_IDS
-    from ..models.equipment import EquipmentProc
+    from ..models.equipment import (
+        RARE_EQUIPMENT_FIND_BONUS_CAP,
+        SOURCE_EFFECT_CAPABILITIES,
+        SOURCE_EFFECT_RARE_EQUIPMENT_FIND_BONUS,
+        EquipmentProc,
+    )
     from ..models.combat import FighterSnapshot
     from ..models.equipment import EquipmentBuild
     from ..models.skill import SkillBuild
@@ -23,7 +28,12 @@ try:
     from .passive_effects import resolve_passive_bonuses
 except ImportError:
     from models.attributes import PRIMARY_ATTRIBUTE_IDS
-    from models.equipment import EquipmentProc
+    from models.equipment import (
+        RARE_EQUIPMENT_FIND_BONUS_CAP,
+        SOURCE_EFFECT_CAPABILITIES,
+        SOURCE_EFFECT_RARE_EQUIPMENT_FIND_BONUS,
+        EquipmentProc,
+    )
     from models.combat import FighterSnapshot
     from models.equipment import EquipmentBuild
     from models.skill import SkillBuild
@@ -52,7 +62,11 @@ WEAPON_RULES = {
     "two_hand_heavy": (110, 0.70, 2, 3, 8, 18),
     "bow": (350, 0.70, 2, 2, 7, 12),
     "crossbow": (400, 0.75, 2, 3, 8, 13),
-    "firearm": (450, 0.60, 1, 4, 9, 10),
+    # Firearms already pay for range through a four-tick reload and heavier SP
+    # shots.  Keeping their style below the global offence floor made that cost
+    # pure downside at low mastery and a permanent tax later.  Match bows at
+    # the base lane; catalog penetration and reload cadence remain the identity.
+    "firearm": (450, 0.70, 1, 4, 9, 10),
     "throwing": (250, 1.05, 1, 2, 6, 10),
 }
 
@@ -158,9 +172,24 @@ class CombatBuildService:
         item_weights: dict[int, float] = {}
         total_weight = 0.0
         weapon_power = 0.0
+        weapon_power_by_item: dict[int, float] = defaultdict(float)
         armor_power = 0.0
+        exploration_capabilities: set[str] = set()
+        adverse_weather_immunity = False
+        rare_equipment_find_bonus = 0.0
 
         for index, item in enumerate(items):
+            for source_effect in item.source_effects:
+                capability = SOURCE_EFFECT_CAPABILITIES.get(source_effect)
+                if capability:
+                    exploration_capabilities.add(capability)
+                if source_effect == "免疫恶劣天气":
+                    adverse_weather_immunity = True
+                rare_equipment_find_bonus += (
+                    SOURCE_EFFECT_RARE_EQUIPMENT_FIND_BONUS.get(
+                        source_effect, 0.0
+                    )
+                )
             material = material_for(item.material)
             resolved_weight = actual_weight(item.weight, item.material)
             item_weights[item.id if item.id is not None else -(index + 1)] = round(
@@ -200,6 +229,7 @@ class CombatBuildService:
                         * material.defense_factor
                         * quality_factor
                         + item.enhancement_level * 2
+                        + item.item_level / 12.0
                     ) * level_factor
                 elif stat == "accuracy":
                     value = (
@@ -212,6 +242,7 @@ class CombatBuildService:
                 elif stat == "atk":
                     if item.item_type == "weapon":
                         weapon_power += value
+                        weapon_power_by_item[id(item)] += value
                     else:
                         effects["attack_power"] += value
                 elif stat == "defense":
@@ -224,6 +255,8 @@ class CombatBuildService:
                     stat_values["magic"] += value
                 elif stat == "weapon_power":
                     weapon_power += value
+                    if item.item_type == "weapon":
+                        weapon_power_by_item[id(item)] += value
                 elif stat == "armor_power":
                     armor_power += value
                 else:
@@ -273,6 +306,11 @@ class CombatBuildService:
         main = self._item_for_slot(slots, items, "main_hand")
         off = self._item_for_slot(slots, items, "off_hand")
         mode, weapon_type = self._weapon_mode(main, off)
+        main_hand_weapon_power = weapon_power_by_item.get(id(main), 0.0)
+        off_hand_weapon_power = (
+            weapon_power_by_item.get(id(off), 0.0)
+            if off is not None and off is not main else 0.0
+        )
         rule_key = weapon_type if mode == "two_hand_ranged" else mode
         attack_range, damage, windup, recovery, cooldown, stamina = (
             WEAPON_RULES.get(rule_key, WEAPON_RULES["unarmed"])
@@ -359,6 +397,8 @@ class CombatBuildService:
             weapon_power=round(weapon_power, 2),
             armor_power=round(armor_power, 2),
             weapon_weight=round(weapon_weight, 2),
+            main_hand_weapon_power=round(main_hand_weapon_power, 2),
+            off_hand_weapon_power=round(off_hand_weapon_power, 2),
             action_speed=round(action_speed, 2),
             combat_effects=combat_effects,
             advanced_stat_modifiers={
@@ -368,6 +408,12 @@ class CombatBuildService:
             physical_accuracy_multiplier=physical_accuracy,
             spell_accuracy_multiplier=spell_accuracy,
             equipment_procs=tuple(equipment_procs),
+            exploration_capabilities=tuple(sorted(exploration_capabilities)),
+            adverse_weather_immunity=adverse_weather_immunity,
+            rare_equipment_find_bonus=min(
+                RARE_EQUIPMENT_FIND_BONUS_CAP,
+                rare_equipment_find_bonus,
+            ),
         )
         effective_levels = {
             skill_id: min(
@@ -378,8 +424,31 @@ class CombatBuildService:
             for skill_id in set(skills) | set(skill_values)
         }
         passives = resolve_passive_bonuses(effective_levels, equipment)
+        dual_wield_efficiency = (
+            passives.dual_wield_efficiency
+            if mode == "dual_wield" else 0.0
+        )
+        effective_weapon_power = weapon_power
+        dual_wield_followup_scale = 0.0
+        if mode == "dual_wield":
+            effective_weapon_power = (
+                main_hand_weapon_power
+                + off_hand_weapon_power * dual_wield_efficiency
+            )
+            # Off-hand power already contributes to the main damage budget.
+            # The visible second segment is identity/action feedback, not a
+            # second full payment of that same off-hand weapon.
+            dual_wield_followup_scale = min(
+                0.25,
+                0.10 + 0.15 * dual_wield_efficiency,
+            )
         return replace(
             equipment,
+            weapon_power=round(effective_weapon_power, 2),
+            dual_wield_efficiency=round(dual_wield_efficiency, 4),
+            dual_wield_followup_scale=round(
+                dual_wield_followup_scale, 4
+            ),
             damage_multiplier=equipment.damage_multiplier * passives.style_multiplier,
             block_rate=min(0.35, equipment.block_rate + passives.block_rate),
             knockback_resistance=min(

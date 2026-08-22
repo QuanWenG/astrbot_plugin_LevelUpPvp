@@ -199,7 +199,7 @@ class MaterialBuildPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(build.combat_effects["resistance_fire"], 25)
         self.assertAlmostEqual(build.combat_effects["resistance_cold"], 25)
 
-    async def test_growth_changes_hp_mp_speed_but_luck_not_pvp(self):
+    async def test_growth_changes_resources_and_luck_is_bounded_fortune(self):
         skills, _ = await self.skills.get_skills(self.user)
         slots, equipped = await self.equipment.get_loadout(self.user.id)
         build = self.builds.resolve_equipment(self.user, slots, equipped, skills)
@@ -230,14 +230,45 @@ class MaterialBuildPersistenceTests(unittest.IsolatedAsyncioTestCase):
             advanced_attributes=replace(left.advanced_attributes, luck=999),
         )
         engine = SideviewCombatEngine()
-        profile = STRATEGY_PROFILES["全力猛攻"]
-        normal = engine.simulate(left, right, profile, profile, 808)
-        lucky = engine.simulate(lucky_left, right, profile, profile, 808)
-        self.assertEqual(normal.winner_pk, lucky.winner_pk)
-        self.assertEqual(normal.duration_ticks, lucky.duration_ticks)
-        self.assertEqual(
-            [event.to_dict() for event in normal.events],
-            [event.to_dict() for event in lucky.events],
+        normal_state = engine._fighter_from_initial(
+            left,
+            engine.ATTACKER_START,
+            None,
+        )
+        lucky_state = engine._fighter_from_initial(
+            lucky_left,
+            engine.ATTACKER_START,
+            None,
+        )
+        target_state = engine._fighter_from_initial(
+            right,
+            engine.DEFENDER_START,
+            None,
+        )
+        self.assertGreater(
+            lucky_state.fortune_charges,
+            normal_state.fortune_charges,
+        )
+        self.assertLessEqual(
+            lucky_state.fortune_charges,
+            engine.ruleset.fortune.charge_cap,
+        )
+        normal_critical = engine._critical_chance(
+            normal_state,
+            target_state,
+        )
+        lucky_critical = engine._critical_chance(
+            lucky_state,
+            target_state,
+        )
+        self.assertGreater(lucky_critical, normal_critical)
+        self.assertAlmostEqual(
+            lucky_critical - normal_critical,
+            engine.ruleset.fortune.critical_bonus_cap,
+        )
+        self.assertLessEqual(
+            lucky_critical,
+            engine.ruleset.damage.critical_chance_cap,
         )
 
     async def test_feather_float_recomputes_runtime_weight_and_penalties(self):
@@ -285,7 +316,7 @@ class MaterialBuildPersistenceTests(unittest.IsolatedAsyncioTestCase):
             snapshot, snapshot,
             STRATEGY_PROFILES["稳扎稳打"], STRATEGY_PROFILES["稳扎稳打"], 8,
         )
-        self.assertEqual(result.engine_version, "sideview-v10")
+        self.assertEqual(result.engine_version, SideviewCombatEngine.ENGINE_VERSION)
 
 
 if __name__ == "__main__":

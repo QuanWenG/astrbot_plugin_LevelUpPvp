@@ -15,8 +15,54 @@ from services.equipment_catalog import (
     EquipmentFactory,
     load_equipment_catalog,
 )
-from services.equipment_service import EquipmentService
+from services.equipment_service import (
+    REWARD_QUALITY_ORDER,
+    EquipmentService,
+    apply_reward_quality_bonus,
+    reward_quality_policy,
+)
 from services.user_service import UserService
+
+
+class RewardQualityPolicyTests(unittest.TestCase):
+    def test_quality_bonus_is_continuous_and_player_explainable(self):
+        before_old_cliff = reward_quality_policy(0.75)
+        self.assertEqual(before_old_cliff.minimum_quality, "common")
+        self.assertEqual(before_old_cliff.guaranteed_upgrades, 0)
+        self.assertAlmostEqual(before_old_cliff.quality_progress, 0.375)
+        self.assertAlmostEqual(before_old_cliff.upgrade_chance, 0.375)
+
+        completed_tier = reward_quality_policy(2.0)
+        self.assertEqual(completed_tier.minimum_quality, "excellent")
+        self.assertEqual(completed_tier.guaranteed_upgrades, 1)
+        self.assertEqual(completed_tier.upgrade_chance, 0.0)
+
+        next_tier = reward_quality_policy(2.5)
+        self.assertEqual(next_tier.minimum_quality, "excellent")
+        self.assertEqual(next_tier.guaranteed_upgrades, 1)
+        self.assertAlmostEqual(next_tier.upgrade_chance, 0.25)
+
+    def test_same_seed_never_loses_quality_when_bonus_increases(self):
+        bonuses = tuple(step / 20 for step in range(0, 81))
+        for seed in range(100):
+            qualities = [
+                apply_reward_quality_bonus(
+                    "common",
+                    bonus,
+                    seed=seed,
+                )
+                for bonus in bonuses
+            ]
+            tiers = [REWARD_QUALITY_ORDER.index(item) for item in qualities]
+            self.assertEqual(tiers, sorted(tiers))
+
+    def test_quality_policy_rejects_invalid_bonus(self):
+        with self.assertRaises(TypeError):
+            reward_quality_policy(True)
+        with self.assertRaises(ValueError):
+            reward_quality_policy(float("nan"))
+        with self.assertRaises(ValueError):
+            reward_quality_policy(-0.01)
 
 
 class EquipmentCatalogTests(unittest.TestCase):

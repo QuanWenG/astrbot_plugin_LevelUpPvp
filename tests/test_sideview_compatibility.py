@@ -27,7 +27,9 @@ class CustomStrategyAIProfileTests(unittest.IsolatedAsyncioTestCase):
         ai_profile = profile_for_strategy("疾风架势", profile_data)
 
         self.assertEqual(profile_data["primary_stats"], ("dexterity", "constitution", "magic"))
-        self.assertEqual(profile_data["counters"], ("全力猛攻",))
+        # Free-form/LLM text may shape behaviour, but cannot inject a private
+        # counter table outside the canonical six-family tactic rules.
+        self.assertNotIn("counters", profile_data)
         self.assertEqual(ai_profile.preferred_range, 125)
         self.assertGreater(ai_profile.guard_tendency, 0.2)
 

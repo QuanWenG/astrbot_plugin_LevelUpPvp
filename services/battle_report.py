@@ -13,6 +13,35 @@ class BattleReportBuilder:
 
     MIN_LINES = 6
     MAX_LINES = 10
+    ENVIRONMENT_LABELS = {
+        "calm": "平稳场地",
+        "rain": "雨地",
+        "fog": "浓雾",
+        "strong_wind": "强风",
+        "close_quarters": "狭地",
+        "mana_tide": "魔力潮",
+        "ether_disturbance": "以太扰动",
+    }
+    TACTIC_LABELS = {
+        "pressure": "压制",
+        "counter": "反制",
+        "skirmish": "游击",
+        "control": "控制",
+        "sustain": "坚守",
+        "gambit": "奇策",
+    }
+    ABILITY_EVENT_KINDS = frozenset({
+        "skill_use", "spell_cast_start", "spell_cast", "summon",
+        "summon_strike", "zone_create", "mana_backlash", "mana_barrier",
+        "life_steal", "status_apply", "ability_heal", "cleanse", "dispel",
+        "resource_restore", "mana_drain", "teleport", "stance",
+    })
+    OUTCOME_PRIORITY = (
+        "cleanse", "dispel", "mana_drain", "teleport",
+        "resource_restore", "mana_backlash", "mana_barrier",
+        "life_steal", "status_apply", "ability_heal", "summon",
+        "zone_create", "stance",
+    )
 
     def build(self, result: SimulationResult) -> list[str]:
         names = {
@@ -21,9 +50,16 @@ class BattleReportBuilder:
         }
         winner_name = names[result.winner_pk]
         loser_name = names[result.loser_pk]
-        damage_events = [event for event in result.events if event.kind == "damage"]
+        damage_events = [
+            event
+            for event in result.events
+            if event.kind in {"damage", "summon_strike"}
+        ]
         attack_events = [event for event in result.events if event.kind == "attack"]
-        ability_events = [event for event in result.events if event.kind in {"skill_use", "spell_cast_start", "spell_cast", "summon", "zone_create", "mana_backlash"}]
+        ability_events = [
+            event for event in result.events
+            if event.kind in self.ABILITY_EVENT_KINDS
+        ]
         knockback_events = [
             event for event in result.events if event.kind == "knockback"
         ]
@@ -31,37 +67,77 @@ class BattleReportBuilder:
             event.kind == "damage" and event.guarded for event in result.events
         )
         evade_count = sum(event.kind == "evade" for event in result.events)
+        status_resist_count = sum(
+            event.kind == "status_resist" for event in result.events
+        )
+        tactic_events = [
+            event for event in result.events
+            if event.kind == "strategy_trigger" and event.skill_id == "opening"
+        ]
+        fortune_events = [
+            event for event in result.events if event.kind == "fortune_swing"
+        ]
 
         first_attack_tick = attack_events[0].tick if attack_events else result.duration_ticks
         lines = [
             (
                 f"{result.attacker.name}以「{result.attacker.strategy}」迎战，"
-                f"{result.defender.name}采用「{result.defender.strategy}」。"
+                f"{result.defender.name}采用「{result.defender.strategy}」；"
+                f"本场环境为{self.ENVIRONMENT_LABELS.get(result.environment_id, result.environment_id)}。"
             ),
             (
                 f"双方沿一维战场接近，在战斗开始后"
                 f"{self._seconds(first_attack_tick)}秒进入交锋距离。"
             ),
         ]
+        if len(tactic_events) >= 2:
+            left = self.TACTIC_LABELS.get(
+                tactic_events[0].status_id,
+                tactic_events[0].status_id or "未知",
+            )
+            right = self.TACTIC_LABELS.get(
+                tactic_events[1].status_id,
+                tactic_events[1].status_id or "未知",
+            )
+            relation = (
+                "取得战术先机" if tactic_events[0].value > 0
+                else "受到对方克制" if tactic_events[0].value < 0
+                else "没有形成直接克制"
+            )
+            lines.append(
+                f"开局战术为{left}对{right}，{result.attacker.name}{relation}。"
+            )
         if damage_events:
             lines.append(self._damage_line(damage_events[0], names))
         else:
             lines.append("双方始终没有形成有效命中，战局陷入僵持。")
 
         if ability_events:
-            event = ability_events[0]
-            actor = names.get(event.actor_pk, "参战者")
-            definition = ACTIVE_ABILITY_DEFINITIONS.get(event.skill_id or "")
-            ability_name = definition.name if definition else "特殊能力"
-            if event.kind == "mana_backlash":
-                lines.append(f"战斗开始后{self._seconds(event.tick)}秒，{actor}透支施法并承受{event.value}点魔力反噬。")
-            else:
-                action = "施放" if definition and definition.ability_type == "spell" else "发动"
-                lines.append(f"战斗开始后{self._seconds(event.tick)}秒，{actor}{action}「{ability_name}」，战局随之改变。")
-        if guard_count or evade_count:
-            lines.append(f"全场出现{guard_count}次有效防御、{evade_count}次闪避，攻防节奏反复变化。")
+            event = next(
+                (
+                    candidate
+                    for kind in self.OUTCOME_PRIORITY
+                    for candidate in ability_events
+                    if candidate.kind == kind
+                ),
+                ability_events[0],
+            )
+            lines.append(self._ability_line(event, names))
+        if guard_count or evade_count or status_resist_count:
+            lines.append(
+                f"全场出现{guard_count}次有效防御、{evade_count}次闪避、"
+                f"{status_resist_count}次异常抵抗，攻防节奏反复变化。"
+            )
         else:
             lines.append("双方没有选择退让，以连续正面交锋争夺主动。")
+
+        if fortune_events:
+            event = fortune_events[0]
+            actor = names.get(event.actor_pk, "参战者")
+            lines.append(
+                f"战斗开始后{self._seconds(event.tick)}秒，{actor}触发运势，"
+                "让一次本应发生的坏结果重新判定。"
+            )
 
         special = next(
             (event for event in damage_events if event.critical or event.guarded),
@@ -91,6 +167,7 @@ class BattleReportBuilder:
         if result.finish_reason in {
             "timeout_hp_ratio",
             "timeout_remaining_hp",
+            "timeout_score",
         }:
             lines.append(
                 f"战斗在{self._seconds(result.duration_ticks)}秒时达到上限，"
@@ -103,7 +180,9 @@ class BattleReportBuilder:
                 f"战斗开始后{self._seconds(result.duration_ticks)}秒，"
                 f"{winner_name}完成击倒，战胜{loser_name}。"
             )
-        return lines[: self.MAX_LINES]
+        if len(lines) <= self.MAX_LINES:
+            return lines
+        return lines[: self.MAX_LINES - 2] + lines[-2:]
 
     def _damage_line(
         self,
@@ -113,7 +192,11 @@ class BattleReportBuilder:
         actor = names.get(event.actor_pk, "进攻方")
         target = names.get(event.target_pk, "防守方")
         definition = ACTIVE_ABILITY_DEFINITIONS.get(event.skill_id or "")
-        skill_prefix = f"发动「{definition.name}」" if definition else ""
+        if event.kind == "summon_strike":
+            summon_name = definition.name if definition else "召唤物"
+            skill_prefix = f"召唤的守卫借「{summon_name}」"
+        else:
+            skill_prefix = f"发动「{definition.name}」" if definition else ""
         if event.critical:
             action = f"{skill_prefix}打出暴击命中{target}"
         elif event.guarded:
@@ -134,6 +217,92 @@ class BattleReportBuilder:
             f"{actor}{action}，造成{event.value}{damage_label}伤害，"
             f"目标剩余{event.remaining_hp}生命。"
         )
+
+    def _ability_line(
+        self,
+        event: BattleEvent,
+        names: dict[int, str],
+    ) -> str:
+        actor = names.get(event.actor_pk, "参战者")
+        target = names.get(event.target_pk, "对手")
+        definition = ACTIVE_ABILITY_DEFINITIONS.get(event.skill_id or "")
+        ability_name = definition.name if definition else "特殊能力"
+        prefix = f"战斗开始后{self._seconds(event.tick)}秒，"
+        if event.kind == "mana_backlash":
+            return f"{prefix}{actor}透支施法并承受{event.value}点魔力反噬。"
+        if event.kind == "mana_barrier":
+            return (
+                f"{prefix}{actor}的法力护盾消耗魔力抵消"
+                f"{event.value}点伤害。"
+            )
+        if event.kind == "life_steal":
+            return (
+                f"{prefix}{actor}借「{ability_name}」汲取{event.value}点生命，"
+                f"恢复至{event.remaining_hp}。"
+            )
+        if event.kind == "ability_heal":
+            return (
+                f"{prefix}{actor}施放「{ability_name}」，为{target}恢复"
+                f"{event.value}点生命。"
+            )
+        if event.kind == "cleanse":
+            return (
+                f"{prefix}{actor}借「{ability_name}」净化了{target}身上的"
+                f"{event.value}个异常状态。"
+            )
+        if event.kind == "dispel":
+            return (
+                f"{prefix}{actor}借「{ability_name}」驱散了{target}的"
+                f"{event.value}项增益或召唤效果。"
+            )
+        if event.kind == "mana_drain":
+            return (
+                f"{prefix}{actor}借「{ability_name}」从{target}吸取"
+                f"{event.value}点魔力。"
+            )
+        if event.kind == "resource_restore":
+            resource = "体力" if event.status_id == "sp" else "魔力"
+            return (
+                f"{prefix}{actor}借「{ability_name}」恢复"
+                f"{event.value}点{resource}。"
+            )
+        if event.kind == "teleport":
+            return (
+                f"{prefix}{actor}施放「{ability_name}」完成位移，"
+                f"移动了{event.value}距离。"
+            )
+        if event.kind == "summon":
+            return f"{prefix}{actor}施放「{ability_name}」，召唤物随之入场。"
+        if event.kind == "zone_create":
+            return f"{prefix}{actor}施放「{ability_name}」，在战场上展开区域效果。"
+        if event.kind == "stance":
+            return f"{prefix}{actor}发动「{ability_name}」，战斗姿态正式生效。"
+        if (
+            event.kind == "status_apply"
+            and event.skill_id == "monster_corrosive_splash"
+            and event.status_id == "defense_down"
+        ):
+            return (
+                f"{prefix}{actor}的弱酸腐蚀了{target}的护甲，"
+                "防御暂时下降。"
+            )
+        if event.kind == "status_apply":
+            if event.actor_pk == event.target_pk:
+                return (
+                    f"{prefix}{actor}施放「{ability_name}」，使自身获得"
+                    f"「{event.status_id or '特殊'}」状态。"
+                )
+            return (
+                f"{prefix}{actor}施放「{ability_name}」，使{target}受到"
+                f"「{event.status_id or '特殊'}」状态影响。"
+            )
+        if event.kind == "summon_strike":
+            return (
+                f"{prefix}{actor}召唤的守卫发动「{ability_name}」，"
+                f"造成{event.value}点伤害。"
+            )
+        action = "施放" if definition and definition.ability_type == "spell" else "发动"
+        return f"{prefix}{actor}{action}「{ability_name}」，战局随之改变。"
 
     def _seconds(self, tick: int) -> str:
         return f"{tick * 0.1:.1f}"

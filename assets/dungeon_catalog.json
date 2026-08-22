@@ -98,6 +98,153 @@
         "catalog_id_max": 3113,
         "chance": 0.2
       }
+    },
+    {
+      "dungeon_id": "sealed_archive",
+      "name": "封尘书库",
+      "description": "坍塌塔楼下埋着一座失落书库。亡灵抄写员与构装守卫仍在执行旧日命令，深入者更容易找到结界、净化与入门奥术。",
+      "recommended_level": 25,
+      "exp_discount_rate": 0.05,
+      "waves": [
+        {
+          "template_id": "monster_065",
+          "level": 18,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_084",
+          "level": 20,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_076",
+          "level": 22,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_024",
+          "level": 25,
+          "rank": "elite"
+        },
+        {
+          "template_id": "monster_025",
+          "level": 28,
+          "rank": "boss"
+        }
+      ],
+      "clear_rewards": {
+        "equipment_count": 1,
+        "equipment_level_min": 12,
+        "equipment_level_max": 28,
+        "catalog_id_min": 3001,
+        "catalog_id_max": 3113
+      },
+      "partial_kill_rewards": {
+        "equipment_count": 1,
+        "equipment_level_min": 10,
+        "equipment_level_max": 22,
+        "catalog_id_min": 3001,
+        "catalog_id_max": 3113,
+        "chance": 0.24
+      }
+    },
+    {
+      "dungeon_id": "moonfang_den",
+      "name": "月牙兽巢",
+      "description": "林洞之间盘踞着迁徙兽群，狭道里既有毒牙也有巨兽留下的蜕皮。这里偏向产出强化肉体、树肤与抗毒的自然魔法。",
+      "recommended_level": 12,
+      "exp_discount_rate": 0.05,
+      "waves": [
+        {
+          "template_id": "monster_027",
+          "level": 8,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_093",
+          "level": 9,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_061",
+          "level": 11,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_075",
+          "level": 13,
+          "rank": "elite"
+        },
+        {
+          "template_id": "monster_155",
+          "level": 16,
+          "rank": "boss"
+        }
+      ],
+      "clear_rewards": {
+        "equipment_count": 3,
+        "equipment_level_min": 7,
+        "equipment_level_max": 18,
+        "catalog_id_min": 3001,
+        "catalog_id_max": 3113
+      },
+      "partial_kill_rewards": {
+        "equipment_count": 1,
+        "equipment_level_min": 6,
+        "equipment_level_max": 14,
+        "catalog_id_min": 3001,
+        "catalog_id_max": 3113,
+        "chance": 0.18
+      }
+    },
+    {
+      "dungeon_id": "aberrant_rift",
+      "name": "畸变裂谷",
+      "description": "失控魔力让菌群、血肉与残影互相吞并，地貌每天都在重排。敢走到尽头的人可能带回操纵心智、暗影与空间的稀有书页。",
+      "recommended_level": 40,
+      "exp_discount_rate": 0.05,
+      "waves": [
+        {
+          "template_id": "monster_180",
+          "level": 30,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_183",
+          "level": 32,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_187",
+          "level": 36,
+          "rank": "normal"
+        },
+        {
+          "template_id": "monster_202",
+          "level": 40,
+          "rank": "elite"
+        },
+        {
+          "template_id": "monster_209",
+          "level": 45,
+          "rank": "boss"
+        }
+      ],
+      "clear_rewards": {
+        "equipment_count": 2,
+        "equipment_level_min": 24,
+        "equipment_level_max": 46,
+        "catalog_id_min": 3001,
+        "catalog_id_max": 3113
+      },
+      "partial_kill_rewards": {
+        "equipment_count": 1,
+        "equipment_level_min": 20,
+        "equipment_level_max": 38,
+        "catalog_id_min": 3001,
+        "catalog_id_max": 3113,
+        "chance": 0.22
+      }
     }
   ]
 }

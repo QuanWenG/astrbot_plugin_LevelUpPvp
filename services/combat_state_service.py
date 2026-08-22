@@ -109,10 +109,11 @@ class CombatStateService:
                 recovery_turn_phase,
                 statuses_json, skill_cooldowns_json,
                 attack_cooldown, recovery_ticks, hitstun_ticks,
-                counter_cooldown, stance_id, frozen_mana_ratio,
+                counter_cooldown, hard_control_immunity_ticks,
+                stance_id, frozen_mana_ratio,
                 frozen_mana_capacity_ratio, lethal_survival_used,
                 defeated, updated_at_ts, version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_pk) DO UPDATE SET
                 hp_ratio = excluded.hp_ratio,
                 mana_ratio = excluded.mana_ratio,
@@ -127,6 +128,8 @@ class CombatStateService:
                 recovery_ticks = excluded.recovery_ticks,
                 hitstun_ticks = excluded.hitstun_ticks,
                 counter_cooldown = excluded.counter_cooldown,
+                hard_control_immunity_ticks =
+                    excluded.hard_control_immunity_ticks,
                 stance_id = excluded.stance_id,
                 frozen_mana_ratio = excluded.frozen_mana_ratio,
                 frozen_mana_capacity_ratio = excluded.frozen_mana_capacity_ratio,
@@ -150,6 +153,7 @@ class CombatStateService:
                 stored.recovery_ticks,
                 stored.hitstun_ticks,
                 stored.counter_cooldown,
+                stored.hard_control_immunity_ticks,
                 stored.stance_id,
                 stored.frozen_mana_ratio,
                 stored.frozen_mana_capacity_ratio,
@@ -350,6 +354,7 @@ class CombatStateService:
             fighter.recovery_ticks,
             fighter.hitstun_ticks,
             fighter.counter_cooldown,
+            fighter.hard_control_immunity_until,
             *fighter.skill_cooldowns.values(),
             *(status.remaining_ticks for status in fighter.statuses.values()),
         ]
@@ -386,6 +391,9 @@ class CombatStateService:
         fighter.recovery_ticks = max(0, fighter.recovery_ticks - 1)
         fighter.hitstun_ticks = max(0, fighter.hitstun_ticks - 1)
         fighter.counter_cooldown = max(0, fighter.counter_cooldown - 1)
+        fighter.hard_control_immunity_until = max(
+            0, fighter.hard_control_immunity_until - 1
+        )
         expired = []
         for status in fighter.statuses.values():
             status.remaining_ticks -= 1
@@ -430,6 +438,9 @@ class CombatStateService:
             recovery_ticks=int(row["recovery_ticks"]),
             hitstun_ticks=int(row["hitstun_ticks"]),
             counter_cooldown=int(row["counter_cooldown"]),
+            hard_control_immunity_ticks=max(
+                0, int(row["hard_control_immunity_ticks"])
+            ),
             stance_id=row["stance_id"],
             frozen_mana_ratio=float(row["frozen_mana_ratio"]),
             frozen_mana_capacity_ratio=float(

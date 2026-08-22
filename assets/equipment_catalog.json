@@ -2457,7 +2457,7 @@
       "mode": "generated",
       "item_type": "weapon",
       "equip_slot": "main_hand",
-      "hand_mode": "one_hand",
+      "hand_mode": "two_hand_heavy",
       "weapon_type": "axe",
       "armor_type": "",
       "material": "iron",
